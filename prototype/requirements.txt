@@ -1,0 +1,6 @@
+faster-whisper>=1.0.3
+silero-vad>=5.1
+sounddevice>=0.4.6
+numpy>=1.26
+anthropic>=0.40
+python-dotenv>=1.0

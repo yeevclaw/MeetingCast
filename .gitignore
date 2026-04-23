@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Env
+.env
+.env.local
+.dev-config.toml
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Models / caches
+models/
+*.bin
+
+# Node (Phase 2+)
+node_modules/
+dist/
+dist-ssr/
+
+# Rust (Phase 2+)
+target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
