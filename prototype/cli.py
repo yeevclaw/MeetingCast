@@ -6,22 +6,23 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from audio_stream import wav_chunks
 from stt import get_backend
 from translator import Translator
 
 
-COLORS = {"en": "\033[36m", "vi": "\033[35m"}  # cyan / magenta
+COLORS = {"en": "\033[36m", "vi": "\033[35m"}
 RESET = "\033[0m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
 
 
 def on_chunk(target: str, chunk: str):
-    # interleaved terminal output: prefix each chunk so you can see both streams in flight
     print(f"{COLORS[target]}[{target}]{RESET}{chunk}", end="", flush=True)
 
 
 async def run_translate(text: str):
     translator = Translator()
-    print()
     print(f"--- 並行翻譯 ---")
     results = await translator.translate_both(text, on_chunk=on_chunk)
     print("\n")
@@ -32,10 +33,49 @@ async def run_translate(text: str):
     return results
 
 
+async def run_mic_sim(backend_name: str, wav_path: str, translate: bool):
+    stt = get_backend(backend_name)
+
+    t_stream_start = time.perf_counter()
+    t_first_interim: float | None = None
+    t_first_final: float | None = None
+    final_texts: list[str] = []
+
+    chunks = wav_chunks(wav_path, chunk_ms=100, realtime=True)
+
+    print(f"backend: {backend_name} (streaming)  |  file: {wav_path}")
+    print("--- 即時辨識（WAV 以 100ms chunk 實時餵入，模擬麥克風）---\n")
+
+    async for transcript in stt.stream(chunks):
+        elapsed_ms = (time.perf_counter() - t_stream_start) * 1000
+        if not transcript.is_final:
+            if t_first_interim is None:
+                t_first_interim = elapsed_ms
+            # overwrite the current line with interim
+            print(f"\r{DIM}[{elapsed_ms:>5.0f}ms interim]{RESET} {transcript.text}\033[K", end="", flush=True)
+        else:
+            if t_first_final is None:
+                t_first_final = elapsed_ms
+            print(f"\r{GREEN}[{elapsed_ms:>5.0f}ms  FINAL ]{RESET} {transcript.text}\033[K")
+            final_texts.append(transcript.text)
+
+    total_ms = (time.perf_counter() - t_stream_start) * 1000
+    print()
+    print("--- 量測 ---")
+    print(f"首個 interim : {t_first_interim:.0f} ms" if t_first_interim else "首個 interim : (none)")
+    print(f"首個 final   : {t_first_final:.0f} ms" if t_first_final else "首個 final   : (none)")
+    print(f"stream 總時長: {total_ms:.0f} ms")
+
+    full_text = "".join(final_texts)
+    if translate and full_text:
+        print()
+        await run_translate(full_text)
+
+
 def main():
     load_dotenv(Path(__file__).parent / ".env")
 
-    parser = argparse.ArgumentParser(description="Phase 1 pipeline runner (STT + optional translation)")
+    parser = argparse.ArgumentParser(description="Phase 1 pipeline runner")
     parser.add_argument(
         "--backend",
         choices=["local", "cloud"],
@@ -47,12 +87,22 @@ def main():
         default=str(Path(__file__).parent / "samples" / "zh_short.wav"),
     )
     parser.add_argument("--language", default="zh")
-    parser.add_argument("--warmup", action="store_true", help="local only; skip first inference timing")
-    parser.add_argument("--translate", action="store_true", help="also translate to en + vi via Claude")
-    parser.add_argument("--text", help="skip STT, translate this text directly")
+    parser.add_argument("--warmup", action="store_true", help="local only")
+    parser.add_argument("--translate", action="store_true", help="translate to en + vi")
+    parser.add_argument("--text", help="skip STT, translate this text")
+    parser.add_argument(
+        "--mic-sim",
+        metavar="WAV",
+        help="stream this WAV file as if it were a live microphone (real-time pacing)",
+    )
     args = parser.parse_args()
 
-    # Translate-only mode (no STT): useful for testing translator in isolation
+    if args.mic_sim:
+        if not Path(args.mic_sim).exists():
+            sys.exit(f"file not found: {args.mic_sim}")
+        asyncio.run(run_mic_sim(args.backend, args.mic_sim, args.translate))
+        return
+
     if args.text:
         print(f"--- 原文 ---\n{args.text}")
         asyncio.run(run_translate(args.text))
