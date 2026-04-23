@@ -4,11 +4,13 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
 
 from audio_stream import wav_chunks
 from stt import get_backend
 from translator import Translator
+from vad import VADSegmenter, load_wav_float32
 
 
 COLORS = {"en": "\033[36m", "vi": "\033[35m"}
@@ -31,6 +33,65 @@ async def run_translate(text: str):
         print(f"[{target}] {m.text}")
         print(f"     首 token: {m.first_token_ms:.0f} ms  |  完成: {m.total_ms:.0f} ms")
     return results
+
+
+async def run_vad_demo(wav_path: str, translate: bool):
+    print(f"--- VAD demo: {wav_path} ---")
+    print("loading audio + silero-vad ...", flush=True)
+    audio, sr = load_wav_float32(wav_path)
+    total_sec = len(audio) / sr
+    vad = VADSegmenter()
+    t_vad = time.perf_counter()
+    segments = vad.segment(audio)
+    vad_ms = (time.perf_counter() - t_vad) * 1000
+    print(f"audio {total_sec:.1f}s → {len(segments)} 段 (VAD 耗時 {vad_ms:.0f} ms)\n")
+
+    stt = get_backend("local")
+    translator = Translator() if translate else None
+
+    # Warm up mlx-whisper once so first segment isn't skewed
+    if segments:
+        print("warming up mlx-whisper ...", flush=True)
+        t_w = time.perf_counter()
+        stt.transcribe_file(wav_path)
+        print(f"warm-up: {(time.perf_counter() - t_w) * 1000:.0f} ms\n")
+
+    import tempfile, wave
+
+    print(f"{'seg':>3} {'start':>7} {'dur':>6} {'stt_ms':>7} {'首token':>9}  text")
+    print("-" * 100)
+
+    for i, seg in enumerate(segments):
+        # Write segment to temp wav for mlx-whisper (accepts path)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tmp_path = tf.name
+        with wave.open(tmp_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes((seg.audio * 32768).astype(np.int16).tobytes())
+
+        t0 = time.perf_counter()
+        tr = stt.transcribe_file(tmp_path)
+        stt_ms = (time.perf_counter() - t0) * 1000
+
+        first_tok = ""
+        if translator and tr.text:
+            t1 = time.perf_counter()
+            ft_ms_en = None
+            async for _chunk in translator.translate_stream(tr.text, "en"):
+                if ft_ms_en is None:
+                    ft_ms_en = (time.perf_counter() - t1) * 1000
+                    break  # only measure first token
+            first_tok = f"{ft_ms_en:.0f}ms" if ft_ms_en else "n/a"
+
+        print(
+            f"{i+1:>3} {seg.t_start:>6.2f}s {seg.duration:>5.2f}s "
+            f"{stt_ms:>6.0f}ms {first_tok:>8}  {tr.text}"
+        )
+
+        import os
+        os.unlink(tmp_path)
 
 
 async def run_mic_sim(backend_name: str, wav_path: str, translate: bool):
@@ -95,7 +156,18 @@ def main():
         metavar="WAV",
         help="stream this WAV file as if it were a live microphone (real-time pacing)",
     )
+    parser.add_argument(
+        "--vad-demo",
+        metavar="WAV",
+        help="batch-segment WAV with silero-vad, transcribe each segment via local STT, optionally translate",
+    )
     args = parser.parse_args()
+
+    if args.vad_demo:
+        if not Path(args.vad_demo).exists():
+            sys.exit(f"file not found: {args.vad_demo}")
+        asyncio.run(run_vad_demo(args.vad_demo, args.translate))
+        return
 
     if args.mic_sim:
         if not Path(args.mic_sim).exists():
