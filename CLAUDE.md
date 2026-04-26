@@ -6,25 +6,30 @@
 
 **MVP 範圍：單向**（中文 → 英文 + 越南文），不處理對方發言。
 
-## 專案現況（2026-04-23）
+## 專案現況（2026-04-26）
 
-只有三份規劃文件，尚未開始實作：
+Phase 1 CLI 原型 ~95% 完成，端到端 pipeline 已可運作（mlx-whisper Metal GPU + silero-vad streaming + Claude Haiku 4.5 並行翻譯）。延遲報告見 `docs/LATENCY.md`：感知延遲 P50 ~2.3s ✅、P95 ~3.1s ⚠️。
 
-- `CLAUDE.md`（本文件）— 專案規格與守則
-- `PROJECT_STRUCTURE.md` — 目錄結構規劃與各模組職責
-- `PHASE1_GUIDE.md` — Phase 1 CLI 原型的環境準備、Step 1→7、關鍵程式片段
+剩下：等 macOS 麥克風權限到位後跑真人 live test，然後打 tag `v0.1.0-phase1` 收尾。
 
-下一步：依 `PHASE1_GUIDE.md` 建立 `prototype/` 目錄並跑通 CLI pipeline。尚未建立 git repo。
+關鍵架構決策（不要重新討論）：
+- **STT 引擎用 mlx-whisper**（不是 faster-whisper）— ctranslate2 在 macOS 沒 Metal 支援，CPU 只有 4.3s 太慢；mlx-whisper Metal GPU 跑 0.9s
+- **雙 backend、本地預設**：`MLXWhisperSTT` + `DeepgramSTT`，皆 implement 同一 `Transcript` stream 介面
+- **Cloud 用 Deepgram**（不是 Google Chirp 2 / Azure）— 設定最單純，cloud 主要用於 interim 預覽 UX
+- **Deepgram SDK 6.1.1 bool serialization bug**：要傳字串 `"true"` 而非 Python `True`，繞過方式在 `stt/cloud.py` 有註解
 
 ## 常用指令
 
-> 尚未建置，以下各 Phase 開工時就地填入實際指令。
+> Phase 1 已可運作；Phase 2+ 待 Tauri 開工後填。
 
-### Phase 1（Python CLI）
-- 啟動：`cd prototype && python cli.py`
-- 延遲量測：`python latency_bench.py`
-- 測試：`pytest`
-- 單測：`pytest tests/python/test_vad.py::test_specific`
+### Phase 1（Python CLI，路徑相對於 `prototype/`）
+- 環境：`python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+- 設定：`cp .env.example .env`（填 `ANTHROPIC_API_KEY` 與 `DEEPGRAM_API_KEY`）
+- 麥克風 live：`.venv/bin/python cli.py --mic --backend local --translate`
+- WAV 模擬麥克風：`.venv/bin/python cli.py --mic-sim samples/weather_90s.wav --backend local --translate`
+- VAD 切句 demo（含每段延遲）：`.venv/bin/python cli.py --vad-demo samples/weather_90s.wav --translate`
+- 純翻譯測試：`.venv/bin/python cli.py --text "中文句子"`
+- 延遲基準：`.venv/bin/python latency_bench.py samples/weather_90s.wav --output ../docs/LATENCY.md`
 
 ### Phase 2+（Tauri 桌面版）
 - 開發模式：`./scripts/dev.sh`
