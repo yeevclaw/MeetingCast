@@ -1,10 +1,22 @@
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use crate::config::SharedConfig;
+
+#[derive(Serialize, Clone)]
+struct ChunkPayload {
+    id: String,
+    text: String,
+}
+
+#[derive(Serialize, Clone)]
+struct DonePayload {
+    id: String,
+}
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -26,6 +38,7 @@ fn target_lang_name(target: &str) -> &str {
 pub async fn translate(
     app: AppHandle,
     config: tauri::State<'_, SharedConfig>,
+    id: String,
     text: String,
     target: String,
 ) -> Result<(), String> {
@@ -81,7 +94,10 @@ pub async fn translate(
                             .and_then(|d| d.get("text"))
                             .and_then(|t| t.as_str())
                         {
-                            let _ = app.emit(&chunk_event, delta.to_string());
+                            let _ = app.emit(
+                                &chunk_event,
+                                ChunkPayload { id: id.clone(), text: delta.to_string() },
+                            );
                         }
                     }
                 }
@@ -95,6 +111,6 @@ pub async fn translate(
         }
     }
 
-    let _ = app.emit(&done_event, ());
+    let _ = app.emit(&done_event, DonePayload { id: id.clone() });
     Ok(())
 }

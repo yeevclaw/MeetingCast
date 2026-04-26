@@ -20,15 +20,16 @@ export default function ControlWindow() {
     const unlistenFns: Array<() => void> = [];
 
     listen<TranscriptPayload>("transcript", (e) => {
-      const { text, is_final } = e.payload;
+      const { text, is_final, t_start } = e.payload;
       if (!text) return;
       if (is_final) {
         setHistory((h) => [...h, text]);
         setLatestZh("");
-        invoke("translate", { text, target: "en" }).catch((err) =>
+        const id = String(t_start);
+        invoke("translate", { id, text, target: "en" }).catch((err) =>
           setError(`translate en: ${err}`),
         );
-        invoke("translate", { text, target: "vi" }).catch((err) =>
+        invoke("translate", { id, text, target: "vi" }).catch((err) =>
           setError(`translate vi: ${err}`),
         );
       } else {

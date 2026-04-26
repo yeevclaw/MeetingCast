@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { Lang, TranscriptPayload, Utterance } from "@/lib/types";
+import type { ChunkPayload, Lang, TranscriptPayload, Utterance } from "@/lib/types";
 
 const TITLES: Record<Lang, string> = {
   en: "English",
@@ -18,30 +18,35 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
   const [fontSize, setFontSize] = useState(32);
   const [pinned, setPinned] = useState(false);
   const [borderless, setBorderless] = useState(false);
-  const counterRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const unlistenFns: Array<() => void> = [];
 
     listen<TranscriptPayload>("transcript", (e) => {
-      const { is_final, text } = e.payload;
+      const { is_final, text, t_start } = e.payload;
       if (!is_final || !text) return;
-      const id = String(counterRef.current++);
-      setUtterances((prev) => [...prev, { id, zh: text, en: "", vi: "" }]);
+      const id = String(t_start);
+      setUtterances((prev) => {
+        if (prev.some((u) => u.id === id)) return prev; // dedup
+        return [...prev, { id, zh: text, en: "", vi: "" }];
+      });
     }).then((u) => unlistenFns.push(u));
 
-    listen<string>(`translation:chunk:${lang}`, (e) => {
+    listen<ChunkPayload>(`translation:chunk:${lang}`, (e) => {
+      const { id, text } = e.payload;
       setUtterances((us) => {
-        if (us.length === 0) return us;
-        const last = us[us.length - 1];
-        const updated: Utterance = { ...last, [lang]: last[lang] + e.payload };
-        return [...us.slice(0, -1), updated];
+        const idx = us.findIndex((u) => u.id === id);
+        if (idx === -1) {
+          // chunk arrived before transcript event reached this window — buffer as new
+          return [...us, { id, zh: "", en: "", vi: "", [lang]: text }] as Utterance[];
+        }
+        const updated: Utterance = { ...us[idx], [lang]: us[idx][lang] + text };
+        return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
       });
     }).then((u) => unlistenFns.push(u));
 
     listen("stt:started", () => {
-      counterRef.current = 0;
       setUtterances([]);
     }).then((u) => unlistenFns.push(u));
 
