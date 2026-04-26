@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
+from audio_capture import mic_chunks
 from audio_stream import wav_chunks
 from stt import get_backend
 from translator import Translator
@@ -94,43 +95,49 @@ async def run_vad_demo(wav_path: str, translate: bool):
         os.unlink(tmp_path)
 
 
-async def run_mic_sim(backend_name: str, wav_path: str, translate: bool):
+async def run_streaming(chunks, backend_name: str, translate: bool, label: str):
     stt = get_backend(backend_name)
+    translator = Translator() if translate else None
 
-    t_stream_start = time.perf_counter()
+    t0 = time.perf_counter()
     t_first_interim: float | None = None
     t_first_final: float | None = None
-    final_texts: list[str] = []
+    translation_tasks: list[asyncio.Task] = []
 
-    chunks = wav_chunks(wav_path, chunk_ms=100, realtime=True)
+    print(f"backend: {backend_name} (streaming)  |  source: {label}\n")
 
-    print(f"backend: {backend_name} (streaming)  |  file: {wav_path}")
-    print("--- 即時辨識（WAV 以 100ms chunk 實時餵入，模擬麥克風）---\n")
+    try:
+        async for transcript in stt.stream(chunks):
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if not transcript.is_final:
+                if t_first_interim is None:
+                    t_first_interim = elapsed_ms
+                print(
+                    f"\r{DIM}[{elapsed_ms:>5.0f}ms interim]{RESET} {transcript.text}\033[K",
+                    end="", flush=True,
+                )
+            else:
+                if t_first_final is None:
+                    t_first_final = elapsed_ms
+                print(
+                    f"\r{GREEN}[{elapsed_ms:>5.0f}ms  FINAL ]{RESET} {transcript.text}\033[K"
+                )
+                if translator and transcript.text:
+                    task = asyncio.create_task(
+                        translator.translate_both(transcript.text, on_chunk=on_chunk)
+                    )
+                    translation_tasks.append(task)
+    finally:
+        if translation_tasks:
+            print("\n[ 等待最後翻譯完成... ]")
+            await asyncio.gather(*translation_tasks, return_exceptions=True)
+            print()
 
-    async for transcript in stt.stream(chunks):
-        elapsed_ms = (time.perf_counter() - t_stream_start) * 1000
-        if not transcript.is_final:
-            if t_first_interim is None:
-                t_first_interim = elapsed_ms
-            # overwrite the current line with interim
-            print(f"\r{DIM}[{elapsed_ms:>5.0f}ms interim]{RESET} {transcript.text}\033[K", end="", flush=True)
-        else:
-            if t_first_final is None:
-                t_first_final = elapsed_ms
-            print(f"\r{GREEN}[{elapsed_ms:>5.0f}ms  FINAL ]{RESET} {transcript.text}\033[K")
-            final_texts.append(transcript.text)
-
-    total_ms = (time.perf_counter() - t_stream_start) * 1000
-    print()
-    print("--- 量測 ---")
+    total_ms = (time.perf_counter() - t0) * 1000
+    print("\n--- 量測 ---")
     print(f"首個 interim : {t_first_interim:.0f} ms" if t_first_interim else "首個 interim : (none)")
     print(f"首個 final   : {t_first_final:.0f} ms" if t_first_final else "首個 final   : (none)")
     print(f"stream 總時長: {total_ms:.0f} ms")
-
-    full_text = "".join(final_texts)
-    if translate and full_text:
-        print()
-        await run_translate(full_text)
 
 
 def main():
@@ -152,6 +159,11 @@ def main():
     parser.add_argument("--translate", action="store_true", help="translate to en + vi")
     parser.add_argument("--text", help="skip STT, translate this text")
     parser.add_argument(
+        "--mic",
+        action="store_true",
+        help="capture from system microphone and stream through pipeline (Ctrl+C to stop)",
+    )
+    parser.add_argument(
         "--mic-sim",
         metavar="WAV",
         help="stream this WAV file as if it were a live microphone (real-time pacing)",
@@ -172,7 +184,17 @@ def main():
     if args.mic_sim:
         if not Path(args.mic_sim).exists():
             sys.exit(f"file not found: {args.mic_sim}")
-        asyncio.run(run_mic_sim(args.backend, args.mic_sim, args.translate))
+        chunks = wav_chunks(args.mic_sim, chunk_ms=100, realtime=True)
+        asyncio.run(run_streaming(chunks, args.backend, args.translate, args.mic_sim))
+        return
+
+    if args.mic:
+        print("[ 麥克風錄音中，Ctrl+C 停止 ]\n")
+        chunks = mic_chunks(sample_rate=16000, chunk_ms=100)
+        try:
+            asyncio.run(run_streaming(chunks, args.backend, args.translate, "microphone"))
+        except KeyboardInterrupt:
+            print("\nstopped.")
         return
 
     if args.text:
