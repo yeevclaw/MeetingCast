@@ -28,6 +28,7 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+*.tsbuildinfo
 logs/
 *.log
 npm-debug.log*
