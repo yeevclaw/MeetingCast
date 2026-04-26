@@ -12,10 +12,28 @@
   "app": {
     "windows": [
       {
-        "title": "MeetingCast",
         "label": "control",
+        "title": "MeetingCast",
         "width": 480,
-        "height": 720
+        "height": 540,
+        "x": 40,
+        "y": 80
+      },
+      {
+        "label": "en",
+        "title": "English",
+        "width": 900,
+        "height": 320,
+        "x": 540,
+        "y": 80
+      },
+      {
+        "label": "vi",
+        "title": "Tiếng Việt",
+        "width": 900,
+        "height": 320,
+        "x": 540,
+        "y": 440
       }
     ],
     "security": {

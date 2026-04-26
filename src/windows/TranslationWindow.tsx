@@ -1,0 +1,140 @@
+import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { Lang, TranscriptPayload, Utterance } from "@/lib/types";
+
+const TITLES: Record<Lang, string> = {
+  en: "English",
+  vi: "Tiếng Việt",
+};
+
+const KEEP_RECENT = 5;
+const FONT_STEP = 4;
+const FONT_MIN = 20;
+const FONT_MAX = 64;
+
+export default function TranslationWindow({ lang }: { lang: Lang }) {
+  const [utterances, setUtterances] = useState<Utterance[]>([]);
+  const [fontSize, setFontSize] = useState(32);
+  const [pinned, setPinned] = useState(false);
+  const [borderless, setBorderless] = useState(false);
+  const counterRef = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const unlistenFns: Array<() => void> = [];
+
+    listen<TranscriptPayload>("transcript", (e) => {
+      const { is_final, text } = e.payload;
+      if (!is_final || !text) return;
+      const id = String(counterRef.current++);
+      setUtterances((prev) => [...prev, { id, zh: text, en: "", vi: "" }]);
+    }).then((u) => unlistenFns.push(u));
+
+    listen<string>(`translation:chunk:${lang}`, (e) => {
+      setUtterances((us) => {
+        if (us.length === 0) return us;
+        const last = us[us.length - 1];
+        const updated: Utterance = { ...last, [lang]: last[lang] + e.payload };
+        return [...us.slice(0, -1), updated];
+      });
+    }).then((u) => unlistenFns.push(u));
+
+    listen("stt:started", () => {
+      counterRef.current = 0;
+      setUtterances([]);
+    }).then((u) => unlistenFns.push(u));
+
+    return () => unlistenFns.forEach((f) => f());
+  }, [lang]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [utterances]);
+
+  async function togglePin() {
+    const w = getCurrentWindow();
+    const next = !pinned;
+    await w.setAlwaysOnTop(next);
+    setPinned(next);
+  }
+
+  async function toggleBorderless() {
+    const w = getCurrentWindow();
+    const next = !borderless;
+    await w.setDecorations(!next);
+    setBorderless(next);
+  }
+
+  function bumpFont(delta: number) {
+    setFontSize((s) => Math.max(FONT_MIN, Math.min(FONT_MAX, s + delta)));
+  }
+
+  const visible = utterances.slice(-KEEP_RECENT);
+
+  return (
+    <main className="flex h-screen flex-col bg-[#F5F1E8] text-[#2A2018]">
+      <header className="flex flex-shrink-0 items-center justify-between border-b border-[#E0D8C5] px-6 py-1 text-xs font-medium uppercase tracking-wider text-[#6B5E4A]">
+        <span>{TITLES[lang]}</span>
+        <div className="flex items-center gap-1 normal-case tracking-normal">
+          <button
+            className="rounded px-2 py-0.5 hover:bg-[#E0D8C5]"
+            onClick={() => bumpFont(-FONT_STEP)}
+            aria-label="字小"
+          >
+            A−
+          </button>
+          <span className="w-8 text-center tabular-nums">{fontSize}</span>
+          <button
+            className="rounded px-2 py-0.5 hover:bg-[#E0D8C5]"
+            onClick={() => bumpFont(FONT_STEP)}
+            aria-label="字大"
+          >
+            A+
+          </button>
+          <button
+            className={`rounded px-2 py-0.5 hover:bg-[#E0D8C5] ${pinned ? "bg-[#E0D8C5] text-[#2A2018]" : ""}`}
+            onClick={togglePin}
+            aria-label="釘選"
+            title="釘到最前面"
+          >
+            {pinned ? "📌" : "📍"}
+          </button>
+          <button
+            className={`rounded px-2 py-0.5 hover:bg-[#E0D8C5] ${borderless ? "bg-[#E0D8C5] text-[#2A2018]" : ""}`}
+            onClick={toggleBorderless}
+            aria-label="無邊框"
+            title="無邊框"
+          >
+            ⬚
+          </button>
+        </div>
+      </header>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-10 py-6">
+        {visible.length === 0 ? (
+          <p style={{ fontSize: `${fontSize * 0.6}px` }} className="text-[#A89A7E]">
+            — waiting —
+          </p>
+        ) : (
+          <ul className="space-y-4">
+            {visible.map((u, idx) => {
+              const distanceFromLast = visible.length - 1 - idx;
+              const opacity = Math.max(0.3, 1 - distanceFromLast * 0.18);
+              return (
+                <li
+                  key={u.id}
+                  className="leading-snug"
+                  style={{ opacity, fontSize: `${fontSize}px` }}
+                >
+                  {u[lang] || <span className="text-[#A89A7E]">…</span>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </main>
+  );
+}
