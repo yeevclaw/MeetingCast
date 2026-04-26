@@ -4,8 +4,9 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::config::SharedConfig;
+
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
-const MODEL: &str = "claude-haiku-4-5";
 
 const SYSTEM_TEMPLATE: &str = "你是專業即時會議口譯員。將使用者輸入的中文翻譯為 {lang}。\n\
 規則：\n\
@@ -22,13 +23,23 @@ fn target_lang_name(target: &str) -> &str {
 }
 
 #[tauri::command]
-pub async fn translate(app: AppHandle, text: String, target: String) -> Result<(), String> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
+pub async fn translate(
+    app: AppHandle,
+    config: tauri::State<'_, SharedConfig>,
+    text: String,
+    target: String,
+) -> Result<(), String> {
+    let (api_key, model) = {
+        let cfg = config.lock().await;
+        (cfg.api.anthropic_api_key.clone(), cfg.api.model.clone())
+    };
+    if api_key.is_empty() {
+        return Err("Anthropic API key not configured (open Settings)".into());
+    }
 
     let system = SYSTEM_TEMPLATE.replace("{lang}", target_lang_name(&target));
     let body = json!({
-        "model": MODEL,
+        "model": model,
         "max_tokens": 1024,
         "stream": true,
         "system": [{

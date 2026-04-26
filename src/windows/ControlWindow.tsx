@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import SettingsModal from "@/components/SettingsModal";
 import type { Source, TranscriptPayload } from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
@@ -12,6 +13,7 @@ export default function ControlWindow() {
   const [latestZh, setLatestZh] = useState<string>("");
   const [history, setHistory] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -70,10 +72,18 @@ export default function ControlWindow() {
   }
 
   return (
-    <main className="flex h-screen flex-col bg-stone-50 text-stone-900">
-      <header className="border-b border-stone-200 px-6 py-3">
-        <h1 className="text-xl font-semibold">MeetingCast</h1>
-        <p className="text-xs text-stone-500">控制視窗</p>
+    <main className="relative flex h-screen flex-col bg-stone-50 text-stone-900">
+      <header className="flex items-center justify-between border-b border-stone-200 px-6 py-3">
+        <div>
+          <h1 className="text-xl font-semibold">MeetingCast</h1>
+          <p className="text-xs text-stone-500">控制視窗</p>
+        </div>
+        <button
+          className="rounded border border-stone-300 px-3 py-1 text-sm text-stone-600 hover:bg-stone-100"
+          onClick={() => setShowSettings(true)}
+        >
+          設定
+        </button>
       </header>
 
       <div className="flex flex-col gap-3 border-b border-stone-200 px-6 py-4">
@@ -118,6 +128,8 @@ export default function ControlWindow() {
           {error}
         </div>
       )}
+
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
 
       <section className="flex flex-1 flex-col overflow-hidden">
         <div className="flex-shrink-0 border-b border-stone-200 px-6 py-1 text-xs font-medium uppercase tracking-wide text-stone-500">

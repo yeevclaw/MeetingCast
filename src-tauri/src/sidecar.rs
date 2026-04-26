@@ -3,10 +3,12 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
+
+use crate::config::SharedConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -61,6 +63,13 @@ impl SidecarManager {
             return Err(format!("sidecar script not found: {}", script.display()));
         }
 
+        // Read DEEPGRAM_API_KEY from shared config and pass via env to subprocess.
+        let deepgram_key = {
+            let cfg_state = app.state::<SharedConfig>();
+            let cfg = cfg_state.lock().await;
+            cfg.api.deepgram_api_key.clone()
+        };
+
         let mut cmd = Command::new(&python);
         cmd.arg(&script)
             .current_dir(&root)
@@ -68,6 +77,9 @@ impl SidecarManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if !deepgram_key.is_empty() {
+            cmd.env("DEEPGRAM_API_KEY", deepgram_key);
+        }
 
         let mut child = cmd.spawn().map_err(|e| format!("spawn sidecar: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;

@@ -16,3 +16,11 @@ export type TranscriptPayload = {
 };
 
 export type Source = { type: "mic" } | { type: "wav"; path: string };
+
+export type Config = {
+  api: {
+    anthropic_api_key: string;
+    deepgram_api_key: string;
+    model: string;
+  };
+};
