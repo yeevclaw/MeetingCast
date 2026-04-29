@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import SettingsModal from "@/components/SettingsModal";
+import { friendly } from "@/lib/errors";
 import type { Source, TranscriptPayload } from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
@@ -175,11 +176,34 @@ export default function ControlWindow() {
         </div>
       </div>
 
-      {error && (
-        <div className="border-b border-rose-200 bg-rose-50 px-6 py-2 text-sm text-rose-700">
-          {error}
-        </div>
-      )}
+      {error && (() => {
+        const f = friendly(error);
+        return (
+          <div className="border-b border-rose-200 bg-rose-50 px-6 py-2 text-sm text-rose-800">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex-1">
+                <p className="font-medium">{f.primary}</p>
+                {f.secondary && <p className="text-xs text-rose-700">{f.secondary}</p>}
+              </div>
+              <button
+                className="text-xs text-rose-500 hover:text-rose-800"
+                onClick={() => setError(null)}
+                aria-label="關閉"
+              >
+                ✕
+              </button>
+            </div>
+            {f.primary !== f.raw && (
+              <details className="mt-1 text-xs text-rose-500">
+                <summary className="cursor-pointer hover:text-rose-700">技術細節</summary>
+                <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-rose-100 p-2 font-mono text-[10px]">
+                  {f.raw}
+                </pre>
+              </details>
+            )}
+          </div>
+        );
+      })()}
 
       {toast && (
         <div
@@ -204,7 +228,12 @@ export default function ControlWindow() {
         </div>
         <div ref={historyRef} className="flex-1 overflow-y-auto px-6 py-3">
           {history.length === 0 && !latestZh ? (
-            <p className="text-sm text-stone-400">— 等待中 —</p>
+            <div className="flex h-full flex-col items-center justify-center gap-2 text-stone-500">
+              <p className="text-base">按「開始」即可錄音翻譯</p>
+              <p className="text-xs text-stone-400">
+                也可用快捷鍵 <kbd className="rounded border border-stone-300 bg-stone-100 px-1.5 py-0.5 font-mono text-[11px]">⌘ Shift M</kbd> 切換
+              </p>
+            </div>
           ) : (
             <ul className="space-y-2 text-base leading-relaxed text-stone-800">
               {history.map((h, i) => (

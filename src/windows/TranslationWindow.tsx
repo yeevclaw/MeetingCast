@@ -122,9 +122,14 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
       </header>
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-10 py-6">
         {visible.length === 0 ? (
-          <p style={{ fontSize: `${fontSize * 0.6}px` }} className="text-[#A89A7E]">
-            — waiting —
-          </p>
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-[#A89A7E]">
+            <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
+              {lang === "en" ? "Translation will appear here once recording starts" : "Bản dịch sẽ hiện ở đây khi bắt đầu ghi âm"}
+            </p>
+            <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center text-[#C7BBA0]">
+              {lang === "en" ? "Press Start in the control window" : "Bấm Bắt đầu ở cửa sổ điều khiển"}
+            </p>
+          </div>
         ) : (
           <ul className="space-y-4">
             {visible.map((u, idx) => {

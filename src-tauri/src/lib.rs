@@ -44,6 +44,8 @@ pub fn run() {
             translator::translate,
             config::get_config,
             config::set_config,
+            errors::open_config_folder,
+            errors::open_errors_log,
         ])
         .setup(move |app| {
             if let Err(e) = app.global_shortcut().register(toggle_shortcut.clone()) {

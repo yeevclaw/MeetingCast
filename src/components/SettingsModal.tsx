@@ -109,6 +109,25 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                 ))}
               </select>
             </Field>
+
+            <Field label="檔案">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="rounded border border-stone-300 px-2 py-1 text-xs text-stone-700 hover:bg-stone-50"
+                  onClick={() => invoke("open_config_folder").catch((e) => setError(`open: ${e}`))}
+                  type="button"
+                >
+                  📂 設定資料夾
+                </button>
+                <button
+                  className="rounded border border-stone-300 px-2 py-1 text-xs text-stone-700 hover:bg-stone-50"
+                  onClick={() => invoke("open_errors_log").catch((e) => setError(`open: ${e}`))}
+                  type="button"
+                >
+                  📝 錯誤紀錄
+                </button>
+              </div>
+            </Field>
           </div>
         )}
 
