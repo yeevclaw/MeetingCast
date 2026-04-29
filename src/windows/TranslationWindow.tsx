@@ -46,7 +46,7 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
       });
     }).then((u) => unlistenFns.push(u));
 
-    listen("stt:started", () => {
+    listen("session:reset", () => {
       setUtterances([]);
     }).then((u) => unlistenFns.push(u));
 

@@ -8,6 +8,7 @@ via sys.path; PyInstaller packaging in Phase 4 will collect them properly.
 """
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -52,6 +53,11 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     backend_name = cmd.get("backend", "local")
     language = cmd.get("language", "zh")
     source_cfg = cmd.get("source", {"type": "mic"})
+    api_cfg = cmd.get("api") or {}
+
+    deepgram_api_key = api_cfg.get("deepgram_api_key")
+    if deepgram_api_key:
+        os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
 
     try:
         chunks = make_audio_source(source_cfg)

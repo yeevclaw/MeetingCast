@@ -4,6 +4,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::errors;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiConfig {
     #[serde(default)]
@@ -84,7 +86,10 @@ pub async fn set_config(
     state: tauri::State<'_, SharedConfig>,
     config: Config,
 ) -> Result<(), String> {
-    save(&config)?;
+    if let Err(e) = save(&config) {
+        errors::record("config_save", &e, None);
+        return Err(e);
+    }
     *state.lock().await = config;
     Ok(())
 }

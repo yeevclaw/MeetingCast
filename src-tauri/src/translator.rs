@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use crate::config::SharedConfig;
+use crate::errors;
 
 #[derive(Serialize, Clone)]
 struct ChunkPayload {
@@ -77,7 +78,17 @@ pub async fn translate(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("anthropic {status}: {body}"));
+        let msg = format!("anthropic {status}: {body}");
+        errors::record(
+            "translation_api",
+            &msg,
+            Some(serde_json::json!({
+                "target": target,
+                "id": id,
+                "text_excerpt": text.chars().take(60).collect::<String>(),
+            })),
+        );
+        return Err(msg);
     }
 
     let chunk_event = format!("translation:chunk:{}", target);

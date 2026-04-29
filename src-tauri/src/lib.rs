@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Emitter;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::sync::Mutex;
 
 mod config;
+mod errors;
 mod sidecar;
 mod translator;
 
@@ -19,8 +22,20 @@ pub fn run() {
     config::seed_from_dotenv(&mut cfg);
     let shared_config: config::SharedConfig = Arc::new(Mutex::new(cfg));
 
+    let toggle_shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyM);
+    let handler_shortcut = toggle_shortcut.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(move |app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed && shortcut == &handler_shortcut {
+                        let _ = app.emit("hotkey:toggle", ());
+                    }
+                })
+                .build(),
+        )
         .manage::<sidecar::SharedManager>(Arc::new(Mutex::new(sidecar::SidecarManager::new())))
         .manage(shared_config)
         .invoke_handler(tauri::generate_handler![
@@ -30,6 +45,16 @@ pub fn run() {
             config::get_config,
             config::set_config,
         ])
+        .setup(move |app| {
+            if let Err(e) = app.global_shortcut().register(toggle_shortcut.clone()) {
+                errors::record(
+                    "global_shortcut_register",
+                    &format!("failed to register Cmd+Shift+M: {e}"),
+                    None,
+                );
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

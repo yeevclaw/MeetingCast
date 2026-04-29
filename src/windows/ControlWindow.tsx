@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import SettingsModal from "@/components/SettingsModal";
 import type { Source, TranscriptPayload } from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
+
+type Toast = { kind: "info" | "warning" | "error"; message: string };
+
+type CrashPayload = { attempt: number; max: number; stderr_tail?: string };
+type RestoredPayload = { attempt: number };
 
 export default function ControlWindow() {
   const [running, setRunning] = useState(false);
@@ -14,7 +19,52 @@ export default function ControlWindow() {
   const [history, setHistory] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
   const historyRef = useRef<HTMLDivElement>(null);
+  const runningRef = useRef(false);
+  const backendRef = useRef(backend);
+  const useMicRef = useRef(useMic);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+  useEffect(() => {
+    backendRef.current = backend;
+  }, [backend]);
+  useEffect(() => {
+    useMicRef.current = useMic;
+  }, [useMic]);
+
+  const showToast = useCallback((kind: Toast["kind"], message: string, ms = 4000) => {
+    setToast({ kind, message });
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    if (ms > 0) {
+      toastTimerRef.current = setTimeout(() => setToast(null), ms);
+    }
+  }, []);
+
+  const handleStart = useCallback(async () => {
+    setError(null);
+    setHistory([]);
+    setLatestZh("");
+    const source: Source = useMicRef.current
+      ? { type: "mic" }
+      : { type: "wav", path: DEMO_WAV };
+    try {
+      await invoke("start_stt", { backend: backendRef.current, source });
+    } catch (err) {
+      setError(`start: ${err}`);
+    }
+  }, []);
+
+  const handleStop = useCallback(async () => {
+    try {
+      await invoke("stop_stt");
+    } catch (err) {
+      setError(`stop: ${err}`);
+    }
+  }, []);
 
   useEffect(() => {
     const unlistenFns: Array<() => void> = [];
@@ -43,34 +93,37 @@ export default function ControlWindow() {
       unlistenFns.push(u),
     );
 
-    return () => unlistenFns.forEach((f) => f());
-  }, []);
+    listen<CrashPayload>("stt:crashed", (e) => {
+      const { attempt, max } = e.payload;
+      showToast("warning", `辨識引擎崩潰，重啟中 (${attempt}/${max})`);
+    }).then((u) => unlistenFns.push(u));
+    listen<RestoredPayload>("stt:restored", (e) => {
+      showToast("info", `辨識引擎已重啟 (第 ${e.payload.attempt} 次)`);
+    }).then((u) => unlistenFns.push(u));
+    listen<string>("stt:fatal", (e) => {
+      setRunning(false);
+      showToast("error", e.payload, 0);
+    }).then((u) => unlistenFns.push(u));
+
+    listen("hotkey:toggle", () => {
+      if (runningRef.current) {
+        handleStop();
+      } else {
+        handleStart();
+      }
+    }).then((u) => unlistenFns.push(u));
+
+    return () => {
+      unlistenFns.forEach((f) => f());
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, [handleStart, handleStop, showToast]);
 
   useEffect(() => {
     if (historyRef.current) {
       historyRef.current.scrollTop = historyRef.current.scrollHeight;
     }
   }, [history]);
-
-  async function handleStart() {
-    setError(null);
-    setHistory([]);
-    setLatestZh("");
-    const source: Source = useMic ? { type: "mic" } : { type: "wav", path: DEMO_WAV };
-    try {
-      await invoke("start_stt", { backend, source });
-    } catch (err) {
-      setError(`start: ${err}`);
-    }
-  }
-
-  async function handleStop() {
-    try {
-      await invoke("stop_stt");
-    } catch (err) {
-      setError(`stop: ${err}`);
-    }
-  }
 
   return (
     <main className="relative flex h-screen flex-col bg-stone-50 text-stone-900">
@@ -127,6 +180,21 @@ export default function ControlWindow() {
       {error && (
         <div className="border-b border-rose-200 bg-rose-50 px-6 py-2 text-sm text-rose-700">
           {error}
+        </div>
+      )}
+
+      {toast && (
+        <div
+          className={`pointer-events-auto fixed right-4 top-4 z-20 max-w-xs rounded-md border px-4 py-2 text-sm shadow ${
+            toast.kind === "error"
+              ? "border-rose-300 bg-rose-50 text-rose-800"
+              : toast.kind === "warning"
+              ? "border-amber-300 bg-amber-50 text-amber-800"
+              : "border-sky-300 bg-sky-50 text-sky-800"
+          }`}
+          onClick={() => setToast(null)}
+        >
+          {toast.message}
         </div>
       )}
 
