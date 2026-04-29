@@ -8,7 +8,7 @@ const TITLES: Record<Lang, string> = {
   vi: "Tiếng Việt",
 };
 
-const KEEP_RECENT = 5;
+const FADE_WINDOW = 5;
 const FONT_STEP = 4;
 const FONT_MIN = 20;
 const FONT_MAX = 64;
@@ -80,8 +80,6 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
     setFontSize((s) => Math.max(FONT_MIN, Math.min(FONT_MAX, s + delta)));
   }
 
-  const visible = utterances.slice(-KEEP_RECENT);
-
   return (
     <main className="flex h-screen flex-col bg-[#F5F1E8] text-[#2A2018]">
       <header className="flex flex-shrink-0 items-center justify-between border-b border-[#E0D8C5] px-6 py-1 text-xs font-medium uppercase tracking-wider text-[#6B5E4A]">
@@ -121,7 +119,7 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
         </div>
       </header>
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-10 py-6">
-        {visible.length === 0 ? (
+        {utterances.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-[#A89A7E]">
             <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
               {lang === "en" ? "Translation will appear here once recording starts" : "Bản dịch sẽ hiện ở đây khi bắt đầu ghi âm"}
@@ -132,9 +130,14 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
           </div>
         ) : (
           <ul className="space-y-4">
-            {visible.map((u, idx) => {
-              const distanceFromLast = visible.length - 1 - idx;
-              const opacity = Math.max(0.3, 1 - distanceFromLast * 0.18);
+            {utterances.map((u, idx) => {
+              const distanceFromLast = utterances.length - 1 - idx;
+              // Last FADE_WINDOW items get a fresh→dim gradient; older
+              // items stay at the 0.3 floor (still readable, scrollable).
+              const opacity =
+                distanceFromLast >= FADE_WINDOW
+                  ? 0.3
+                  : Math.max(0.3, 1 - distanceFromLast * 0.18);
               return (
                 <li
                   key={u.id}
