@@ -21,36 +21,39 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const unlistenFns: Array<() => void> = [];
+    const unlistens: Array<Promise<() => void>> = [
+      listen<TranscriptPayload>("transcript", (e) => {
+        const { is_final, text, t_start } = e.payload;
+        if (!is_final || !text) return;
+        const id = String(t_start);
+        setUtterances((prev) => {
+          if (prev.some((u) => u.id === id)) return prev; // dedup
+          return [...prev, { id, zh: text, en: "", vi: "" }];
+        });
+      }),
+      listen<ChunkPayload>(`translation:chunk:${lang}`, (e) => {
+        const { id, text } = e.payload;
+        setUtterances((us) => {
+          const idx = us.findIndex((u) => u.id === id);
+          if (idx === -1) {
+            // chunk arrived before transcript event reached this window — buffer as new
+            return [...us, { id, zh: "", en: "", vi: "", [lang]: text }] as Utterance[];
+          }
+          const updated: Utterance = { ...us[idx], [lang]: us[idx][lang] + text };
+          return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
+        });
+      }),
+      listen("session:reset", () => {
+        setUtterances([]);
+      }),
+    ];
 
-    listen<TranscriptPayload>("transcript", (e) => {
-      const { is_final, text, t_start } = e.payload;
-      if (!is_final || !text) return;
-      const id = String(t_start);
-      setUtterances((prev) => {
-        if (prev.some((u) => u.id === id)) return prev; // dedup
-        return [...prev, { id, zh: text, en: "", vi: "" }];
-      });
-    }).then((u) => unlistenFns.push(u));
-
-    listen<ChunkPayload>(`translation:chunk:${lang}`, (e) => {
-      const { id, text } = e.payload;
-      setUtterances((us) => {
-        const idx = us.findIndex((u) => u.id === id);
-        if (idx === -1) {
-          // chunk arrived before transcript event reached this window — buffer as new
-          return [...us, { id, zh: "", en: "", vi: "", [lang]: text }] as Utterance[];
-        }
-        const updated: Utterance = { ...us[idx], [lang]: us[idx][lang] + text };
-        return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
-      });
-    }).then((u) => unlistenFns.push(u));
-
-    listen("session:reset", () => {
-      setUtterances([]);
-    }).then((u) => unlistenFns.push(u));
-
-    return () => unlistenFns.forEach((f) => f());
+    return () => {
+      // Promise-based cleanup so StrictMode double-mounts don't leave duplicate
+      // listeners. If the promise hasn't resolved yet, the unlisten still fires
+      // once it does.
+      unlistens.forEach((p) => p.then((u) => u()));
+    };
   }, [lang]);
 
   useEffect(() => {

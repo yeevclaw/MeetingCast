@@ -67,54 +67,52 @@ export default function ControlWindow() {
   }, []);
 
   useEffect(() => {
-    const unlistenFns: Array<() => void> = [];
-
-    listen<TranscriptPayload>("transcript", (e) => {
-      const { text, is_final, t_start } = e.payload;
-      if (!text) return;
-      if (is_final) {
-        setHistory((h) => [...h, text]);
-        setLatestZh("");
-        const id = String(t_start);
-        invoke("translate", { id, text, target: "en" }).catch((err) =>
-          setError(`translate en: ${err}`),
-        );
-        invoke("translate", { id, text, target: "vi" }).catch((err) =>
-          setError(`translate vi: ${err}`),
-        );
-      } else {
-        setLatestZh(text);
-      }
-    }).then((u) => unlistenFns.push(u));
-
-    listen("stt:started", () => setRunning(true)).then((u) => unlistenFns.push(u));
-    listen("stt:stopped", () => setRunning(false)).then((u) => unlistenFns.push(u));
-    listen<string>("stt:error", (e) => setError(e.payload)).then((u) =>
-      unlistenFns.push(u),
-    );
-
-    listen<CrashPayload>("stt:crashed", (e) => {
-      const { attempt, max } = e.payload;
-      showToast("warning", `辨識引擎崩潰，重啟中 (${attempt}/${max})`);
-    }).then((u) => unlistenFns.push(u));
-    listen<RestoredPayload>("stt:restored", (e) => {
-      showToast("info", `辨識引擎已重啟 (第 ${e.payload.attempt} 次)`);
-    }).then((u) => unlistenFns.push(u));
-    listen<string>("stt:fatal", (e) => {
-      setRunning(false);
-      showToast("error", e.payload, 0);
-    }).then((u) => unlistenFns.push(u));
-
-    listen("hotkey:toggle", () => {
-      if (runningRef.current) {
-        handleStop();
-      } else {
-        handleStart();
-      }
-    }).then((u) => unlistenFns.push(u));
+    const unlistens: Array<Promise<() => void>> = [
+      listen<TranscriptPayload>("transcript", (e) => {
+        const { text, is_final, t_start } = e.payload;
+        if (!text) return;
+        if (is_final) {
+          setHistory((h) => [...h, text]);
+          setLatestZh("");
+          const id = String(t_start);
+          invoke("translate", { id, text, target: "en" }).catch((err) =>
+            setError(`translate en: ${err}`),
+          );
+          invoke("translate", { id, text, target: "vi" }).catch((err) =>
+            setError(`translate vi: ${err}`),
+          );
+        } else {
+          setLatestZh(text);
+        }
+      }),
+      listen("stt:started", () => setRunning(true)),
+      listen("stt:stopped", () => setRunning(false)),
+      listen<string>("stt:error", (e) => setError(e.payload)),
+      listen<CrashPayload>("stt:crashed", (e) => {
+        const { attempt, max } = e.payload;
+        showToast("warning", `辨識引擎崩潰，重啟中 (${attempt}/${max})`);
+      }),
+      listen<RestoredPayload>("stt:restored", (e) => {
+        showToast("info", `辨識引擎已重啟 (第 ${e.payload.attempt} 次)`);
+      }),
+      listen<string>("stt:fatal", (e) => {
+        setRunning(false);
+        showToast("error", e.payload, 0);
+      }),
+      listen("hotkey:toggle", () => {
+        if (runningRef.current) {
+          handleStop();
+        } else {
+          handleStart();
+        }
+      }),
+    ];
 
     return () => {
-      unlistenFns.forEach((f) => f());
+      // Promise-based cleanup so StrictMode double-mounts don't leave duplicate
+      // listeners. If the promise hasn't resolved yet, the unlisten still fires
+      // once it does.
+      unlistens.forEach((p) => p.then((u) => u()));
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, [handleStart, handleStop, showToast]);
