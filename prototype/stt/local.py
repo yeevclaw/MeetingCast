@@ -1,3 +1,6 @@
+import sys
+from collections import Counter
+
 import numpy as np
 import torch
 import mlx_whisper
@@ -8,6 +11,21 @@ from .base import Transcript
 
 WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 
+HALLUCINATION_MIN_CHARS = 20
+HALLUCINATION_DOMINANCE = 0.5
+
+
+def _is_hallucination(text: str) -> bool:
+    """Whisper on silence/noise often emits one Chinese char repeated dozens of
+    times (e.g. '示示示示...'). Filter when a single non-whitespace character
+    occupies more than HALLUCINATION_DOMINANCE of a string longer than
+    HALLUCINATION_MIN_CHARS."""
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < HALLUCINATION_MIN_CHARS:
+        return False
+    most_common = Counter(chars).most_common(1)[0][1]
+    return most_common / len(chars) > HALLUCINATION_DOMINANCE
+
 
 class MLXWhisperSTT:
     MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
@@ -16,7 +34,7 @@ class MLXWhisperSTT:
         self,
         language: str = "zh",
         model_repo: str | None = None,
-        max_speech_sec: float = 15.0,
+        max_speech_sec: float = 8.0,
     ):
         self.language = language
         self.model_repo = model_repo or self.MODEL_REPO
@@ -34,7 +52,14 @@ class MLXWhisperSTT:
             path_or_hf_repo=self.model_repo,
             language=self.language,
         )
-        return result["text"].strip()
+        text = result["text"].strip()
+        if _is_hallucination(text):
+            print(
+                f"[hallucination filtered] {text[:40]}{'...' if len(text) > 40 else ''}",
+                file=sys.stderr,
+            )
+            return ""
+        return text
 
     def transcribe_file(self, path: str) -> Transcript:
         return Transcript(text=self._transcribe_audio(path), is_final=True)
@@ -43,14 +68,14 @@ class MLXWhisperSTT:
         """PCM16 LE byte chunks → Transcript per VAD-cut utterance.
 
         Force-flushes after max_speech_sec to handle continuous speech
-        (e.g. broadcasters, fast presenters) where VAD never sees a 400ms gap.
+        (e.g. broadcasters, fast presenters) where VAD never sees a pause.
         """
         max_samples = int(self.max_speech_sec * sample_rate)
         vad_iter = VADIterator(
             self._vad(),
             threshold=0.5,
             sampling_rate=sample_rate,
-            min_silence_duration_ms=400,
+            min_silence_duration_ms=300,
             speech_pad_ms=30,
         )
         leftover = b""
