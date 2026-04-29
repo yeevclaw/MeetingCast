@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import SettingsModal from "@/components/SettingsModal";
+import WelcomeWizard from "@/components/WelcomeWizard";
 import { friendly } from "@/lib/errors";
-import type { Source, TranscriptPayload } from "@/lib/types";
+import type { Config, Source, TranscriptPayload } from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
 
@@ -21,11 +22,27 @@ export default function ControlWindow() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
+  const [needsWelcome, setNeedsWelcome] = useState<Config | null>(null);
+  const [modelLoading, setModelLoading] = useState(false);
+  const modelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const historyRef = useRef<HTMLDivElement>(null);
   const runningRef = useRef(false);
   const backendRef = useRef(backend);
   const useMicRef = useRef(useMic);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    // First-run detection: show wizard until anthropic key is set.
+    invoke<Config>("get_config")
+      .then((cfg) => {
+        if (!cfg.api.anthropic_api_key.trim()) {
+          setNeedsWelcome(cfg);
+        }
+      })
+      .catch(() => {
+        // If config fetch fails, don't block the UI; user can still hit Settings.
+      });
+  }, []);
 
   useEffect(() => {
     runningRef.current = running;
@@ -86,8 +103,27 @@ export default function ControlWindow() {
           setLatestZh(text);
         }
       }),
-      listen("stt:started", () => setRunning(true)),
+      listen("stt:started", () => {
+        setRunning(true);
+        if (modelTimerRef.current) {
+          clearTimeout(modelTimerRef.current);
+          modelTimerRef.current = null;
+        }
+        setModelLoading(false);
+      }),
       listen("stt:stopped", () => setRunning(false)),
+      listen("stt:model_loading", () => {
+        // Delay painting the overlay so cache hits (model_ready arrives within
+        // a few ms) never flash. Only a real first-run download triggers the UI.
+        modelTimerRef.current = setTimeout(() => setModelLoading(true), 400);
+      }),
+      listen("stt:model_ready", () => {
+        if (modelTimerRef.current) {
+          clearTimeout(modelTimerRef.current);
+          modelTimerRef.current = null;
+        }
+        setModelLoading(false);
+      }),
       listen<string>("stt:error", (e) => setError(e.payload)),
       listen<CrashPayload>("stt:crashed", (e) => {
         const { attempt, max } = e.payload;
@@ -115,6 +151,7 @@ export default function ControlWindow() {
       // once it does.
       unlistens.forEach((p) => p.then((u) => u()));
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      if (modelTimerRef.current) clearTimeout(modelTimerRef.current);
     };
   }, [handleStart, handleStop, showToast]);
 
@@ -221,6 +258,27 @@ export default function ControlWindow() {
       )}
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+
+      {needsWelcome && (
+        <WelcomeWizard
+          initialConfig={needsWelcome}
+          onDone={() => setNeedsWelcome(null)}
+        />
+      )}
+
+      {modelLoading && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-stone-900/40 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-3 rounded-lg bg-white px-8 py-6 shadow-xl">
+            <div className="flex items-center gap-3">
+              <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-stone-300 border-t-emerald-600" />
+              <p className="font-medium text-stone-900">正在準備辨識模型</p>
+            </div>
+            <p className="max-w-xs text-center text-xs text-stone-500">
+              首次啟動需下載 ~1.5 GB（mlx-whisper large-v3-turbo）。下次直接使用快取，這只是首次需要等。
+            </p>
+          </div>
+        </div>
+      )}
 
       <section className="flex flex-1 flex-col overflow-hidden">
         <div className="flex-shrink-0 border-b border-stone-200 px-6 py-1 text-xs font-medium uppercase tracking-wide text-stone-500">

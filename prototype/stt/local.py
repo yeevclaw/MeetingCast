@@ -94,6 +94,15 @@ class MLXWhisperSTT:
             self._vad_model = load_silero_vad()
         return self._vad_model
 
+    def ensure_loaded(self) -> None:
+        """Pre-fetch model snapshot from HuggingFace. Idempotent — returns
+        instantly if already cached. Use before the first transcribe to
+        front-load the ~1.5GB download instead of blocking the first
+        utterance for 1–2 minutes."""
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(self.model_repo)
+
     def _transcribe_audio(self, audio) -> str:
         # B: RMS energy gate. Skip segments quieter than fan/keyboard noise
         # without ever calling Whisper. This is the cheapest hallucination

@@ -60,8 +60,15 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
         os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
 
     try:
-        chunks = make_audio_source(source_cfg)
         stt = get_backend(backend_name, language=language)
+        # Front-load the local model snapshot before opening the mic, so the
+        # user sees a clear "preparing" state instead of a 1–2 min freeze on
+        # first start. No-op if cached.
+        if hasattr(stt, "ensure_loaded"):
+            emit({"type": "model_loading"})
+            await asyncio.to_thread(stt.ensure_loaded)
+            emit({"type": "model_ready"})
+        chunks = make_audio_source(source_cfg)
     except Exception as e:
         emit({"type": "error", "message": f"setup failed: {e}"})
         return

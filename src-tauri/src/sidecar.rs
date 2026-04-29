@@ -26,6 +26,8 @@ pub enum SidecarEvent {
     Ready,
     Started,
     Stopped,
+    ModelLoading,
+    ModelReady,
     Transcript {
         text: String,
         is_final: bool,
@@ -257,6 +259,8 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Started => app.emit("stt:started", ()),
         SidecarEvent::Stopped => app.emit("stt:stopped", ()),
         SidecarEvent::Ready => app.emit("stt:ready", ()),
+        SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
+        SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
         SidecarEvent::Error { message } => {
             errors::record("sidecar_protocol_error", message, None);
             app.emit("stt:error", message)
