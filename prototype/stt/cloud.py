@@ -48,7 +48,7 @@ class DeepgramSTT:
             interim_results="true",  # type: ignore[arg-type]
             punctuate="true",  # type: ignore[arg-type]
             smart_format="true",  # type: ignore[arg-type]
-            utterance_end_ms=1000,
+            utterance_end_ms=700,
             vad_events="true",  # type: ignore[arg-type]
         ) as conn:
 

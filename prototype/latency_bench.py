@@ -200,7 +200,7 @@ def render_report(runs: list[SegmentRun], total_bench_ms: float) -> str:
     target = 2500
     e2e_p50 = max(e2e_en["p50"], e2e_vi["p50"])
     e2e_p95 = max(e2e_en["p95"], e2e_vi["p95"])
-    vad_silence = 400
+    vad_silence = 300
     perceived_p50 = e2e_p50 + vad_silence
     perceived_p95 = e2e_p95 + vad_silence
     verdict_p50 = "✅ 達標" if perceived_p50 < target else "⚠️ 超標"

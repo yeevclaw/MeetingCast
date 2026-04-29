@@ -47,7 +47,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 VAD 參數調校建議：
 - `threshold`: 0.5（太低會誤觸，太高會漏字）
-- `min_silence_duration_ms`: 400（句尾停頓判定）
+- `min_silence_duration_ms`: 300（句尾停頓判定，速度優先；若切太碎再調回 400）
 - `min_speech_duration_ms`: 250（過濾雜音）
 
 ### Step 6：串起完整 pipeline
@@ -167,7 +167,7 @@ if __name__ == "__main__":
 2. **Whisper 模型下載**：首次跑會自動下載到 `~/.cache/huggingface/`，約 1.5GB
 3. **silero-vad 取樣率**：必須是 16000 Hz，麥克風 capture 時就要 resample
 4. **asyncio + sounddevice**：sounddevice 的 callback 是同步的，要用 `asyncio.Queue` 橋接到 async 世界
-5. **長句處理**：如果使用者連續講超過 15 秒不停頓，VAD 不會切，要設 `max_speech_sec` 強制切片
+5. **長句處理**：如果使用者連續講超過 8 秒不停頓，VAD 不會切，要設 `max_speech_sec` 強制切片
 
 ## 完成 Phase 1 後的決策點
 

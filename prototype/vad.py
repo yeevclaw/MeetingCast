@@ -20,9 +20,9 @@ class VADSegmenter:
     def __init__(
         self,
         threshold: float = 0.5,
-        min_silence_ms: int = 400,
+        min_silence_ms: int = 300,
         min_speech_ms: int = 250,
-        max_speech_sec: float = 15.0,
+        max_speech_sec: float = 8.0,
         sample_rate: int = 16000,
     ):
         self.model = load_silero_vad()
