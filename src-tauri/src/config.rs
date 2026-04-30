@@ -43,10 +43,22 @@ pub struct GlossaryEntry {
     pub vi: String,
 }
 
+/// Audio capture preferences. `input_device` is the sounddevice device name
+/// (e.g. "MacBook Pro Microphone"); empty string means "use system default".
+/// Names are persisted instead of integer indices because indices reshuffle
+/// when USB/Bluetooth devices are plugged in or out.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub input_device: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
     /// BTreeMap so config.toml round-trips with stable key order.
     #[serde(default)]
     pub glossary: BTreeMap<String, GlossaryEntry>,

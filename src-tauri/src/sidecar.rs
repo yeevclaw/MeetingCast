@@ -11,7 +11,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::config::SharedConfig;
 use crate::errors;
@@ -19,6 +19,13 @@ use crate::errors;
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
 const STDERR_TAIL_LINES: usize = 50;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AudioDevice {
+    pub name: String,
+    #[serde(default)]
+    pub channels: u32,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,6 +49,18 @@ pub enum SidecarEvent {
         t_start: f64,
         t_end: f64,
     },
+    /// Response to a `list_devices` command — consumed by the matching
+    /// oneshot in `list_audio_devices`, never forwarded to the frontend
+    /// as a Tauri event.
+    Devices {
+        devices: Vec<AudioDevice>,
+    },
+    /// Soft warning the sidecar wants to surface to the user without
+    /// aborting the session — e.g. mic device fallback. Distinct from
+    /// `Error` so the UI can render it as a non-fatal toast.
+    Warning {
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -58,6 +77,11 @@ pub struct SidecarManager {
     /// the moment it exits. Lets the frontend distinguish "warming up the
     /// PyInstaller bundle (~10s)" from "ready to record".
     ready: bool,
+    /// One-shot for the most recent `list_devices` request. The stdout reader
+    /// fulfils it when it sees a `devices` event; old senders are dropped
+    /// (resolving with an error on the awaiting side) if a second request
+    /// arrives before the first response.
+    pending_devices: Option<oneshot::Sender<Vec<AudioDevice>>>,
 }
 
 impl SidecarManager {
@@ -70,6 +94,18 @@ impl SidecarManager {
             intentional_stop: false,
             stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LINES),
             ready: false,
+            pending_devices: None,
+        }
+    }
+
+    /// Mark the next exit as intentional (so the watchdog doesn't try to
+    /// restart) and write a shutdown command into the child's stdin. Used
+    /// by lib.rs's RunEvent::ExitRequested hook for a graceful quit.
+    pub async fn request_shutdown(&mut self) {
+        self.intentional_stop = true;
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
+            let _ = stdin.flush().await;
         }
     }
 }
@@ -86,15 +122,29 @@ fn project_root() -> PathBuf {
 const SIDECAR_BIN_NAME: &str = "stt_engine";
 
 /// Resolve which binary to spawn for the STT sidecar.
-/// Production (bundled): the PyInstaller binary that Tauri's externalBin
-/// places alongside the main executable as `stt_engine-<target-triple>`
-/// (or sometimes the bare `stt_engine` after bundling). Falls back to the
-/// dev venv for `pnpm tauri dev` / `cargo run`.
+///
+/// Priority:
+///   1. Dev venv (`prototype/.venv/bin/python` + `python-sidecar/stt_engine.py`)
+///      — if both exist, prefer them. This means dev mode (`pnpm tauri dev` /
+///      `cargo run`) always picks up live Python edits and never gets shadowed
+///      by a stale PyInstaller copy that Tauri's externalBin re-staged into
+///      `target/debug/`. In a release `.app` bundle these paths don't resolve
+///      (there is no project tree next to the executable), so this branch is
+///      naturally inert in production.
+///   2. Bundled binary (`stt_engine` or `stt_engine-<triple>` next to the
+///      main executable) — production fallback.
 ///
 /// Returns (program, leading_args). Leading args are arguments inserted
 /// before any caller-supplied args — used to pass the script path when
 /// running via the dev-mode Python interpreter.
 fn locate_sidecar() -> Result<(PathBuf, Vec<String>), String> {
+    let root = project_root();
+    let python = root.join("prototype/.venv/bin/python");
+    let script = root.join("python-sidecar/stt_engine.py");
+    if python.exists() && script.exists() {
+        return Ok((python, vec![script.to_string_lossy().to_string()]));
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             // Tauri's externalBin places the binary in the same directory as
@@ -119,20 +169,10 @@ fn locate_sidecar() -> Result<(PathBuf, Vec<String>), String> {
         }
     }
 
-    // Dev fallback: prototype/.venv/bin/python + python-sidecar/stt_engine.py
-    let root = project_root();
-    let python = root.join("prototype/.venv/bin/python");
-    let script = root.join("python-sidecar/stt_engine.py");
-    if !python.exists() {
-        return Err(format!(
-            "sidecar binary not found in app bundle and dev venv missing: {}",
-            python.display()
-        ));
-    }
-    if !script.exists() {
-        return Err(format!("sidecar script not found: {}", script.display()));
-    }
-    Ok((python, vec![script.to_string_lossy().to_string()]))
+    Err(format!(
+        "sidecar not found: neither dev venv ({}) nor a bundled binary alongside the main exe is present",
+        python.display()
+    ))
 }
 
 type SpawnFut = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -192,10 +232,20 @@ async fn spawn_inner_body(
         while let Ok(Some(line)) = lines.next_line().await {
             match serde_json::from_str::<SidecarEvent>(&line) {
                 Ok(event) => {
-                    if matches!(event, SidecarEvent::Ready) {
-                        mgr_o.lock().await.ready = true;
+                    match event {
+                        SidecarEvent::Ready => {
+                            mgr_o.lock().await.ready = true;
+                            emit_event(&app_o, SidecarEvent::Ready);
+                        }
+                        // `devices` is RPC-style — route it to whoever is awaiting
+                        // the oneshot. Don't emit a Tauri event for it.
+                        SidecarEvent::Devices { devices } => {
+                            if let Some(tx) = mgr_o.lock().await.pending_devices.take() {
+                                let _ = tx.send(devices);
+                            }
+                        }
+                        other => emit_event(&app_o, other),
                     }
-                    emit_event(&app_o, event);
                 }
                 Err(e) => eprintln!("[sidecar] invalid json: {line:?} ({e})"),
             }
@@ -335,10 +385,13 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
                 "message": message,
             }),
         ),
+        SidecarEvent::Warning { message } => app.emit("stt:warning", message),
         SidecarEvent::Error { message } => {
             errors::record("sidecar_protocol_error", message, None);
             app.emit("stt:error", message)
         }
+        // Routed via the oneshot in the stdout reader — should never reach here.
+        SidecarEvent::Devices { .. } => Ok(()),
     };
 }
 
@@ -348,9 +401,23 @@ pub async fn start_stt(
     state: tauri::State<'_, SharedManager>,
     config: tauri::State<'_, SharedConfig>,
     backend: String,
-    source: Value,
+    mut source: Value,
     language: Option<String>,
 ) -> Result<(), String> {
+    // If source.type == "mic" and the caller didn't specify a device,
+    // backfill from config so the user's persisted preference is honored
+    // even when the frontend forgets to pass it.
+    if source.get("type").and_then(|v| v.as_str()) == Some("mic")
+        && source.get("device").is_none()
+    {
+        let device = config.lock().await.audio.input_device.clone();
+        if !device.is_empty() {
+            if let Some(obj) = source.as_object_mut() {
+                obj.insert("device".into(), Value::String(device));
+            }
+        }
+    }
+
     let need_spawn = {
         let mut m = state.lock().await;
         m.restart_attempts = 0;
@@ -433,6 +500,34 @@ pub async fn prewarm_sidecar(
     prewarm(app, state.inner().clone(), config.inner().clone()).await
 }
 
+/// Tear down the current sidecar (intentional, no auto-restart) and spawn a
+/// fresh one. Used by the frontend to retry after a prewarm step errored —
+/// e.g. model snapshot download interrupted by a flaky network.
+#[tauri::command]
+pub async fn restart_sidecar(
+    app: AppHandle,
+    state: tauri::State<'_, SharedManager>,
+    config: tauri::State<'_, SharedConfig>,
+) -> Result<(), String> {
+    {
+        let mut m = state.lock().await;
+        // Reset restart_attempts so the watchdog doesn't refuse the new spawn
+        // on the basis of stale crash counts from before the user hit retry.
+        m.restart_attempts = 0;
+        m.request_shutdown().await;
+    }
+    // Wait briefly for the child to exit cleanly. Polling stdin == None is
+    // the cheapest signal that the watchdog has reaped it. Cap at 1 s — if
+    // the child is wedged we'd rather force-spawn anyway than block forever.
+    for _ in 0..20 {
+        if state.lock().await.stdin.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    prewarm(app, state.inner().clone(), config.inner().clone()).await
+}
+
 /// Whether the sidecar has emitted its initial `ready` event and can accept
 /// a `start` command without first paying the cold-start cost.
 #[tauri::command]
@@ -452,4 +547,39 @@ pub async fn stop_stt(state: tauri::State<'_, SharedManager>) -> Result<(), Stri
         let _ = stdin.flush().await;
     }
     Ok(())
+}
+
+/// Ask the sidecar to enumerate input-capable audio devices via sounddevice.
+/// The sidecar replies with a `devices` event; the stdout reader routes the
+/// payload back through the oneshot installed here. Returns an empty list
+/// if the sidecar is still warming up — callers should retry once `ready`.
+#[tauri::command]
+pub async fn list_audio_devices(
+    state: tauri::State<'_, SharedManager>,
+) -> Result<Vec<AudioDevice>, String> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut m = state.lock().await;
+        if m.stdin.is_none() {
+            return Err("sidecar not running".into());
+        }
+        // Drop any prior pending request — the awaiter will see a channel-
+        // closed error, which the UI treats as a transient failure.
+        m.pending_devices = Some(tx);
+        let line = "{\"type\":\"list_devices\"}\n";
+        let stdin = m.stdin.as_mut().ok_or("no stdin")?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("write stdin: {e}"))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| format!("flush stdin: {e}"))?;
+    }
+    match tokio::time::timeout(Duration::from_secs(3), rx).await {
+        Ok(Ok(devices)) => Ok(devices),
+        Ok(Err(_)) => Err("sidecar dropped response".into()),
+        Err(_) => Err("list_devices timeout".into()),
+    }
 }

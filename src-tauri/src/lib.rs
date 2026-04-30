@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use std::time::Duration;
+use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::sync::Mutex;
 
@@ -43,7 +44,9 @@ pub fn run() {
             sidecar::start_stt,
             sidecar::stop_stt,
             sidecar::prewarm_sidecar,
+            sidecar::restart_sidecar,
             sidecar::sidecar_ready,
+            sidecar::list_audio_devices,
             translator::translate,
             translator::clear_translation_context,
             config::get_config,
@@ -75,6 +78,26 @@ pub fn run() {
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. }) {
+                // Best-effort graceful shutdown: ask the sidecar to wind down
+                // its STT loop and exit cleanly. Without this, kill_on_drop
+                // sends SIGKILL the moment the manager is dropped, which can
+                // leave CoreAudio holding the mic for a few seconds and
+                // skips any cleanup the Python child wanted to do.
+                let mgr_state: tauri::State<sidecar::SharedManager> =
+                    app.state::<sidecar::SharedManager>();
+                let mgr = mgr_state.inner().clone();
+                tauri::async_runtime::block_on(async move {
+                    // 500 ms cap — we don't want to hang the app on quit
+                    // even if the sidecar is wedged.
+                    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                        mgr.lock().await.request_shutdown().await;
+                    })
+                    .await;
+                });
+            }
+        });
 }

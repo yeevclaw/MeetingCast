@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import type { Config } from "@/lib/types";
+import type { AudioDevice, Config } from "@/lib/types";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 
@@ -28,13 +28,40 @@ export default function SettingsModal({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string>("");
+  const [devices, setDevices] = useState<AudioDevice[] | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
+  const [refreshingDevices, setRefreshingDevices] = useState(false);
+  // Dedup concurrent refreshes — without this, React StrictMode's double-
+  // mount fires two list_audio_devices in flight simultaneously, the second
+  // overwrites the first's oneshot in the Rust side, and the first call
+  // surfaces a spurious "sidecar dropped response" even though devices
+  // ultimately come back fine.
+  const refreshInFlightRef = useRef(false);
+
+  const refreshDevices = useCallback(async () => {
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    setRefreshingDevices(true);
+    try {
+      const list = await invoke<AudioDevice[]>("list_audio_devices");
+      setDevices(list);
+      setDevicesError(null);
+    } catch (e) {
+      setDevicesError(String(e));
+      setDevices([]);
+    } finally {
+      refreshInFlightRef.current = false;
+      setRefreshingDevices(false);
+    }
+  }, []);
 
   useEffect(() => {
     invoke<Config>("get_config")
       .then(setCfg)
       .catch((e) => setError(`load: ${e}`));
     getVersion().then(setVersion).catch(() => {});
-  }, []);
+    refreshDevices();
+  }, [refreshDevices]);
 
   async function handleSave() {
     if (!cfg) return;
@@ -55,10 +82,15 @@ export default function SettingsModal({
     setCfg({ ...cfg, api: { ...cfg.api, ...patch } });
   }
 
+  function updateAudio(patch: Partial<Config["audio"]>) {
+    if (!cfg) return;
+    setCfg({ ...cfg, audio: { ...cfg.audio, ...patch } });
+  }
+
   return (
-    <div className="absolute inset-0 z-10 flex items-center justify-center bg-paper-900/30 p-4">
-      <div className="w-full max-w-md rounded-lg border border-paper-200 bg-white p-5 shadow-xl">
-        <header className="flex items-center justify-between border-b border-paper-200 pb-3">
+    <div className="absolute inset-0 z-10 flex items-stretch justify-center bg-paper-900/30 p-4">
+      <div className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-lg border border-paper-200 bg-white shadow-xl">
+        <header className="flex flex-shrink-0 items-center justify-between border-b border-paper-200 px-5 py-3">
           <h2 className="text-lg font-semibold">設定</h2>
           <button
             className="text-paper-500 hover:text-paper-900"
@@ -70,9 +102,9 @@ export default function SettingsModal({
         </header>
 
         {!cfg ? (
-          <p className="py-6 text-sm text-paper-600">載入中…</p>
+          <p className="px-5 py-6 text-sm text-paper-600">載入中…</p>
         ) : (
-          <div className="space-y-4 py-4 text-sm">
+          <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4 text-sm">
             <Field
               label="Anthropic API key"
               hint="從 console.anthropic.com 建立"
@@ -131,7 +163,11 @@ export default function SettingsModal({
 
             <Field
               label="辨識引擎"
-              hint={running ? "錄音中無法切換，請先停止" : "本地 mlx-whisper 預設；網路差時可切 cloud"}
+              hint={
+                running
+                  ? "錄音中無法切換，請先停止"
+                  : "預設 mlx-whisper（免費、離線可用）；切 cloud 需填 Deepgram API key"
+              }
             >
               <select
                 className="w-full rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
@@ -160,6 +196,56 @@ export default function SettingsModal({
               </label>
             </Field>
 
+            {useMic && (
+              <Field
+                label="麥克風裝置"
+                hint={
+                  running
+                    ? "錄音中無法切換，請先停止"
+                    : "拔插藍芽耳機或外接麥克風後可按 ↻ 重新整理"
+                }
+              >
+                <div className="flex gap-2">
+                  <select
+                    className="flex-1 rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
+                    value={cfg.audio.input_device}
+                    onChange={(e) => updateAudio({ input_device: e.target.value })}
+                    disabled={running}
+                  >
+                    <option value="">系統預設</option>
+                    {/* 已選裝置目前不在清單中（被拔掉了）— 仍保留為選項，
+                        標 "(未連接)" 提示，避免儲存時被靜默清掉。 */}
+                    {cfg.audio.input_device &&
+                      !(devices ?? []).some((d) => d.name === cfg.audio.input_device) && (
+                        <option value={cfg.audio.input_device}>
+                          {cfg.audio.input_device}（未連接）
+                        </option>
+                      )}
+                    {(devices ?? []).map((d) => (
+                      <option key={d.name} value={d.name}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="rounded border border-paper-300 px-2 text-xs text-paper-700 hover:bg-paper-100 disabled:opacity-50"
+                    onClick={refreshDevices}
+                    disabled={refreshingDevices || running}
+                    aria-label="重新整理裝置清單"
+                    title="重新整理"
+                  >
+                    {refreshingDevices ? "…" : "↻"}
+                  </button>
+                </div>
+                {devicesError && (
+                  <p className="mt-1 break-all text-xs text-danger-700">
+                    無法列出裝置：{devicesError}
+                  </p>
+                )}
+              </Field>
+            )}
+
             <Field label="檔案">
               <div className="flex flex-wrap gap-2">
                 <button
@@ -182,10 +268,10 @@ export default function SettingsModal({
         )}
 
         {error && (
-          <p className="rounded bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</p>
+          <p className="mx-5 mb-2 rounded bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</p>
         )}
 
-        <footer className="flex items-center justify-between gap-2 border-t border-paper-200 pt-3">
+        <footer className="flex flex-shrink-0 items-center justify-between gap-2 border-t border-paper-200 px-5 py-3">
           <span className="text-[11px] tabular-nums text-paper-500">
             {version ? `MeetingCast v${version}` : ""}
           </span>

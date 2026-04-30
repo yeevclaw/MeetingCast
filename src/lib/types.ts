@@ -15,7 +15,9 @@ export type TranscriptPayload = {
   t_end: number;
 };
 
-export type Source = { type: "mic" } | { type: "wav"; path: string };
+export type Source =
+  | { type: "mic"; device?: string }
+  | { type: "wav"; path: string };
 
 export type ChunkPayload = {
   id: string;
@@ -26,10 +28,18 @@ export type DonePayload = {
   id: string;
 };
 
+export type AudioDevice = {
+  name: string;
+  channels: number;
+};
+
 export type Config = {
   api: {
     anthropic_api_key: string;
     deepgram_api_key: string;
     model: string;
+  };
+  audio: {
+    input_device: string;
   };
 };

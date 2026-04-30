@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import MicMeter from "@/components/MicMeter";
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { friendly } from "@/lib/errors";
-import type { Config, Source, TranscriptPayload } from "@/lib/types";
+import type { Config, Lang, Source, TranscriptPayload } from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
 
@@ -48,6 +49,7 @@ export default function ControlWindow() {
   const [running, setRunning] = useState(false);
   const [backend, setBackend] = useState<"local" | "cloud">("local");
   const [useMic, setUseMic] = useState(true);
+  const [selectedDevice, setSelectedDevice] = useState<string>("");
   const [micAvailable, setMicAvailable] = useState<boolean | null>(null);
   const [latestZh, setLatestZh] = useState<string>("");
   const [history, setHistory] = useState<string[]>([]);
@@ -64,6 +66,7 @@ export default function ControlWindow() {
     mic: "pending",
   });
   const [stepError, setStepError] = useState<Partial<Record<StepId, string>>>({});
+  const [retryingPrewarm, setRetryingPrewarm] = useState(false);
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const modelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -81,6 +84,7 @@ export default function ControlWindow() {
         if (!cfg.api.anthropic_api_key.trim()) {
           setNeedsWelcome(cfg);
         }
+        setSelectedDevice(cfg.audio?.input_device ?? "");
       })
       .catch(() => {
         // If config fetch fails, don't block the UI; user can still hit Settings.
@@ -148,17 +152,93 @@ export default function ControlWindow() {
     }
   }, []);
 
+  // Track translation windows the user has closed so we (a) skip the
+  // translate API call (no point paying tokens for a destination nobody can
+  // see) and (b) toast exactly once per language so the user knows why
+  // half the translations stopped.
+  const closedLangsNotifiedRef = useRef<Set<Lang>>(new Set());
+
+  const requestTranslate = useCallback(
+    async (id: string, text: string, target: Lang) => {
+      const win = await WebviewWindow.getByLabel(target);
+      if (!win) {
+        if (!closedLangsNotifiedRef.current.has(target)) {
+          closedLangsNotifiedRef.current.add(target);
+          const label = target === "en" ? "英文" : "越南文";
+          showToast("warning", `${label}譯文視窗已關閉，將不再翻譯該語言`);
+        }
+        return;
+      }
+      invoke("translate", { id, text, target }).catch((err) =>
+        setError(`translate ${target}: ${err}`),
+      );
+    },
+    [showToast],
+  );
+
+  const selectedDeviceRef = useRef(selectedDevice);
+  useEffect(() => {
+    selectedDeviceRef.current = selectedDevice;
+  }, [selectedDevice]);
+
+  const startInFlightRef = useRef(false);
+
   const handleStart = useCallback(async () => {
+    // Dedup rapid double-clicks / hotkey + click race — without this, a
+    // second invoke during the first's await would surface "already running"
+    // from the sidecar as a confusing toast.
+    if (startInFlightRef.current) return;
+
+    // Pre-flight key checks. Doing these in JS avoids spinning up the
+    // recording pipeline only to have every translate fail with 401, or
+    // (for cloud STT) the sidecar connect with 401 leaving the UI stuck on
+    // "錄音中" with empty transcript.
+    try {
+      const cfg = await invoke<Config>("get_config");
+      if (!cfg.api.anthropic_api_key.trim()) {
+        showToast("error", "請先在設定填入 Anthropic API key", 5000);
+        setShowSettings(true);
+        return;
+      }
+      if (backendRef.current === "cloud" && !cfg.api.deepgram_api_key.trim()) {
+        showToast("error", "切到 cloud 辨識需要 Deepgram API key", 5000);
+        setShowSettings(true);
+        return;
+      }
+    } catch {
+      // get_config really shouldn't fail here — if it does, fall through and
+      // let the existing error path surface whatever happens.
+    }
+
+    startInFlightRef.current = true;
     setError(null);
     setHistory([]);
     setLatestZh("");
     const source: Source = useMicRef.current
-      ? { type: "mic" }
+      ? {
+          type: "mic",
+          ...(selectedDeviceRef.current ? { device: selectedDeviceRef.current } : {}),
+        }
       : { type: "wav", path: DEMO_WAV };
     try {
       await invoke("start_stt", { backend: backendRef.current, source });
     } catch (err) {
       setError(`start: ${err}`);
+    } finally {
+      startInFlightRef.current = false;
+    }
+  }, [showToast]);
+
+  const handleCloseSettings = useCallback(async () => {
+    setShowSettings(false);
+    // Settings persists audio.input_device via set_config — re-read so the
+    // main window's selectedDevice (used by MicMeter and start_stt) reflects
+    // what the user just saved.
+    try {
+      const cfg = await invoke<Config>("get_config");
+      setSelectedDevice(cfg.audio?.input_device ?? "");
+    } catch {
+      // Ignore — keep prior value.
     }
   }, []);
 
@@ -189,13 +269,16 @@ export default function ControlWindow() {
         if (is_final) {
           setHistory((h) => [...h, text]);
           setLatestZh("");
+          // Skip the translate call for trivially short utterances —
+          // single-char fragments like "嗯", "啊", "對" are usually noise
+          // or filler, and translating each one bills an API call for no
+          // user value (and often produces meta-prefix-filtered junk).
+          // Still keep the line in 中文逐字稿 history so the user sees what
+          // was heard.
+          if (text.trim().length < 2) return;
           const id = String(t_start);
-          invoke("translate", { id, text, target: "en" }).catch((err) =>
-            setError(`translate en: ${err}`),
-          );
-          invoke("translate", { id, text, target: "vi" }).catch((err) =>
-            setError(`translate vi: ${err}`),
-          );
+          requestTranslate(id, text, "en");
+          requestTranslate(id, text, "vi");
         } else {
           setLatestZh(text);
         }
@@ -248,6 +331,7 @@ export default function ControlWindow() {
         setModelLoading(false);
       }),
       listen<string>("stt:error", (e) => setError(e.payload)),
+      listen<string>("stt:warning", (e) => showToast("warning", e.payload, 6000)),
       listen<CrashPayload>("stt:crashed", (e) => {
         const { attempt, max } = e.payload;
         showToast("warning", `辨識引擎崩潰，重啟中 (${attempt}/${max})`);
@@ -276,7 +360,7 @@ export default function ControlWindow() {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       if (modelTimerRef.current) clearTimeout(modelTimerRef.current);
     };
-  }, [handleStop, requestStart, showToast]);
+  }, [handleStop, requestStart, showToast, requestTranslate]);
 
   useEffect(() => {
     if (historyRef.current) {
@@ -295,6 +379,21 @@ export default function ControlWindow() {
   }, [sessionStartedAt]);
 
   const micMissing = micAvailable === false && useMic;
+  const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
+
+  const retryPrewarm = useCallback(async () => {
+    setRetryingPrewarm(true);
+    setStepStatus({ spawn: "in_progress", model: "pending", mic: "pending" });
+    setStepError({});
+    setSidecarReady(false);
+    try {
+      await invoke("restart_sidecar");
+    } catch (e) {
+      setError(`restart: ${e}`);
+    } finally {
+      setRetryingPrewarm(false);
+    }
+  }, []);
 
   return (
     <main className="relative flex h-screen flex-col bg-paper-50 text-paper-900">
@@ -323,7 +422,7 @@ export default function ControlWindow() {
           <span className={running ? "font-medium text-paper-900" : ""}>
             {running ? "錄音中" : "閒置"}
           </span>
-          <MicMeter active={running && useMic} />
+          <MicMeter active={running && useMic} deviceLabel={selectedDevice} />
         </span>
         <span className="flex items-center gap-3">
           <span
@@ -434,7 +533,7 @@ export default function ControlWindow() {
 
       {showSettings && (
         <SettingsModal
-          onClose={() => setShowSettings(false)}
+          onClose={handleCloseSettings}
           backend={backend}
           setBackend={setBackend}
           useMic={useMic}
@@ -526,9 +625,25 @@ export default function ControlWindow() {
                 );
               })}
             </ul>
-            <p className="mt-4 text-center text-[11px] text-paper-500">
-              首次啟動需下載 ~1.5 GB 語音模型，之後會直接讀取快取
-            </p>
+            {hasPrewarmError ? (
+              <div className="mt-4 flex flex-col items-center gap-2">
+                <button
+                  className="rounded bg-paper-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-paper-700 disabled:bg-paper-400"
+                  onClick={retryPrewarm}
+                  disabled={retryingPrewarm}
+                  type="button"
+                >
+                  {retryingPrewarm ? "重新啟動中…" : "重試"}
+                </button>
+                <p className="text-center text-[11px] text-paper-500">
+                  首次啟動需下載 ~1.5 GB；網路不穩可重試
+                </p>
+              </div>
+            ) : (
+              <p className="mt-4 text-center text-[11px] text-paper-500">
+                首次啟動需下載 ~1.5 GB 語音模型，之後會直接讀取快取
+              </p>
+            )}
           </div>
         </div>
       )}

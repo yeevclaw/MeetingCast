@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from "react";
 
 const SEGMENTS = 10;
 
-export default function MicMeter({ active }: { active: boolean }) {
+export default function MicMeter({
+  active,
+  deviceLabel,
+}: {
+  active: boolean;
+  deviceLabel?: string;
+}) {
   const [level, setLevel] = useState(0);
   const rafRef = useRef<number | null>(null);
 
@@ -34,7 +40,26 @@ export default function MicMeter({ active }: { active: boolean }) {
 
     (async () => {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // If a specific device was chosen in Settings, find its Web Audio
+        // deviceId by matching label. Labels are populated only after the
+        // app has called getUserMedia at least once (ControlWindow does
+        // this on mount), so by the time the meter activates they should
+        // be available. Falls back to system default if not found.
+        let constraints: MediaStreamConstraints = { audio: true };
+        if (deviceLabel) {
+          try {
+            const list = await navigator.mediaDevices.enumerateDevices();
+            const target = list.find(
+              (d) => d.kind === "audioinput" && d.label === deviceLabel,
+            );
+            if (target?.deviceId) {
+              constraints = { audio: { deviceId: { exact: target.deviceId } } };
+            }
+          } catch {
+            // Ignore — fall through to default constraints.
+          }
+        }
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
         if (cancelled) {
           stream.getTracks().forEach((t) => t.stop());
           return;
@@ -57,7 +82,7 @@ export default function MicMeter({ active }: { active: boolean }) {
       stream?.getTracks().forEach((t) => t.stop());
       ctx?.close().catch(() => {});
     };
-  }, [active]);
+  }, [active, deviceLabel]);
 
   const litCount = Math.round(level * SEGMENTS);
 

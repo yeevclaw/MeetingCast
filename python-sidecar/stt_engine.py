@@ -40,13 +40,42 @@ def make_audio_source(source: dict):
     kind = source.get("type", "mic")
     if kind == "mic":
         from audio_capture import mic_chunks
-        return mic_chunks(sample_rate=16000, chunk_ms=100)
+        # Empty string from UI means "system default" — pass None so sounddevice
+        # picks the OS default. A non-empty string is treated as a device name
+        # (sounddevice accepts either an int index or a substring of the name).
+        device = source.get("device") or None
+        return mic_chunks(sample_rate=16000, chunk_ms=100, device=device)
     if kind == "wav":
         path = source.get("path")
         if not path:
             raise ValueError("source.wav requires 'path'")
         return wav_chunks(path, chunk_ms=100, realtime=True)
     raise ValueError(f"unknown source type: {kind}")
+
+
+def list_input_devices() -> list[dict]:
+    """Enumerate microphone-capable devices via sounddevice.
+
+    Returns a list of {name, channels} dicts, filtering to devices with at
+    least one input channel. Names are not unique on macOS when multiple
+    interfaces share a label (rare), but they're stable across runs whereas
+    the integer index can shift when a USB/Bluetooth device is plugged in
+    or out — so the UI persists by name.
+    """
+    import sounddevice as sd
+
+    seen: set[str] = set()
+    out: list[dict] = []
+    for d in sd.query_devices():
+        channels = int(d.get("max_input_channels", 0) or 0)
+        if channels <= 0:
+            continue
+        name = str(d.get("name", "")).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "channels": channels})
+    return out
 
 
 async def run_stt(cmd: dict, cancel_event: asyncio.Event):
@@ -58,6 +87,28 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     deepgram_api_key = api_cfg.get("deepgram_api_key")
     if deepgram_api_key:
         os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
+
+    # Validate the requested mic device early. If the user's persisted device
+    # got unplugged (USB / Bluetooth) we want to fall back to the system
+    # default and warn — not crash, get re-spawned by the watchdog, and crash
+    # again with the same dead device.
+    if source_cfg.get("type") == "mic":
+        device_pref = source_cfg.get("device") or ""
+        if device_pref:
+            try:
+                import sounddevice as sd
+                sd.check_input_settings(
+                    device=device_pref,
+                    samplerate=16000,
+                    channels=1,
+                    dtype="float32",
+                )
+            except Exception as e:
+                emit({
+                    "type": "warning",
+                    "message": f"麥克風「{device_pref}」無法使用（{e}），已改用系統預設",
+                })
+                source_cfg = {**source_cfg, "device": ""}
 
     try:
         stt = get_backend(backend_name, language=language)
@@ -246,6 +297,16 @@ async def main():
                 except (asyncio.CancelledError, Exception):
                     pass
             return
+        elif cmd_type == "list_devices":
+            try:
+                devices = list_input_devices()
+            except Exception as e:
+                # Always emit `devices` so the Rust-side oneshot resolves —
+                # without it the UI hangs until the timeout fires.
+                emit({"type": "devices", "devices": []})
+                emit({"type": "error", "message": f"list_devices: {e}"})
+            else:
+                emit({"type": "devices", "devices": devices})
         else:
             emit({"type": "error", "message": f"unknown command: {cmd_type}"})
 
