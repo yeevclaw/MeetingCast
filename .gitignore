@@ -13,8 +13,8 @@ venv/
 .env.local
 .dev-config.toml
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code local settings & agent state
+.claude/
 
 # macOS
 .DS_Store
@@ -22,6 +22,11 @@ venv/
 # Models / caches
 models/
 *.bin
+
+# PyInstaller artifacts (regenerable via scripts/build-sidecar.sh)
+python-sidecar/build/
+python-sidecar/dist/
+src-tauri/binaries/
 
 # Node
 node_modules/
