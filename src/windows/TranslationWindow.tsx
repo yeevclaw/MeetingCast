@@ -81,12 +81,12 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
   }
 
   return (
-    <main className="flex h-screen flex-col bg-[#F5F1E8] text-[#2A2018]">
-      <header className="flex flex-shrink-0 items-center justify-between border-b border-[#E0D8C5] px-6 py-1 text-xs font-medium uppercase tracking-wider text-[#6B5E4A]">
+    <main className="flex h-screen flex-col bg-paper-100 text-paper-900">
+      <header className="flex flex-shrink-0 items-center justify-between border-b border-paper-300 px-6 py-1 text-xs font-medium uppercase tracking-wider text-paper-600">
         <span>{TITLES[lang]}</span>
         <div className="flex items-center gap-1 normal-case tracking-normal">
           <button
-            className="rounded px-2 py-0.5 hover:bg-[#E0D8C5]"
+            className="rounded px-2 py-0.5 hover:bg-paper-300"
             onClick={() => bumpFont(-FONT_STEP)}
             aria-label="字小"
           >
@@ -94,14 +94,14 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
           </button>
           <span className="w-8 text-center tabular-nums">{fontSize}</span>
           <button
-            className="rounded px-2 py-0.5 hover:bg-[#E0D8C5]"
+            className="rounded px-2 py-0.5 hover:bg-paper-300"
             onClick={() => bumpFont(FONT_STEP)}
             aria-label="字大"
           >
             A+
           </button>
           <button
-            className={`rounded px-2 py-0.5 hover:bg-[#E0D8C5] ${pinned ? "bg-[#E0D8C5] text-[#2A2018]" : ""}`}
+            className={`rounded px-2 py-0.5 hover:bg-paper-300 ${pinned ? "bg-paper-300 text-paper-900" : ""}`}
             onClick={togglePin}
             aria-label="釘選"
             title="釘到最前面"
@@ -109,7 +109,7 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
             {pinned ? "📌" : "📍"}
           </button>
           <button
-            className={`rounded px-2 py-0.5 hover:bg-[#E0D8C5] ${borderless ? "bg-[#E0D8C5] text-[#2A2018]" : ""}`}
+            className={`rounded px-2 py-0.5 hover:bg-paper-300 ${borderless ? "bg-paper-300 text-paper-900" : ""}`}
             onClick={toggleBorderless}
             aria-label="無邊框"
             title="無邊框"
@@ -120,11 +120,11 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
       </header>
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-10 py-6">
         {utterances.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-3 text-[#A89A7E]">
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-paper-500">
             <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
               {lang === "en" ? "Translation will appear here once recording starts" : "Bản dịch sẽ hiện ở đây khi bắt đầu ghi âm"}
             </p>
-            <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center text-[#C7BBA0]">
+            <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center text-paper-400">
               {lang === "en" ? "Press Start in the control window" : "Bấm Bắt đầu ở cửa sổ điều khiển"}
             </p>
           </div>
@@ -144,7 +144,7 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
                   className="leading-snug"
                   style={{ opacity, fontSize: `${fontSize}px` }}
                 >
-                  {u[lang] || <span className="text-[#A89A7E]">…</span>}
+                  {u[lang] || <span className="text-paper-500">…</span>}
                 </li>
               );
             })}

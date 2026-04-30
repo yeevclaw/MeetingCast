@@ -7,7 +7,7 @@ from .base import Transcript
 
 
 class DeepgramSTT:
-    def __init__(self, language: str = "zh", model: str = "nova-2"):
+    def __init__(self, language: str = "zh", model: str = "nova-3"):
         api_key = os.getenv("DEEPGRAM_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -38,18 +38,13 @@ class DeepgramSTT:
         import asyncio
 
         client = AsyncDeepgramClient(api_key=self._api_key)
-        # Workaround: SDK 6.1.1 serializes Python True as "True" which Deepgram
-        # rejects with HTTP 400. Pass lowercase strings explicitly.
+        # MINIMAL CONFIG (debug): everything optional stripped to find which
+        # param causes Deepgram's generic 400. Add back one at a time.
         async with client.listen.v1.connect(
             model=self.model,
             language=self.language,
             encoding="linear16",
             sample_rate=sample_rate,
-            interim_results="true",  # type: ignore[arg-type]
-            punctuate="true",  # type: ignore[arg-type]
-            smart_format="true",  # type: ignore[arg-type]
-            utterance_end_ms=700,
-            vad_events="true",  # type: ignore[arg-type]
         ) as conn:
 
             async def sender():

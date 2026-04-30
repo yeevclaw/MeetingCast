@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -30,10 +31,25 @@ impl Default for ApiConfig {
     }
 }
 
+/// One glossary entry. Keys in the [glossary] map are the source-language
+/// (zh) terms; the per-target translation is taken from the matching field.
+/// Empty fields mean "no override for this language" — the model falls back
+/// to its default rendering.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct GlossaryEntry {
+    #[serde(default)]
+    pub en: String,
+    #[serde(default)]
+    pub vi: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
+    /// BTreeMap so config.toml round-trips with stable key order.
+    #[serde(default)]
+    pub glossary: BTreeMap<String, GlossaryEntry>,
 }
 
 pub type SharedConfig = Arc<Mutex<Config>>;

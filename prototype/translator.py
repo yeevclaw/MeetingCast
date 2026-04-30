@@ -7,7 +7,10 @@ from typing import Callable
 import anthropic
 
 
-META_SCAN_CHARS = 80
+# Lower = better first-token latency on short sentences (whose full
+# translation can fit under the buffer and otherwise wouldn't render until
+# stream end). 32 covers the longest marker (26 chars) with safety margin.
+META_SCAN_CHARS = 32
 # Substrings that almost never appear in legit Chinese-meeting translations
 # but do appear when Claude breaks character to comment on the input. Matched
 # anywhere in the first META_SCAN_CHARS characters (case-insensitive).

@@ -1,6 +1,7 @@
 import sys
-from collections import Counter
+from collections import Counter, deque
 
+import mlx.core as mx
 import numpy as np
 import torch
 import mlx_whisper
@@ -9,15 +10,54 @@ from silero_vad import VADIterator, load_silero_vad
 from .base import Transcript
 
 
+# Cap MLX's idle Metal allocator cache. Without this, every transcribe call
+# leaves intermediate buffers in MLX's free pool — over a long meeting
+# (dozens of VAD-cut segments) the pool can balloon to 10–20+ GB on a
+# 64 GB unified-memory Mac and never shrink. 1 GB is plenty of headroom for
+# whisper-large-v3-turbo's working set; lower means more frequent
+# allocations but capped resident memory.
+_MLX_CACHE_LIMIT_BYTES = 1 * 1024 * 1024 * 1024
+try:
+    # mlx 0.20+ moved the cache APIs from `mx.metal.*` to top-level `mx.*`.
+    # Prefer the new path; fall back so older bundled mlx still works.
+    if hasattr(mx, "set_cache_limit"):
+        mx.set_cache_limit(_MLX_CACHE_LIMIT_BYTES)
+    else:
+        mx.metal.set_cache_limit(_MLX_CACHE_LIMIT_BYTES)
+except Exception as _e:  # noqa: BLE001
+    print(f"[mlx cache limit] failed: {_e}", file=sys.stderr)
+
+
+def _mlx_clear_cache() -> None:
+    try:
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+        else:
+            mx.metal.clear_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 
 HALLUCINATION_MIN_CHARS = 20
 HALLUCINATION_DOMINANCE = 0.5
 
 # Float32 audio is in [-1, 1]. Conversational speech RMS ≈ 0.05–0.15;
-# fans / aircon hum / keyboard ≈ 0.001–0.005. Anything below this floor
-# is virtually guaranteed to make Whisper hallucinate, so skip transcription.
+# fans / aircon hum / keyboard ≈ 0.001–0.005. The fixed floor is used at
+# session start (before we have noise samples) and as the lower bound the
+# adaptive threshold can never drop below — protects against a dead-silent
+# room making the threshold so tiny that fan ramp-up triggers transcription.
 RMS_NOISE_THRESHOLD = 0.005
+
+# Adaptive noise floor params. Track recent silent-window RMS values; the
+# threshold to gate Whisper is the 25th percentile × NOISE_MARGIN. 25th
+# percentile (instead of mean) ignores brief speech leakage that VAD missed.
+# 3× margin sits comfortably above ambient (fans / aircon / keyboard hum)
+# yet below quiet speech (~0.02). Window size is ~2 seconds at 32 ms / sample.
+NOISE_RING_SIZE = 60
+NOISE_RING_MIN = 30  # only adapt once we have ~1 s of silence sampled
+NOISE_MARGIN = 3.0
 
 # Phrases Whisper emits when fed silence/noise — these are training-data
 # leaks (audiobook outros, YouTube subscribe asks, hymns/scripture). They
@@ -88,6 +128,11 @@ class MLXWhisperSTT:
         self.model_repo = model_repo or self.MODEL_REPO
         self.max_speech_sec = max_speech_sec
         self._vad_model = None
+        # Adaptive noise floor — populated by stream() from windows that
+        # silero-vad classifies as non-speech. Defaults to the static floor
+        # so tests / one-shot transcribe_file callers don't break.
+        self._noise_ring: deque[float] = deque(maxlen=NOISE_RING_SIZE)
+        self._dynamic_threshold: float = RMS_NOISE_THRESHOLD
 
     def _vad(self):
         if self._vad_model is None:
@@ -103,15 +148,27 @@ class MLXWhisperSTT:
 
         snapshot_download(self.model_repo)
 
+    def _update_noise_floor(self, window_rms: float) -> None:
+        """Track recent silent-window RMS and update the dynamic gate. The
+        threshold = 25th-percentile of the ring × NOISE_MARGIN, floored at
+        the static RMS_NOISE_THRESHOLD so a dead-silent room can't drive it
+        absurdly low. The 25th percentile is more robust than the mean
+        because silero occasionally misses the first 1–2 windows of a real
+        utterance — taking the lower quartile excludes those leaks."""
+        self._noise_ring.append(window_rms)
+        if len(self._noise_ring) >= NOISE_RING_MIN:
+            p25 = float(np.percentile(self._noise_ring, 25))
+            self._dynamic_threshold = max(RMS_NOISE_THRESHOLD, p25 * NOISE_MARGIN)
+
     def _transcribe_audio(self, audio) -> str:
         # B: RMS energy gate. Skip segments quieter than fan/keyboard noise
         # without ever calling Whisper. This is the cheapest hallucination
         # guard since Whisper-on-silence is the entire failure mode.
         if isinstance(audio, np.ndarray):
             rms = _segment_rms(audio)
-            if rms < RMS_NOISE_THRESHOLD:
+            if rms < self._dynamic_threshold:
                 print(
-                    f"[low-energy skipped] rms={rms:.4f} < {RMS_NOISE_THRESHOLD}",
+                    f"[low-energy skipped] rms={rms:.4f} < {self._dynamic_threshold:.4f}",
                     file=sys.stderr,
                 )
                 return ""
@@ -128,6 +185,10 @@ class MLXWhisperSTT:
             no_speech_threshold=0.5,
         )
         text = result["text"].strip()
+        # Return idle Metal buffers to the OS. Without this, MLX's allocator
+        # holds the working set of every past transcribe call indefinitely;
+        # over a meeting that's tens of GB resident for no good reason.
+        _mlx_clear_cache()
         # C: known-phrase blocklist + structural single-char-repeat detector.
         if _is_hallucination(text):
             print(
@@ -166,6 +227,14 @@ class MLXWhisperSTT:
                 window_bytes = leftover[: WINDOW_SAMPLES * 2]
                 leftover = leftover[WINDOW_SAMPLES * 2 :]
                 window = np.frombuffer(window_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # Sample the ambient noise floor whenever silero says we're
+                # not in speech. The threshold is then computed from the
+                # 25th percentile of recent samples (see _update_noise_floor).
+                # Done before the VAD event check so a window that starts
+                # speech still counts as silence at this point.
+                if not in_speech:
+                    self._update_noise_floor(_segment_rms(window))
 
                 if in_speech:
                     speech_buffer.append(window)

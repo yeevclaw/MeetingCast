@@ -1,1 +1,30 @@
 @import "tailwindcss";
+
+@theme {
+  /* Warm paper neutral scale — single source of truth across all windows */
+  --color-paper-50: #FBF8F1;
+  --color-paper-100: #F5F1E8;
+  --color-paper-200: #EAE3D2;
+  --color-paper-300: #E0D8C5;
+  --color-paper-400: #C7BBA0;
+  --color-paper-500: #A89A7E;
+  --color-paper-600: #6B5E4A;
+  --color-paper-700: #4A3F30;
+  --color-paper-800: #3A3024;
+  --color-paper-900: #2A2018;
+
+  /* Status colors stay within the warm family — no saturated rose/emerald/sky */
+  --color-danger-50: #F4E7DD;
+  --color-danger-100: #ECD8C8;
+  --color-danger-200: #D9B8A8;
+  --color-danger-700: #7A3D2A;
+  --color-danger-900: #5C2A1A;
+
+  --color-warn-50: #FAF3E0;
+  --color-warn-200: #E8D9B0;
+  --color-warn-700: #7A5A1F;
+  --color-warn-900: #5C3F0E;
+
+  /* Recording indicator — muted brick, not the punchy rose-500 */
+  --color-recording: #B0413E;
+}

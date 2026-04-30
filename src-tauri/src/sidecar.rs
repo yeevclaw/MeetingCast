@@ -28,6 +28,14 @@ pub enum SidecarEvent {
     Stopped,
     ModelLoading,
     ModelReady,
+    /// Per-stage progress for startup prewarm (model load + mic init etc.)
+    /// so the frontend can render a checklist instead of a single spinner.
+    Prewarm {
+        step: String,
+        state: String,
+        #[serde(default)]
+        message: Option<String>,
+    },
     Transcript {
         text: String,
         is_final: bool,
@@ -46,6 +54,10 @@ pub struct SidecarManager {
     starting: bool,
     intentional_stop: bool,
     stderr_tail: VecDeque<String>,
+    /// True between the moment the child emits its first `ready` event and
+    /// the moment it exits. Lets the frontend distinguish "warming up the
+    /// PyInstaller bundle (~10s)" from "ready to record".
+    ready: bool,
 }
 
 impl SidecarManager {
@@ -57,6 +69,7 @@ impl SidecarManager {
             starting: false,
             intentional_stop: false,
             stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LINES),
+            ready: false,
         }
     }
 }
@@ -70,6 +83,58 @@ fn project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+const SIDECAR_BIN_NAME: &str = "stt_engine";
+
+/// Resolve which binary to spawn for the STT sidecar.
+/// Production (bundled): the PyInstaller binary that Tauri's externalBin
+/// places alongside the main executable as `stt_engine-<target-triple>`
+/// (or sometimes the bare `stt_engine` after bundling). Falls back to the
+/// dev venv for `pnpm tauri dev` / `cargo run`.
+///
+/// Returns (program, leading_args). Leading args are arguments inserted
+/// before any caller-supplied args — used to pass the script path when
+/// running via the dev-mode Python interpreter.
+fn locate_sidecar() -> Result<(PathBuf, Vec<String>), String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Tauri's externalBin places the binary in the same directory as
+            // the main exe. The filename may or may not have the target-
+            // triple suffix depending on bundling stage; check both.
+            let target_triple = format!(
+                "{}-apple-darwin",
+                if cfg!(target_arch = "aarch64") {
+                    "aarch64"
+                } else {
+                    "x86_64"
+                }
+            );
+            for candidate in [
+                dir.join(SIDECAR_BIN_NAME),
+                dir.join(format!("{}-{}", SIDECAR_BIN_NAME, target_triple)),
+            ] {
+                if candidate.exists() {
+                    return Ok((candidate, vec![]));
+                }
+            }
+        }
+    }
+
+    // Dev fallback: prototype/.venv/bin/python + python-sidecar/stt_engine.py
+    let root = project_root();
+    let python = root.join("prototype/.venv/bin/python");
+    let script = root.join("python-sidecar/stt_engine.py");
+    if !python.exists() {
+        return Err(format!(
+            "sidecar binary not found in app bundle and dev venv missing: {}",
+            python.display()
+        ));
+    }
+    if !script.exists() {
+        return Err(format!("sidecar script not found: {}", script.display()));
+    }
+    Ok((python, vec![script.to_string_lossy().to_string()]))
+}
+
 type SpawnFut = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 fn spawn_inner(app: AppHandle, mgr: SharedManager, cfg_arc: SharedConfig) -> SpawnFut {
@@ -81,25 +146,19 @@ async fn spawn_inner_body(
     mgr: SharedManager,
     cfg_arc: SharedConfig,
 ) -> Result<(), String> {
+    let (program, leading_args) = locate_sidecar()?;
     let root = project_root();
-    let python = root.join("prototype/.venv/bin/python");
-    let script = root.join("python-sidecar/stt_engine.py");
-
-    if !python.exists() {
-        return Err(format!("python venv not found: {}", python.display()));
-    }
-    if !script.exists() {
-        return Err(format!("sidecar script not found: {}", script.display()));
-    }
 
     let deepgram_key = {
         let cfg = cfg_arc.lock().await;
         cfg.api.deepgram_api_key.clone()
     };
 
-    let mut cmd = Command::new(&python);
-    cmd.arg(&script)
-        .current_dir(&root)
+    let mut cmd = Command::new(&program);
+    for arg in &leading_args {
+        cmd.arg(arg);
+    }
+    cmd.current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -127,11 +186,17 @@ async fn spawn_inner_body(
 
     // stdout: parse JSON events
     let app_o = app.clone();
+    let mgr_o = mgr.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             match serde_json::from_str::<SidecarEvent>(&line) {
-                Ok(event) => emit_event(&app_o, event),
+                Ok(event) => {
+                    if matches!(event, SidecarEvent::Ready) {
+                        mgr_o.lock().await.ready = true;
+                    }
+                    emit_event(&app_o, event);
+                }
                 Err(e) => eprintln!("[sidecar] invalid json: {line:?} ({e})"),
             }
         }
@@ -163,6 +228,7 @@ async fn spawn_inner_body(
             let mut m = mgr_w.lock().await;
             m.stdin = None;
             m.starting = false;
+            m.ready = false;
             (
                 m.intentional_stop,
                 m.restart_attempts,
@@ -261,6 +327,14 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
+        SidecarEvent::Prewarm { step, state, message } => app.emit(
+            "stt:prewarm",
+            serde_json::json!({
+                "step": step,
+                "state": state,
+                "message": message,
+            }),
+        ),
         SidecarEvent::Error { message } => {
             errors::record("sidecar_protocol_error", message, None);
             app.emit("stt:error", message)
@@ -333,6 +407,37 @@ pub async fn start_stt(
         }
     }
     Ok(())
+}
+
+/// Spawn the sidecar daemon if it is not already running, without sending a
+/// `start` command. Used at app launch to amortize the ~10s PyInstaller cold
+/// start against the user's idle time before they click 開始錄音.
+pub async fn prewarm(
+    app: AppHandle,
+    mgr: SharedManager,
+    cfg: SharedConfig,
+) -> Result<(), String> {
+    let need_spawn = mgr.lock().await.stdin.is_none();
+    if !need_spawn {
+        return Ok(());
+    }
+    spawn_inner(app, mgr, cfg).await
+}
+
+#[tauri::command]
+pub async fn prewarm_sidecar(
+    app: AppHandle,
+    state: tauri::State<'_, SharedManager>,
+    config: tauri::State<'_, SharedConfig>,
+) -> Result<(), String> {
+    prewarm(app, state.inner().clone(), config.inner().clone()).await
+}
+
+/// Whether the sidecar has emitted its initial `ready` event and can accept
+/// a `start` command without first paying the cold-start cost.
+#[tauri::command]
+pub async fn sidecar_ready(state: tauri::State<'_, SharedManager>) -> Result<bool, String> {
+    Ok(state.lock().await.ready)
 }
 
 #[tauri::command]

@@ -92,12 +92,123 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        emit({"type": "error", "message": f"stt error: {e}"})
+        # Extract any nested detail Deepgram/SDK may have attached so we don't
+        # lose useful diagnostics inside the exception's __str__.
+        detail = []
+        for attr in ("status_code", "body", "reason", "code", "headers"):
+            v = getattr(e, attr, None)
+            if v is not None:
+                detail.append(f"{attr}={v!r}")
+        suffix = f" [{type(e).__name__}: {'; '.join(detail)}]" if detail else f" [{type(e).__name__}]"
+        emit({"type": "error", "message": f"stt error: {e}{suffix}"})
     finally:
         emit({"type": "stopped"})
 
 
+def _prewarm_mic():
+    """Briefly open and read from the mic so macOS triggers its privacy
+    prompt during startup, not at first 開始錄音 click. After the user
+    grants permission once, this becomes a no-op on subsequent launches.
+
+    Mirrors the InputStream args used by the real audio_capture.mic_chunks
+    so we exercise the same CoreAudio code path — opening with mismatched
+    args (no callback / different blocksize) doesn't reliably trigger the
+    permission probe. Failures are non-fatal — the sidecar still serves
+    WAV demo sources and the real start_stt will surface a friendly error
+    if the mic is unavailable when actually needed.
+    """
+    try:
+        import time
+        import sounddevice as sd  # type: ignore
+
+        def _no_op(indata, frames, time_info, status):
+            pass
+
+        stream = sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            dtype="float32",
+            blocksize=1600,
+            callback=_no_op,
+        )
+        stream.start()
+        # Hold the stream open just long enough for macOS to probe CoreAudio
+        # and either show its permission prompt or succeed silently.
+        time.sleep(0.1)
+        stream.stop()
+        stream.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"[mic prewarm] {e}", file=sys.stderr, flush=True)
+
+
+def _prewarm_local_model():
+    """Force the mlx-whisper Metal weights to load before the user's first
+    click on Start. snapshot_download alone only fetches files to disk;
+    it does NOT push weights into GPU memory. The first real transcribe
+    therefore pays a 5–10 s lazy-load on top of decode time. Run one
+    no-op transcribe on a silent buffer here to amortize that cost
+    against app launch (already covered by the "正在啟動辨識引擎" overlay)
+    so click-time becomes near-instant.
+
+    Also doubles as ensure_loaded() — if the snapshot is missing, the
+    underlying mlx_whisper.transcribe call performs the download.
+
+    Non-fatal — if the user only ever uses the cloud backend or the demo
+    WAV, this overhead is wasted but the sidecar still works.
+    """
+    try:
+        import numpy as np
+        import mlx.core as mx  # type: ignore
+        import mlx_whisper  # type: ignore
+
+        from stt.local import MLXWhisperSTT
+        engine = MLXWhisperSTT(language="zh")
+        # Bypass _transcribe_audio's RMS gate (which would skip silent input
+        # and never actually load the model) — call mlx_whisper directly.
+        mlx_whisper.transcribe(
+            np.zeros(16000, dtype=np.float32),
+            path_or_hf_repo=engine.model_repo,
+            language="zh",
+            condition_on_previous_text=False,
+            no_speech_threshold=0.5,
+        )
+        # Drop the prewarm's intermediate buffers. The model weights remain
+        # in mlx's per-path cache (the whole point of prewarming) but the
+        # 1 s of silent audio's activations and decoder KV are released.
+        try:
+            (mx.clear_cache if hasattr(mx, "clear_cache") else mx.metal.clear_cache)()
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        print(f"[model prewarm] {e}", file=sys.stderr, flush=True)
+
+
+async def _run_prewarm_step(step: str, fn) -> None:
+    """Wrap a prewarm function with start/done (or error) status events so
+    the frontend can paint a stage-by-stage checklist instead of a single
+    opaque spinner. Failures are non-fatal — emitted as state=error and
+    the rest of startup continues; the user-facing overlay shows ❌ on
+    that row but the app still becomes usable for whatever paths don't
+    depend on the failed step (e.g. cloud STT works without the local
+    model prewarm)."""
+    emit({"type": "prewarm", "step": step, "state": "start"})
+    try:
+        await asyncio.to_thread(fn)
+        emit({"type": "prewarm", "step": step, "state": "done"})
+    except Exception as e:  # noqa: BLE001
+        emit({"type": "prewarm", "step": step, "state": "error", "message": str(e)})
+
+
 async def main():
+    # Run heavy prewarm in threads so the asyncio loop stays responsive
+    # to incoming commands. Order matters: the model load is the longest
+    # step (~10 s first run) so kick it off first; the mic prewarm runs
+    # in parallel and triggers the macOS permission prompt while the model
+    # warms in the background. Each task emits prewarm events so the UI
+    # can show progress instead of a featureless 5–10 s freeze.
+    model_task = asyncio.create_task(_run_prewarm_step("model", _prewarm_local_model))
+    mic_task = asyncio.create_task(_run_prewarm_step("mic", _prewarm_mic))
+    await asyncio.gather(model_task, mic_task)
     emit({"type": "ready"})
     stt_task: asyncio.Task | None = None
     cancel_event: asyncio.Event | None = None
@@ -140,6 +251,16 @@ async def main():
 
 
 if __name__ == "__main__":
+    # CRITICAL for PyInstaller --onefile: when any dependency (torch,
+    # huggingface_hub's parallel download workers, etc.) uses
+    # multiprocessing.spawn, child workers re-execute *this* binary as
+    # `sys.executable`. Without freeze_support, each re-exec runs main()
+    # again — a fork bomb that loads mlx + whisper N times and pushed RSS
+    # past 20 GB. freeze_support() detects spawn-children via env markers
+    # and routes them straight to the multiprocessing worker target instead
+    # of re-running our entry. No-op in the original parent process.
+    import multiprocessing
+    multiprocessing.freeze_support()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
