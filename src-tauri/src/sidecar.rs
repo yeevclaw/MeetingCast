@@ -15,6 +15,7 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::config::SharedConfig;
 use crate::errors;
+use crate::session::{self, SharedRecorder};
 
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
@@ -400,6 +401,7 @@ pub async fn start_stt(
     app: AppHandle,
     state: tauri::State<'_, SharedManager>,
     config: tauri::State<'_, SharedConfig>,
+    recorder: tauri::State<'_, SharedRecorder>,
     backend: String,
     mut source: Value,
     language: Option<String>,
@@ -446,11 +448,12 @@ pub async fn start_stt(
         let cfg = config.lock().await;
         cfg.api.deepgram_api_key.clone()
     };
+    let language_str = language.unwrap_or_else(|| "zh".into());
     let cmd = serde_json::json!({
         "type": "start",
         "backend": backend,
         "source": source,
-        "language": language.unwrap_or_else(|| "zh".into()),
+        "language": language_str,
         "api": {
             "deepgram_api_key": deepgram_api_key,
         },
@@ -473,6 +476,18 @@ pub async fn start_stt(
             return Err("sidecar still not running".into());
         }
     }
+
+    // Open a recording session right after the start command goes through.
+    // We'd rather record the user's intent timestamp than wait for the first
+    // utterance — duration matches what the wall clock UI shows.
+    let device = source
+        .get("device")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id =
+        session::start_session(recorder.inner(), backend, language_str, device).await?;
+    let _ = app.emit("session:opened", session_id);
     Ok(())
 }
 
@@ -536,16 +551,27 @@ pub async fn sidecar_ready(state: tauri::State<'_, SharedManager>) -> Result<boo
 }
 
 #[tauri::command]
-pub async fn stop_stt(state: tauri::State<'_, SharedManager>) -> Result<(), String> {
-    let mut m = state.lock().await;
-    m.intentional_stop = true;
-    m.last_start = None;
-    let cmd = serde_json::json!({"type": "stop"});
-    if let Some(stdin) = m.stdin.as_mut() {
-        let line = format!("{cmd}\n");
-        let _ = stdin.write_all(line.as_bytes()).await;
-        let _ = stdin.flush().await;
+pub async fn stop_stt(
+    state: tauri::State<'_, SharedManager>,
+    recorder: tauri::State<'_, SharedRecorder>,
+) -> Result<(), String> {
+    {
+        let mut m = state.lock().await;
+        m.intentional_stop = true;
+        m.last_start = None;
+        let cmd = serde_json::json!({"type": "stop"});
+        if let Some(stdin) = m.stdin.as_mut() {
+            let line = format!("{cmd}\n");
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
     }
+    // Finalize meta.json on stop. The frontend may still flush a few
+    // pending utterances after this — those are silently dropped because
+    // the recorder slot is already empty (see session_append_utterance).
+    // That's the right tradeoff: a meta.json with one fewer count is
+    // better than racing the file write with concurrent appends.
+    session::stop_session(recorder.inner()).await;
     Ok(())
 }
 

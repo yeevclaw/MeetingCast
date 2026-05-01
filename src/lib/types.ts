@@ -43,3 +43,28 @@ export type Config = {
     input_device: string;
   };
 };
+
+export type StoredUtterance = {
+  id: string;
+  t_start: number;
+  t_end: number;
+  zh: string;
+  en: string;
+  vi: string;
+  incomplete: boolean;
+};
+
+export type SessionMeta = {
+  session_id: string;
+  started_at: string;
+  ended_at?: string | null;
+  duration_secs: number;
+  backend: string;
+  language: string;
+  device: string;
+  count: number;
+  incomplete_count: number;
+  has_summary_zh: boolean;
+  has_summary_en: boolean;
+  has_summary_vi: boolean;
+};

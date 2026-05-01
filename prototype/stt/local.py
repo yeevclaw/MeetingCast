@@ -50,6 +50,29 @@ HALLUCINATION_DOMINANCE = 0.5
 # room making the threshold so tiny that fan ramp-up triggers transcription.
 RMS_NOISE_THRESHOLD = 0.005
 
+# Minimum VAD-cut speech duration. Real syllables take ~250 ms minimum;
+# anything shorter is almost certainly a click / chair-creak / mouse-click
+# that silero misclassified as speech. Drop these before they reach Whisper
+# so it never gets the chance to hallucinate on them.
+MIN_SPEECH_SEC = 0.25
+
+# Speech-consistency gate. After silero declares a segment is speech, slice
+# it into 100 ms chunks and require a fraction of them to be above the
+# adaptive RMS floor. A burst-then-silence shape (e.g. a 200 ms click
+# followed by 3 s of room hum that sneaks past the *segment-mean* RMS gate)
+# fails this even when the segment as a whole exceeds the threshold.
+CONSISTENCY_WINDOW_SAMPLES = 1600  # 100 ms @ 16 kHz
+CONSISTENCY_MIN_ACTIVE_RATIO = 0.4
+
+# Whisper segment-level confidence thresholds. mlx_whisper's `result["segments"]`
+# carries the model's own per-segment metrics — using them is far more
+# precise than pattern-matching the output text. Tuned a bit stricter than
+# Whisper's internal retry thresholds (compression_ratio 2.4, logprob -1.0)
+# so we drop segments Whisper kept under duress.
+SEGMENT_NO_SPEECH_MAX = 0.7
+SEGMENT_AVG_LOGPROB_MIN = -1.0
+SEGMENT_COMPRESSION_RATIO_MAX = 2.0
+
 # Adaptive noise floor params. Track recent silent-window RMS values; the
 # threshold to gate Whisper is the 25th percentile × NOISE_MARGIN. 25th
 # percentile (instead of mean) ignores brief speech leakage that VAD missed.
@@ -161,9 +184,8 @@ class MLXWhisperSTT:
             self._dynamic_threshold = max(RMS_NOISE_THRESHOLD, p25 * NOISE_MARGIN)
 
     def _transcribe_audio(self, audio) -> str:
-        # B: RMS energy gate. Skip segments quieter than fan/keyboard noise
-        # without ever calling Whisper. This is the cheapest hallucination
-        # guard since Whisper-on-silence is the entire failure mode.
+        # Gate 1a: segment-mean RMS. Skip segments quieter than the adaptive
+        # noise floor without ever calling Whisper. Cheapest possible drop.
         if isinstance(audio, np.ndarray):
             rms = _segment_rms(audio)
             if rms < self._dynamic_threshold:
@@ -173,7 +195,27 @@ class MLXWhisperSTT:
                 )
                 return ""
 
-        # A: tighter Whisper guards. condition_on_previous_text=False stops a
+            # Gate 1b: speech-consistency. A burst-then-silence shape (a 200 ms
+            # click + 3 s of room hum) can pass the segment-mean RMS check but
+            # is exactly the input that hallucinates Whisper. Slice into 100 ms
+            # chunks and require >= CONSISTENCY_MIN_ACTIVE_RATIO to be above
+            # the dynamic floor — i.e. the speech is *distributed* through the
+            # segment, not localized in one spike.
+            n_chunks = len(audio) // CONSISTENCY_WINDOW_SAMPLES
+            if n_chunks >= 3:  # below 300 ms there's nothing to be consistent about
+                trimmed = audio[: n_chunks * CONSISTENCY_WINDOW_SAMPLES]
+                chunks = trimmed.astype(np.float64).reshape(n_chunks, CONSISTENCY_WINDOW_SAMPLES)
+                chunk_rms = np.sqrt(np.mean(chunks ** 2, axis=1))
+                active_ratio = float((chunk_rms >= self._dynamic_threshold).mean())
+                if active_ratio < CONSISTENCY_MIN_ACTIVE_RATIO:
+                    print(
+                        f"[low-consistency skipped] active_ratio={active_ratio:.2f} "
+                        f"< {CONSISTENCY_MIN_ACTIVE_RATIO} ({n_chunks} chunks)",
+                        file=sys.stderr,
+                    )
+                    return ""
+
+        # Gate 2: Whisper itself. condition_on_previous_text=False stops a
         # hallucination from one segment poisoning the next. no_speech_threshold
         # at 0.5 (default 0.6) drops slightly more borderline non-speech
         # segments — a worthwhile trade given how aggressively VAD cuts already.
@@ -184,12 +226,52 @@ class MLXWhisperSTT:
             condition_on_previous_text=False,
             no_speech_threshold=0.5,
         )
-        text = result["text"].strip()
         # Return idle Metal buffers to the OS. Without this, MLX's allocator
         # holds the working set of every past transcribe call indefinitely;
         # over a meeting that's tens of GB resident for no good reason.
         _mlx_clear_cache()
-        # C: known-phrase blocklist + structural single-char-repeat detector.
+
+        # Gate 3: per-segment confidence filtering. Whisper retries low-
+        # confidence segments at higher temperature internally, but if all
+        # retries fail it still emits *something* (often the hallucination
+        # we wanted to drop). Walk segments and keep only those that pass
+        # all three of Whisper's own internal metrics. Falls back to the
+        # full result text if segments aren't available — older mlx_whisper
+        # versions or odd code paths.
+        segments = result.get("segments") or []
+        if segments:
+            kept_texts: list[str] = []
+            dropped_reasons: list[str] = []
+            for seg in segments:
+                no_speech = float(seg.get("no_speech_prob", 0.0))
+                avg_logprob = float(seg.get("avg_logprob", 0.0))
+                compression = float(seg.get("compression_ratio", 0.0))
+                if no_speech > SEGMENT_NO_SPEECH_MAX:
+                    dropped_reasons.append(f"no_speech={no_speech:.2f}")
+                    continue
+                if avg_logprob < SEGMENT_AVG_LOGPROB_MIN:
+                    dropped_reasons.append(f"logprob={avg_logprob:.2f}")
+                    continue
+                if compression > SEGMENT_COMPRESSION_RATIO_MAX:
+                    dropped_reasons.append(f"compress={compression:.2f}")
+                    continue
+                t = str(seg.get("text", "")).strip()
+                if t:
+                    kept_texts.append(t)
+            text = " ".join(kept_texts).strip()
+            if not text and dropped_reasons:
+                print(
+                    f"[low-confidence dropped] {len(dropped_reasons)} segments: "
+                    f"{', '.join(dropped_reasons[:3])}"
+                    + ("..." if len(dropped_reasons) > 3 else ""),
+                    file=sys.stderr,
+                )
+        else:
+            text = str(result.get("text", "")).strip()
+
+        # Gate 4: known training-data phrases + single-char dominance. Catches
+        # the long-form '謝謝觀看' / '示示示...' shapes the Whisper-internal
+        # gates miss. Kept as the final safety net, not the primary defense.
         if _is_hallucination(text):
             print(
                 f"[hallucination filtered] {text[:40]}{'...' if len(text) > 40 else ''}",
@@ -249,6 +331,18 @@ class MLXWhisperSTT:
 
                 if event and "end" in event and speech_buffer:
                     full_audio = np.concatenate(speech_buffer)
+                    # Gate 0: minimum speech duration. silero occasionally
+                    # opens-and-closes within ~100 ms on a sharp click; a real
+                    # syllable can't fit in that window. Drop pre-Whisper.
+                    if len(full_audio) / sample_rate < MIN_SPEECH_SEC:
+                        print(
+                            f"[short-speech skipped] {len(full_audio) / sample_rate:.2f}s "
+                            f"< {MIN_SPEECH_SEC}s",
+                            file=sys.stderr,
+                        )
+                        speech_buffer = []
+                        in_speech = False
+                        continue
                     text = self._transcribe_audio(full_audio)
                     if text:
                         yield Transcript(
@@ -274,6 +368,8 @@ class MLXWhisperSTT:
 
         if in_speech and speech_buffer:
             full_audio = np.concatenate(speech_buffer)
+            if len(full_audio) / sample_rate < MIN_SPEECH_SEC:
+                return
             text = self._transcribe_audio(full_audio)
             if text:
                 yield Transcript(

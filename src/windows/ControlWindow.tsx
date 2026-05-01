@@ -2,11 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import HistoryModal from "@/components/HistoryModal";
 import MicMeter from "@/components/MicMeter";
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { friendly } from "@/lib/errors";
-import type { Config, Lang, Source, TranscriptPayload } from "@/lib/types";
+import type {
+  ChunkPayload,
+  Config,
+  DonePayload,
+  Lang,
+  Source,
+  TranscriptPayload,
+} from "@/lib/types";
 
 const DEMO_WAV = "prototype/samples/weather_90s.wav";
 
@@ -37,6 +45,16 @@ function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
   );
 }
 
+function HistoryIcon({ className = "h-5 w-5" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 12a9 9 0 1 0 3-6.7" />
+      <path d="M3 4v5h5" />
+      <path d="M12 7v5l3 2" />
+    </svg>
+  );
+}
+
 function formatElapsed(ms: number): string {
   const total = Math.floor(ms / 1000);
   const m = Math.floor(total / 60);
@@ -55,6 +73,8 @@ export default function ControlWindow() {
   const [history, setHistory] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [needsWelcome, setNeedsWelcome] = useState<Config | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
@@ -158,6 +178,61 @@ export default function ControlWindow() {
   // half the translations stopped.
   const closedLangsNotifiedRef = useRef<Set<Lang>>(new Set());
 
+  // Buffer for utterances waiting on their en/vi translations. Each entry is
+  // appended to the session's transcript.jsonl exactly once — when both langs
+  // finish (or are skipped because the window is closed / text is too short),
+  // or when the user stops recording (in which case the row gets incomplete=true).
+  type PendingUtterance = {
+    zh: string;
+    en: string;
+    vi: string;
+    t_start: number;
+    t_end: number;
+    enDone: boolean;
+    viDone: boolean;
+  };
+  const pendingUtterancesRef = useRef<Map<string, PendingUtterance>>(new Map());
+
+  const tryFinalize = useCallback((id: string) => {
+    const map = pendingUtterancesRef.current;
+    const u = map.get(id);
+    if (!u || !u.enDone || !u.viDone) return;
+    map.delete(id);
+    invoke("session_append_utterance", {
+      utterance: {
+        id,
+        t_start: u.t_start,
+        t_end: u.t_end,
+        zh: u.zh,
+        en: u.en,
+        vi: u.vi,
+        incomplete: false,
+      },
+    }).catch((err) => console.error("session_append_utterance:", err));
+  }, []);
+
+  const flushPending = useCallback(async () => {
+    const entries = Array.from(pendingUtterancesRef.current.entries());
+    pendingUtterancesRef.current.clear();
+    for (const [id, u] of entries) {
+      try {
+        await invoke("session_append_utterance", {
+          utterance: {
+            id,
+            t_start: u.t_start,
+            t_end: u.t_end,
+            zh: u.zh,
+            en: u.en,
+            vi: u.vi,
+            incomplete: !u.enDone || !u.viDone,
+          },
+        });
+      } catch (err) {
+        console.error("flush session_append_utterance:", err);
+      }
+    }
+  }, []);
+
   const requestTranslate = useCallback(
     async (id: string, text: string, target: Lang) => {
       const win = await WebviewWindow.getByLabel(target);
@@ -167,13 +242,21 @@ export default function ControlWindow() {
           const label = target === "en" ? "英文" : "越南文";
           showToast("warning", `${label}譯文視窗已關閉，將不再翻譯該語言`);
         }
+        // Mark this lang as "done" in the pending entry so the finalizer
+        // doesn't wait forever for a translation that will never arrive.
+        const u = pendingUtterancesRef.current.get(id);
+        if (u) {
+          if (target === "en") u.enDone = true;
+          else u.viDone = true;
+          tryFinalize(id);
+        }
         return;
       }
       invoke("translate", { id, text, target }).catch((err) =>
         setError(`translate ${target}: ${err}`),
       );
     },
-    [showToast],
+    [showToast, tryFinalize],
   );
 
   const selectedDeviceRef = useRef(selectedDevice);
@@ -252,6 +335,10 @@ export default function ControlWindow() {
 
   const handleStop = useCallback(async () => {
     try {
+      // Flush any utterances still waiting on translation BEFORE stop_stt
+      // finalizes meta.json — once stop_session runs the recorder slot is
+      // empty and subsequent appends silently drop on the floor.
+      await flushPending();
       await invoke("stop_stt");
       // Drop rolling translation context so a new session doesn't carry
       // pronouns / topic from the previous meeting into its first sentence.
@@ -259,29 +346,78 @@ export default function ControlWindow() {
     } catch (err) {
       setError(`stop: ${err}`);
     }
-  }, []);
+  }, [flushPending]);
 
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [
       listen<TranscriptPayload>("transcript", (e) => {
-        const { text, is_final, t_start } = e.payload;
+        const { text, is_final, t_start, t_end } = e.payload;
         if (!text) return;
         if (is_final) {
           setHistory((h) => [...h, text]);
           setLatestZh("");
+          const id = String(t_start);
           // Skip the translate call for trivially short utterances —
           // single-char fragments like "嗯", "啊", "對" are usually noise
           // or filler, and translating each one bills an API call for no
           // user value (and often produces meta-prefix-filtered junk).
-          // Still keep the line in 中文逐字稿 history so the user sees what
-          // was heard.
-          if (text.trim().length < 2) return;
-          const id = String(t_start);
+          // Still record it (zh-only) so the meeting transcript is faithful.
+          if (text.trim().length < 2) {
+            invoke("session_append_utterance", {
+              utterance: {
+                id,
+                t_start,
+                t_end,
+                zh: text,
+                en: "",
+                vi: "",
+                incomplete: false,
+              },
+            }).catch((err) => console.error("session_append_utterance:", err));
+            return;
+          }
+          // Seat the pending entry BEFORE invoking translate so requestTranslate's
+          // closed-window short-circuit can mark its lang done immediately.
+          pendingUtterancesRef.current.set(id, {
+            zh: text,
+            en: "",
+            vi: "",
+            t_start,
+            t_end,
+            enDone: false,
+            viDone: false,
+          });
           requestTranslate(id, text, "en");
           requestTranslate(id, text, "vi");
         } else {
           setLatestZh(text);
         }
+      }),
+      listen<ChunkPayload>("translation:chunk:en", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) u.en += e.payload.text;
+      }),
+      listen<ChunkPayload>("translation:chunk:vi", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) u.vi += e.payload.text;
+      }),
+      listen<DonePayload>("translation:done:en", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) {
+          u.enDone = true;
+          tryFinalize(e.payload.id);
+        }
+      }),
+      listen<DonePayload>("translation:done:vi", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) {
+          u.viDone = true;
+          tryFinalize(e.payload.id);
+        }
+      }),
+      listen("session:reset", () => {
+        pendingUtterancesRef.current.clear();
+        closedLangsNotifiedRef.current.clear();
       }),
       listen("stt:ready", () => {
         setSidecarReady(true);
@@ -317,6 +453,10 @@ export default function ControlWindow() {
       listen("stt:stopped", () => {
         setRunning(false);
         setSessionStartedAt(null);
+        setActiveSessionId(null);
+      }),
+      listen<string>("session:opened", (e) => {
+        setActiveSessionId(e.payload);
       }),
       listen("stt:model_loading", () => {
         // Delay painting the overlay so cache hits (model_ready arrives within
@@ -360,7 +500,7 @@ export default function ControlWindow() {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       if (modelTimerRef.current) clearTimeout(modelTimerRef.current);
     };
-  }, [handleStop, requestStart, showToast, requestTranslate]);
+  }, [handleStop, requestStart, showToast, requestTranslate, tryFinalize]);
 
   useEffect(() => {
     if (historyRef.current) {
@@ -432,6 +572,14 @@ export default function ControlWindow() {
           >
             {running ? formatElapsed(elapsed) : "0:00"}
           </span>
+          <button
+            className="rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900"
+            onClick={() => setShowHistory(true)}
+            aria-label="歷史會議"
+            title="歷史會議"
+          >
+            <HistoryIcon className="h-4 w-4" />
+          </button>
           <button
             className="rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900"
             onClick={() => setShowSettings(true)}
@@ -539,6 +687,13 @@ export default function ControlWindow() {
           useMic={useMic}
           setUseMic={setUseMic}
           running={running}
+        />
+      )}
+
+      {showHistory && (
+        <HistoryModal
+          onClose={() => setShowHistory(false)}
+          activeSessionId={activeSessionId}
         />
       )}
 

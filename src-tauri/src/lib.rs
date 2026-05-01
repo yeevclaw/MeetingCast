@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 mod config;
 mod errors;
+mod session;
 mod sidecar;
 mod translator;
 
@@ -40,6 +41,7 @@ pub fn run() {
         .manage::<sidecar::SharedManager>(Arc::new(Mutex::new(sidecar::SidecarManager::new())))
         .manage(shared_config)
         .manage(translator::new_context())
+        .manage(session::new_recorder())
         .invoke_handler(tauri::generate_handler![
             sidecar::start_stt,
             sidecar::stop_stt,
@@ -49,10 +51,21 @@ pub fn run() {
             sidecar::list_audio_devices,
             translator::translate,
             translator::clear_translation_context,
+            translator::generate_summary,
+            translator::read_summary,
             config::get_config,
             config::set_config,
             errors::open_config_folder,
             errors::open_errors_log,
+            session::session_append_utterance,
+            session::list_sessions,
+            session::get_session_transcript,
+            session::get_session_meta,
+            session::delete_session,
+            session::open_session_folder,
+            session::export_session_markdown,
+            session::reveal_in_finder,
+            session::reveal_session_summary,
         ])
         .setup(move |app| {
             if let Err(e) = app.global_shortcut().register(toggle_shortcut.clone()) {
