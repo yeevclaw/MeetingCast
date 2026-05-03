@@ -58,6 +58,41 @@ Phase 1 + 2 + 3 + 大部分 Phase 4 完成。`pnpm tauri build` 端到端產出 
 
 **dev 測 Python 改動前**：`mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`，否則 sidecar 會吃 stale PyInstaller binary。
 
+## 包版 SOP（macOS .dmg ship 流程）
+
+**任何時候要產 `.dmg` 分發給其他人，完整跑這套不可跳步**。詳細驗證命令與紅燈標準見 memory `project_macos_signing.md`。
+
+1. **版本同步** — `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三處版本號一致。
+
+2. **macOS 三件套就位**（缺一個簽章就會壞回 linker-signed，fresh install 報 damaged 或不跳麥克風授權對話框）：
+   - `tauri.conf.json` 的 `bundle.macOS` 含 `infoPlist`、`entitlements`、`signingIdentity: "-"`、`minimumSystemVersion`
+   - `src-tauri/Info.plist`（每個用到的系統權限對應一個 `NS*UsageDescription`）
+   - `src-tauri/Entitlements.plist`（每個權限對應一個 `com.apple.security.device.*` 或 `personal-information.*`）
+
+3. **Build sidecar**（Python 改過才要）：`./scripts/build-sidecar.sh`
+
+4. **Build .dmg**：`pnpm tauri build`
+
+5. **驗證簽章** — 三條都過才算 build 成功：
+   ```bash
+   APP=src-tauri/target/release/bundle/macos/MeetingCast.app
+   codesign -dvv "$APP"          # Identifier=com.tpisoftware.meetingcast + flags=adhoc,runtime + Sealed Resources version=2
+   defaults read "$APP/Contents/Info.plist" NSMicrophoneUsageDescription   # 印出中文用途字串
+   codesign -d --entitlements - "$APP"   # 含 com.apple.security.device.audio-input
+   ```
+
+6. **乾淨機測試（強制）** — dev 機 TCC 紀錄會掩蓋簽章壞檔，**沒做這步等於沒測**：
+   ```bash
+   tccutil reset Microphone com.tpisoftware.meetingcast
+   rm -rf /Applications/MeetingCast.app
+   open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg   # 拖 .app 到 /Applications
+   ```
+   開 MeetingCast → 按開始錄音 → **應該跳系統授權對話框**。沒跳就回 step 5 抓問題。
+
+7. 分發前提醒收件人：經 Safari / Slack / Email 下載要 `xattr -cr /Applications/MeetingCast.app` 才能開（quarantine + ad-hoc 簽章碰到 Sequoia 報 damaged）。
+
+> 0.1.0 ~ 0.1.3 連四個 release 都壞但 dev 機看不出來 — 這個 SOP 的存在就是為了不再發生。
+
 ## 核心原則
 
 - **回應一律使用繁體中文**
