@@ -34,9 +34,15 @@ export type AudioDevice = {
 };
 
 export type GlossaryEntry = {
+  term: string;
   aliases: string[];
   en: string;
   vi: string;
+};
+
+export type GlossaryBook = {
+  name: string;
+  entries: GlossaryEntry[];
 };
 
 export type Config = {
@@ -48,7 +54,8 @@ export type Config = {
   audio: {
     input_device: string;
   };
-  glossary: Record<string, GlossaryEntry>;
+  glossaries: GlossaryBook[];
+  active_glossary: string | null;
 };
 
 export type StoredUtterance = {

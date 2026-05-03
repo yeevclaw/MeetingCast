@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import GlossaryModal from "@/components/GlossaryModal";
 import HistoryModal from "@/components/HistoryModal";
 import MicMeter from "@/components/MicMeter";
 import SettingsModal from "@/components/SettingsModal";
@@ -45,6 +46,15 @@ function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
   );
 }
 
+function GlossaryIcon({ className = "h-5 w-5" }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+    </svg>
+  );
+}
+
 function HistoryIcon({ className = "h-5 w-5" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -75,6 +85,13 @@ export default function ControlWindow() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showGlossary, setShowGlossary] = useState(false);
+  const [pendingGlossaryTerm, setPendingGlossaryTerm] = useState<string | null>(null);
+  const [transcriptMenu, setTranscriptMenu] = useState<{
+    x: number;
+    y: number;
+    text: string;
+  } | null>(null);
   const [showHistoryCoach, setShowHistoryCoach] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -173,6 +190,29 @@ export default function ControlWindow() {
       toastTimerRef.current = setTimeout(() => setToast(null), ms);
     }
   }, []);
+
+  function handleTranscriptContextMenu(e: React.MouseEvent) {
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() ?? "";
+    if (!text) return; // no selection: let native menu fire (none in Tauri prod, but harmless)
+    e.preventDefault();
+    setTranscriptMenu({ x: e.clientX, y: e.clientY, text });
+  }
+
+  function addToGlossary(term: string) {
+    setPendingGlossaryTerm(term);
+    setShowGlossary(true);
+    setTranscriptMenu(null);
+  }
+
+  // Click anywhere outside dismisses the floating context menu. Use mousedown
+  // so the menu closes before a re-click on transcript text re-selects.
+  useEffect(() => {
+    if (!transcriptMenu) return;
+    const close = () => setTranscriptMenu(null);
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [transcriptMenu]);
 
   // Track translation windows the user has closed so we (a) skip the
   // translate API call (no point paying tokens for a destination nobody can
@@ -591,23 +631,25 @@ export default function ControlWindow() {
           >
             {running ? formatElapsed(elapsed) : "0:00"}
           </span>
-          <button
-            className={`relative rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900 ${
-              showHistoryCoach ? "ring-2 ring-recording/70 ring-offset-2 ring-offset-paper-50" : ""
-            }`}
+          <IconButton
+            label="歷史會議"
             onClick={() => setShowHistory(true)}
-            aria-label="歷史會議"
-            title="歷史會議"
+            highlightRing={showHistoryCoach}
           >
             <HistoryIcon className="h-4 w-4" />
-          </button>
-          <button
-            className="rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900"
+          </IconButton>
+          <IconButton
+            label="術語表"
+            onClick={() => setShowGlossary(true)}
+          >
+            <GlossaryIcon className="h-4 w-4" />
+          </IconButton>
+          <IconButton
+            label="設定"
             onClick={() => setShowSettings(true)}
-            aria-label="設定"
           >
             <SettingsIcon className="h-4 w-4" />
-          </button>
+          </IconButton>
         </span>
       </div>
 
@@ -718,7 +760,10 @@ export default function ControlWindow() {
               </div>
             )
           ) : (
-            <ul className="space-y-2 text-base leading-relaxed text-paper-900">
+            <ul
+              className="space-y-2 text-base leading-relaxed text-paper-900"
+              onContextMenu={handleTranscriptContextMenu}
+            >
               {history.map((h, i) => (
                 <li key={i}>{h}</li>
               ))}
@@ -759,6 +804,32 @@ export default function ControlWindow() {
           onClose={() => setShowHistory(false)}
           activeSessionId={activeSessionId}
         />
+      )}
+
+      {showGlossary && (
+        <GlossaryModal
+          onClose={() => {
+            setShowGlossary(false);
+            setPendingGlossaryTerm(null);
+          }}
+          initialTerm={pendingGlossaryTerm}
+        />
+      )}
+
+      {transcriptMenu && (
+        <div
+          className="fixed z-40 min-w-[140px] overflow-hidden rounded-lg border border-paper-200 bg-white py-1 shadow-xl"
+          style={{ left: transcriptMenu.x, top: transcriptMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            className="block w-full px-3 py-1.5 text-left text-sm text-paper-900 hover:bg-paper-100"
+            onClick={() => addToGlossary(transcriptMenu.text)}
+          >
+            加入術語表
+            <span className="ml-1 text-xs text-paper-500">「{transcriptMenu.text.slice(0, 12)}」</span>
+          </button>
+        </div>
       )}
 
       {needsWelcome && (
@@ -894,5 +965,34 @@ function StepIcon({ status }: { status: StepStatus }) {
   }
   return (
     <span className="mt-0.5 inline-block h-4 w-4 flex-shrink-0 rounded-full border-2 border-paper-300" />
+  );
+}
+
+function IconButton({
+  label,
+  onClick,
+  highlightRing,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  highlightRing?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <span className="group relative inline-flex">
+      <button
+        className={`rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900 ${
+          highlightRing ? "ring-2 ring-recording/70 ring-offset-2 ring-offset-paper-50" : ""
+        }`}
+        onClick={onClick}
+        aria-label={label}
+      >
+        {children}
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-full z-30 mt-1 -translate-x-1/2 whitespace-nowrap rounded bg-paper-900 px-2 py-0.5 text-[11px] font-medium text-paper-50 opacity-0 shadow-lg transition-opacity duration-150 group-hover:opacity-100">
+        {label}
+      </span>
+    </span>
   );
 }

@@ -1,52 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import type { AudioDevice, Config, GlossaryEntry } from "@/lib/types";
+import type { AudioDevice, Config } from "@/lib/types";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 
 type Backend = "local" | "cloud";
-
-// Editable row form. Keep aliases as a single comma-joined string for
-// inline editing — it's a worse data model but a much better UX for
-// "type 3 things separated by commas" than rendering per-alias chips.
-// Convert to/from the proper string[] at load / save boundaries.
-type GlossaryRow = {
-  // Stable id for React keys; survives term renames where the canonical
-  // dictionary key would otherwise need to be re-mapped.
-  rowId: string;
-  term: string;
-  aliasesText: string;
-  en: string;
-  vi: string;
-};
-
-function rowsFromConfig(glossary: Record<string, GlossaryEntry>): GlossaryRow[] {
-  return Object.entries(glossary).map(([term, entry], i) => ({
-    rowId: `g${i}-${term}`,
-    term,
-    aliasesText: (entry.aliases ?? []).join(", "),
-    en: entry.en ?? "",
-    vi: entry.vi ?? "",
-  }));
-}
-
-function rowsToConfig(rows: GlossaryRow[]): Record<string, GlossaryEntry> {
-  const out: Record<string, GlossaryEntry> = {};
-  for (const row of rows) {
-    const term = row.term.trim();
-    if (!term) continue;
-    out[term] = {
-      aliases: row.aliasesText
-        .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0),
-      en: row.en.trim(),
-      vi: row.vi.trim(),
-    };
-  }
-  return out;
-}
 
 export default function SettingsModal({
   onClose,
@@ -64,9 +23,6 @@ export default function SettingsModal({
   running: boolean;
 }) {
   const [cfg, setCfg] = useState<Config | null>(null);
-  const [glossaryRows, setGlossaryRows] = useState<GlossaryRow[]>([]);
-  const [glossaryOpen, setGlossaryOpen] = useState(false);
-  const rowIdCounter = useRef(0);
   const [showAnthropic, setShowAnthropic] = useState(false);
   const [showDeepgram, setShowDeepgram] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -101,10 +57,7 @@ export default function SettingsModal({
 
   useEffect(() => {
     invoke<Config>("get_config")
-      .then((c) => {
-        setCfg(c);
-        setGlossaryRows(rowsFromConfig(c.glossary ?? {}));
-      })
+      .then(setCfg)
       .catch((e) => setError(`load: ${e}`));
     getVersion().then(setVersion).catch(() => {});
     refreshDevices();
@@ -115,39 +68,13 @@ export default function SettingsModal({
     setSaving(true);
     setError(null);
     try {
-      const glossary = rowsToConfig(glossaryRows);
-      await invoke("set_config", { config: { ...cfg, glossary } });
+      await invoke("set_config", { config: cfg });
       onClose();
     } catch (e) {
       setError(`save: ${e}`);
     } finally {
       setSaving(false);
     }
-  }
-
-  function addGlossaryRow() {
-    rowIdCounter.current += 1;
-    setGlossaryRows((rows) => [
-      ...rows,
-      {
-        rowId: `new-${rowIdCounter.current}`,
-        term: "",
-        aliasesText: "",
-        en: "",
-        vi: "",
-      },
-    ]);
-    setGlossaryOpen(true);
-  }
-
-  function updateGlossaryRow(rowId: string, patch: Partial<GlossaryRow>) {
-    setGlossaryRows((rows) =>
-      rows.map((r) => (r.rowId === rowId ? { ...r, ...patch } : r)),
-    );
-  }
-
-  function removeGlossaryRow(rowId: string) {
-    setGlossaryRows((rows) => rows.filter((r) => r.rowId !== rowId));
   }
 
   function update(patch: Partial<Config["api"]>) {
@@ -318,93 +245,6 @@ export default function SettingsModal({
                 )}
               </Field>
             )}
-
-            <Field
-              label="術語表"
-              hint="專有名詞 / 公司名 / 罕見詞。會餵給 Whisper 偏置 STT 辨識，並在翻譯與會議總結 prompt 中強制使用對應譯名"
-            >
-              <div className="rounded border border-paper-200 bg-paper-50">
-                <button
-                  type="button"
-                  className="flex w-full items-center justify-between px-3 py-2 text-xs text-paper-700 hover:bg-paper-100"
-                  onClick={() => setGlossaryOpen(!glossaryOpen)}
-                >
-                  <span>
-                    {glossaryRows.length === 0
-                      ? "尚未加入任何術語"
-                      : `已加入 ${glossaryRows.length} 條`}
-                  </span>
-                  <span className="text-paper-500">{glossaryOpen ? "▼" : "▶"}</span>
-                </button>
-                {glossaryOpen && (
-                  <div className="space-y-2 border-t border-paper-200 px-3 py-3">
-                    {glossaryRows.map((row) => (
-                      <div
-                        key={row.rowId}
-                        className="rounded border border-paper-200 bg-white p-2 text-xs"
-                      >
-                        <div className="mb-1.5 flex items-center gap-1.5">
-                          <input
-                            type="text"
-                            placeholder="中文術語（例：紫微斗數）"
-                            className="flex-1 rounded border border-paper-300 px-2 py-1 font-medium"
-                            value={row.term}
-                            onChange={(e) =>
-                              updateGlossaryRow(row.rowId, { term: e.target.value })
-                            }
-                          />
-                          <button
-                            type="button"
-                            className="rounded px-1.5 py-1 text-paper-500 hover:bg-danger-50 hover:text-danger-700"
-                            onClick={() => removeGlossaryRow(row.rowId)}
-                            aria-label="刪除"
-                            title="刪除"
-                          >
-                            ✕
-                          </button>
-                        </div>
-                        <input
-                          type="text"
-                          placeholder="常見錯字（逗號分隔，例：紫薇斗數,子位斗數）"
-                          className="mb-1.5 w-full rounded border border-paper-300 px-2 py-1"
-                          value={row.aliasesText}
-                          onChange={(e) =>
-                            updateGlossaryRow(row.rowId, { aliasesText: e.target.value })
-                          }
-                        />
-                        <div className="flex gap-1.5">
-                          <input
-                            type="text"
-                            placeholder="EN"
-                            className="flex-1 rounded border border-paper-300 px-2 py-1"
-                            value={row.en}
-                            onChange={(e) =>
-                              updateGlossaryRow(row.rowId, { en: e.target.value })
-                            }
-                          />
-                          <input
-                            type="text"
-                            placeholder="VI"
-                            className="flex-1 rounded border border-paper-300 px-2 py-1"
-                            value={row.vi}
-                            onChange={(e) =>
-                              updateGlossaryRow(row.rowId, { vi: e.target.value })
-                            }
-                          />
-                        </div>
-                      </div>
-                    ))}
-                    <button
-                      type="button"
-                      className="w-full rounded border border-dashed border-paper-300 px-2 py-1.5 text-xs text-paper-600 hover:border-paper-500 hover:text-paper-900"
-                      onClick={addGlossaryRow}
-                    >
-                      + 新增術語
-                    </button>
-                  </div>
-                )}
-              </div>
-            </Field>
 
             <Field label="檔案">
               <div className="flex flex-wrap gap-2">
