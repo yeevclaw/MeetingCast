@@ -146,10 +146,12 @@ class MLXWhisperSTT:
         language: str = "zh",
         model_repo: str | None = None,
         max_speech_sec: float = 8.0,
+        initial_prompt: str | None = None,
     ):
         self.language = language
         self.model_repo = model_repo or self.MODEL_REPO
         self.max_speech_sec = max_speech_sec
+        self.initial_prompt = initial_prompt
         self._vad_model = None
         # Adaptive noise floor — populated by stream() from windows that
         # silero-vad classifies as non-speech. Defaults to the static floor
@@ -225,6 +227,7 @@ class MLXWhisperSTT:
             language=self.language,
             condition_on_previous_text=False,
             no_speech_threshold=0.5,
+            initial_prompt=self.initial_prompt,
         )
         # Return idle Metal buffers to the OS. Without this, MLX's allocator
         # holds the working set of every past transcribe call indefinitely;

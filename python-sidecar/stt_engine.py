@@ -83,6 +83,7 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     language = cmd.get("language", "zh")
     source_cfg = cmd.get("source", {"type": "mic"})
     api_cfg = cmd.get("api") or {}
+    initial_prompt = cmd.get("initial_prompt") or None
 
     deepgram_api_key = api_cfg.get("deepgram_api_key")
     if deepgram_api_key:
@@ -111,7 +112,13 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 source_cfg = {**source_cfg, "device": ""}
 
     try:
-        stt = get_backend(backend_name, language=language)
+        # Cloud backend ignores initial_prompt — Deepgram has its own keyword
+        # boost mechanism that we can wire later. Avoid passing the kwarg so
+        # we don't break DeepgramSTT's __init__ signature.
+        backend_kwargs = {"language": language}
+        if backend_name == "local" and initial_prompt:
+            backend_kwargs["initial_prompt"] = initial_prompt
+        stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on
         # first start. No-op if cached.

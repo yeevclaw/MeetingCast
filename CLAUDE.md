@@ -206,12 +206,12 @@ Tauri + React + sidecar stdio 整合、Rust translator SSE。
 - ✅ MicMeter、重新錄音確認框
 - ✅ 統一暖紙色票
 - ✅ PyInstaller 打包 sidecar、可分發 `.dmg`
+- ✅ 術語表全鏈路（Whisper initial_prompt + alias 替換 + 翻譯/總結 prompt 注入 + Settings UI）
 - ⬜ Markdown 三語匯出
 - ⬜ Log 檔案輪替（目前 append-only）
 - ⬜ 真人麥克風 live test 全程驗收
 
 ### Phase 5（暫不做）
-- 術語表 GUI（schema 已預留）
 - 字體 / 視窗外觀的 GUI 設定（schema 已預留）
 - 歷史會議搜尋、雲端同步、對方發言反向翻譯
 
@@ -265,9 +265,21 @@ font_size_vi = 32
 always_on_top = false
 borderless = false
 
-[glossary]                                         # ⬜ Phase 5：prompt 模板段落保留但空
-"紫微斗數" = { en = "Zi Wei Dou Shu", vi = "Tử Vi Đẩu Số" }
+[glossary."紫微斗數"]                              # ✅ Settings UI 可改
+aliases = ["紫薇斗數", "子位斗數"]                  # 後處理替換的常見錯字
+en = "Zi Wei Dou Shu"
+vi = "Tử Vi Đẩu Số"
+
+[glossary."TPI Software"]
+aliases = []
+en = "TPI Software"
+vi = "TPI Software"
 ```
+
+**術語表三段串流**：
+- `term`（key）→ Whisper `initial_prompt` 偏置 decoder（取前 30 條，受 ~224 token 上限約束）
+- `aliases` → 後處理 `apply_glossary_aliases()` 把已知錯字替成 canonical term，僅對 `is_final` transcript 跑
+- `en` / `vi` → 翻譯 + 會議總結 system prompt 注入「術語表」section（cache 友善；首句 cache miss 後 hit）
 
 **API key 載入順序**：
 1. App 啟動讀 `config.toml`

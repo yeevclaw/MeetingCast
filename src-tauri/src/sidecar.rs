@@ -228,6 +228,7 @@ async fn spawn_inner_body(
     // stdout: parse JSON events
     let app_o = app.clone();
     let mgr_o = mgr.clone();
+    let cfg_o = cfg_arc.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -244,6 +245,23 @@ async fn spawn_inner_body(
                             if let Some(tx) = mgr_o.lock().await.pending_devices.take() {
                                 let _ = tx.send(devices);
                             }
+                        }
+                        // Apply alias substitution ONLY to final transcripts —
+                        // interim previews change every chunk so the cost would
+                        // be paid for output the user barely sees, and a partial
+                        // alias inside an interim might trigger a wrong rewrite
+                        // that stabilizes once the full word is recognized.
+                        SidecarEvent::Transcript { text, is_final, t_start, t_end } if is_final => {
+                            let rewritten = cfg_o.lock().await.apply_glossary_aliases(&text);
+                            emit_event(
+                                &app_o,
+                                SidecarEvent::Transcript {
+                                    text: rewritten,
+                                    is_final,
+                                    t_start,
+                                    t_end,
+                                },
+                            );
                         }
                         other => emit_event(&app_o, other),
                     }
@@ -444,9 +462,9 @@ pub async fn start_stt(
         }
     }
 
-    let deepgram_api_key = {
+    let (deepgram_api_key, initial_prompt) = {
         let cfg = config.lock().await;
-        cfg.api.deepgram_api_key.clone()
+        (cfg.api.deepgram_api_key.clone(), cfg.whisper_initial_prompt())
     };
     let language_str = language.unwrap_or_else(|| "zh".into());
     let cmd = serde_json::json!({
@@ -454,6 +472,7 @@ pub async fn start_stt(
         "backend": backend,
         "source": source,
         "language": language_str,
+        "initial_prompt": initial_prompt,
         "api": {
             "deepgram_api_key": deepgram_api_key,
         },

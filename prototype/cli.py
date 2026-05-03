@@ -36,7 +36,7 @@ async def run_translate(text: str):
     return results
 
 
-async def run_vad_demo(wav_path: str, translate: bool):
+async def run_vad_demo(wav_path: str, translate: bool, initial_prompt: str | None = None):
     print(f"--- VAD demo: {wav_path} ---")
     print("loading audio + silero-vad ...", flush=True)
     audio, sr = load_wav_float32(wav_path)
@@ -47,7 +47,7 @@ async def run_vad_demo(wav_path: str, translate: bool):
     vad_ms = (time.perf_counter() - t_vad) * 1000
     print(f"audio {total_sec:.1f}s → {len(segments)} 段 (VAD 耗時 {vad_ms:.0f} ms)\n")
 
-    stt = get_backend("local")
+    stt = get_backend("local", initial_prompt=initial_prompt)
     translator = Translator() if translate else None
 
     # Warm up mlx-whisper once so first segment isn't skewed
@@ -95,8 +95,9 @@ async def run_vad_demo(wav_path: str, translate: bool):
         os.unlink(tmp_path)
 
 
-async def run_streaming(chunks, backend_name: str, translate: bool, label: str):
-    stt = get_backend(backend_name)
+async def run_streaming(chunks, backend_name: str, translate: bool, label: str, initial_prompt: str | None = None):
+    kwargs = {"initial_prompt": initial_prompt} if backend_name == "local" else {}
+    stt = get_backend(backend_name, **kwargs)
     translator = Translator() if translate else None
 
     t0 = time.perf_counter()
@@ -173,26 +174,39 @@ def main():
         metavar="WAV",
         help="batch-segment WAV with silero-vad, transcribe each segment via local STT, optionally translate",
     )
+    parser.add_argument(
+        "--prompt-terms",
+        metavar="TERMS",
+        help="comma-separated list of terms to bias Whisper decoder (local backend only); "
+             "e.g. --prompt-terms '紫微斗數,TPI Software,MeetingCast'",
+    )
     args = parser.parse_args()
+
+    initial_prompt = None
+    if args.prompt_terms:
+        terms = [t.strip() for t in args.prompt_terms.split(",") if t.strip()]
+        if terms:
+            initial_prompt = "本段語音可能包含以下術語：" + "、".join(terms) + "。"
+            print(f"[initial_prompt] {initial_prompt}", file=sys.stderr)
 
     if args.vad_demo:
         if not Path(args.vad_demo).exists():
             sys.exit(f"file not found: {args.vad_demo}")
-        asyncio.run(run_vad_demo(args.vad_demo, args.translate))
+        asyncio.run(run_vad_demo(args.vad_demo, args.translate, initial_prompt))
         return
 
     if args.mic_sim:
         if not Path(args.mic_sim).exists():
             sys.exit(f"file not found: {args.mic_sim}")
         chunks = wav_chunks(args.mic_sim, chunk_ms=100, realtime=True)
-        asyncio.run(run_streaming(chunks, args.backend, args.translate, args.mic_sim))
+        asyncio.run(run_streaming(chunks, args.backend, args.translate, args.mic_sim, initial_prompt))
         return
 
     if args.mic:
         print("[ 麥克風錄音中，Ctrl+C 停止 ]\n")
         chunks = mic_chunks(sample_rate=16000, chunk_ms=100)
         try:
-            asyncio.run(run_streaming(chunks, args.backend, args.translate, "microphone"))
+            asyncio.run(run_streaming(chunks, args.backend, args.translate, "microphone", initial_prompt))
         except KeyboardInterrupt:
             print("\nstopped.")
         return
@@ -207,7 +221,10 @@ def main():
 
     print(f"backend: {args.backend}  |  file: {args.file}")
     t_init = time.perf_counter()
-    stt = get_backend(args.backend, language=args.language)
+    backend_kwargs: dict = {"language": args.language}
+    if args.backend == "local":
+        backend_kwargs["initial_prompt"] = initial_prompt
+    stt = get_backend(args.backend, **backend_kwargs)
     print(f"init: {(time.perf_counter() - t_init) * 1000:.0f} ms")
 
     if args.warmup and args.backend == "local":

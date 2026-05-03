@@ -33,6 +33,12 @@ export type AudioDevice = {
   channels: number;
 };
 
+export type GlossaryEntry = {
+  aliases: string[];
+  en: string;
+  vi: string;
+};
+
 export type Config = {
   api: {
     anthropic_api_key: string;
@@ -42,6 +48,7 @@ export type Config = {
   audio: {
     input_device: string;
   };
+  glossary: Record<string, GlossaryEntry>;
 };
 
 export type StoredUtterance = {

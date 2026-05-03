@@ -516,6 +516,7 @@ fn build_summary_system(
     target_label: &str,
     headings: &[&str],
     section_rules: &str,
+    glossary_block: &str,
 ) -> String {
     let heading_block = headings
         .iter()
@@ -532,7 +533,7 @@ fn build_summary_system(
 {heading_block}\n\
 3. 不要編造逐字稿沒有的資訊、不要寫開場或結尾客套\n\
 4. 不要直接複製逐字稿原文進總結\
-{section_rules}"
+{section_rules}{glossary_block}"
     )
 }
 
@@ -540,7 +541,7 @@ fn build_summary_system(
 /// (one per slide, 6–10 total) instead of a fixed list — so it bypasses
 /// the heading-list scaffolding in `build_summary_system` and gets its
 /// own prompt.
-fn build_slide_outline_system(target_label: &str, target: &str) -> String {
+fn build_slide_outline_system(target_label: &str, target: &str, glossary_block: &str) -> String {
     let (cover, agenda, decisions, next_steps) = match target {
         "en" => ("Cover", "Agenda", "Decisions & Action Items", "Next Steps"),
         "vi" => ("Trang bìa", "Chương trình", "Quyết định & Hành động", "Bước tiếp theo"),
@@ -562,7 +563,7 @@ fn build_slide_outline_system(target_label: &str, target: &str) -> String {
    - Slide N-1（{decisions}）：本次明確達成的決議與 Action items（Action items 用 `- [ ] 任務 — 負責人（期限）` 格式）\n\
    - Slide N（{next_steps}）：後續行動、下次會議或追蹤事項\n\
 7. 每張投影片後可選加 `### Speaker Notes`（1–2 句口頭補充細節給簡報者）；沒必要可省略，不要每張都硬寫\n\
-8. 不要編造逐字稿沒有的資訊、不要寫開場或結尾客套"
+8. 不要編造逐字稿沒有的資訊、不要寫開場或結尾客套{glossary_block}"
     )
 }
 
@@ -584,11 +585,24 @@ pub async fn generate_summary(
         return Err(format!("invalid target: {target}"));
     };
 
+    // Glossary block is injected for non-zh targets only — zh→zh mapping is
+    // identity and adds nothing. For en/vi, the block forces Sonnet to render
+    // proper nouns the same way the live-translation path does, so summary
+    // and chunked translation stay in sync.
+    let glossary_block = {
+        let cfg = config.lock().await;
+        if target == "zh" {
+            String::new()
+        } else {
+            glossary_section(&cfg, &target)
+        }
+    };
+
     // Slide outline has a variable number of slides — bypass the fixed-
     // heading scaffolding entirely. All other templates fall through to
     // the headings/section_rules path.
     let system = if template == "slide_outline" {
-        build_slide_outline_system(target_label, &target)
+        build_slide_outline_system(target_label, &target, &glossary_block)
     } else {
         let Some(headings) = template_headings(&template, &target) else {
             return Err(format!("invalid template: {template}"));
@@ -596,7 +610,7 @@ pub async fn generate_summary(
         let Some(section_rules) = template_section_rules(&template) else {
             return Err(format!("invalid template: {template}"));
         };
-        build_summary_system(target_label, &headings, section_rules)
+        build_summary_system(target_label, &headings, section_rules, &glossary_block)
     };
 
     let utterances = session::read_transcript(&session_id)?;

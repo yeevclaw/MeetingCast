@@ -31,12 +31,16 @@ impl Default for ApiConfig {
     }
 }
 
-/// One glossary entry. Keys in the [glossary] map are the source-language
-/// (zh) terms; the per-target translation is taken from the matching field.
-/// Empty fields mean "no override for this language" — the model falls back
-/// to its default rendering.
+/// One glossary entry. Keys in the [glossary] map are the canonical
+/// source-language (zh) terms. `aliases` is a list of common Whisper
+/// mistranscriptions of that term (e.g. "紫微斗數" often comes out as
+/// "紫薇斗數"); these get string-replaced back to the canonical form before
+/// the transcript is emitted to the UI. The per-target translation is taken
+/// from `en` / `vi` — empty means "no override, model decides".
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GlossaryEntry {
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub en: String,
     #[serde(default)]
@@ -62,6 +66,61 @@ pub struct Config {
     /// BTreeMap so config.toml round-trips with stable key order.
     #[serde(default)]
     pub glossary: BTreeMap<String, GlossaryEntry>,
+}
+
+impl Config {
+    /// Build the Chinese-language initial_prompt fed to mlx-whisper's decoder.
+    /// The canonical term keys are joined with 、 inside a leading carrier
+    /// sentence ("本段語音可能包含以下術語：…。") — Whisper's prompt-conditioning
+    /// works best when the prompt is grammatically natural, not a bare list.
+    /// Capped at 30 terms because the decoder prompt is hard-limited to ~224
+    /// BPE tokens and longer prompts tend to make the decoder hallucinate
+    /// continuations of the prompt itself.
+    /// Aliases are deliberately excluded — they're mistranscriptions we want
+    /// to bias AGAINST, not toward; they're applied via post-hoc substitution.
+    pub fn apply_glossary_aliases(&self, text: &str) -> String {
+        if self.glossary.is_empty() {
+            return text.to_string();
+        }
+        // Sort aliases by length descending so longer matches win — without
+        // this, a short alias that's a substring of a longer one (rare but
+        // possible: "AI" inside "AI助理") would clobber the longer match.
+        let mut pairs: Vec<(&String, &String)> = self
+            .glossary
+            .iter()
+            .flat_map(|(term, entry)| entry.aliases.iter().map(move |a| (a, term)))
+            .filter(|(a, _)| !a.is_empty())
+            .collect();
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let mut out = text.to_string();
+        for (alias, canonical) in pairs {
+            if alias != canonical {
+                out = out.replace(alias.as_str(), canonical.as_str());
+            }
+        }
+        out
+    }
+
+    pub fn whisper_initial_prompt(&self) -> Option<String> {
+        if self.glossary.is_empty() {
+            return None;
+        }
+        let terms: Vec<&str> = self
+            .glossary
+            .keys()
+            .take(30)
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if terms.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "本段語音可能包含以下術語：{}。",
+                terms.join("、")
+            ))
+        }
+    }
 }
 
 pub type SharedConfig = Arc<Mutex<Config>>;
