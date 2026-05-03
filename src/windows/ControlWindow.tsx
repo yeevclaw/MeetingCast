@@ -48,9 +48,10 @@ function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
 function HistoryIcon({ className = "h-5 w-5" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M3 12a9 9 0 1 0 3-6.7" />
-      <path d="M3 4v5h5" />
-      <path d="M12 7v5l3 2" />
+      <rect x="8" y="2" width="8" height="4" rx="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      <line x1="9" y1="12" x2="15" y2="12" />
+      <line x1="9" y1="16" x2="13" y2="16" />
     </svg>
   );
 }
@@ -74,6 +75,7 @@ export default function ControlWindow() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showHistoryCoach, setShowHistoryCoach] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [needsWelcome, setNeedsWelcome] = useState<Config | null>(null);
@@ -192,6 +194,7 @@ export default function ControlWindow() {
     viDone: boolean;
   };
   const pendingUtterancesRef = useRef<Map<string, PendingUtterance>>(new Map());
+  const finalizedThisSessionRef = useRef(0);
 
   const tryFinalize = useCallback((id: string) => {
     const map = pendingUtterancesRef.current;
@@ -208,7 +211,11 @@ export default function ControlWindow() {
         vi: u.vi,
         incomplete: false,
       },
-    }).catch((err) => console.error("session_append_utterance:", err));
+    })
+      .then(() => {
+        finalizedThisSessionRef.current += 1;
+      })
+      .catch((err) => console.error("session_append_utterance:", err));
   }, []);
 
   const flushPending = useCallback(async () => {
@@ -227,6 +234,7 @@ export default function ControlWindow() {
             incomplete: !u.enDone || !u.viDone,
           },
         });
+        finalizedThisSessionRef.current += 1;
       } catch (err) {
         console.error("flush session_append_utterance:", err);
       }
@@ -343,6 +351,12 @@ export default function ControlWindow() {
       // Drop rolling translation context so a new session doesn't carry
       // pronouns / topic from the previous meeting into its first sentence.
       invoke("clear_translation_context").catch(() => {});
+      if (
+        finalizedThisSessionRef.current > 0 &&
+        localStorage.getItem("mc_history_coach_seen") !== "1"
+      ) {
+        setShowHistoryCoach(true);
+      }
     } catch (err) {
       setError(`stop: ${err}`);
     }
@@ -373,7 +387,11 @@ export default function ControlWindow() {
                 vi: "",
                 incomplete: false,
               },
-            }).catch((err) => console.error("session_append_utterance:", err));
+            })
+              .then(() => {
+                finalizedThisSessionRef.current += 1;
+              })
+              .catch((err) => console.error("session_append_utterance:", err));
             return;
           }
           // Seat the pending entry BEFORE invoking translate so requestTranslate's
@@ -444,6 +462,7 @@ export default function ControlWindow() {
       listen("stt:started", () => {
         setRunning(true);
         setSessionStartedAt(Date.now());
+        finalizedThisSessionRef.current = 0;
         if (modelTimerRef.current) {
           clearTimeout(modelTimerRef.current);
           modelTimerRef.current = null;
@@ -573,7 +592,9 @@ export default function ControlWindow() {
             {running ? formatElapsed(elapsed) : "0:00"}
           </span>
           <button
-            className="rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900"
+            className={`relative rounded-full p-1.5 text-paper-500 transition hover:bg-paper-200 hover:text-paper-900 ${
+              showHistoryCoach ? "ring-2 ring-recording/70 ring-offset-2 ring-offset-paper-50" : ""
+            }`}
             onClick={() => setShowHistory(true)}
             aria-label="歷史會議"
             title="歷史會議"
@@ -589,6 +610,39 @@ export default function ControlWindow() {
           </button>
         </span>
       </div>
+
+      {showHistoryCoach && (
+        <div className="absolute right-3 top-10 z-30 w-64 rounded-2xl bg-paper-900 px-4 py-3 text-paper-50 shadow-xl">
+          <span className="absolute -top-1.5 right-12 h-3 w-3 rotate-45 bg-paper-900" />
+          <p className="text-sm font-medium leading-snug">
+            ✨ 第一場會議已存好
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-paper-300">
+            點右上角圖示打開歷史紀錄，可以重看逐字稿、匯出，或讓 AI 產生會議總結
+          </p>
+          <div className="mt-3 flex justify-end gap-2 text-xs">
+            <button
+              className="rounded-full px-3 py-1 text-paper-300 transition hover:text-paper-50"
+              onClick={() => {
+                localStorage.setItem("mc_history_coach_seen", "1");
+                setShowHistoryCoach(false);
+              }}
+            >
+              知道了
+            </button>
+            <button
+              className="rounded-full bg-paper-50 px-3 py-1 font-medium text-paper-900 transition hover:bg-paper-200"
+              onClick={() => {
+                localStorage.setItem("mc_history_coach_seen", "1");
+                setShowHistoryCoach(false);
+                setShowHistory(true);
+              }}
+            >
+              看看
+            </button>
+          </div>
+        </div>
+      )}
 
       <button
         className="group relative mx-4 h-16 overflow-hidden rounded-2xl text-white transition active:scale-[0.99]"
@@ -643,16 +697,26 @@ export default function ControlWindow() {
         </div>
         <div ref={historyRef} className="flex-1 overflow-y-auto px-5 py-4">
           {history.length === 0 && !latestZh ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-paper-600">
-              <p className="text-sm">按「開始錄音」即可錄音翻譯</p>
-              <p className="text-xs text-paper-500">
-                也可用快捷鍵{" "}
-                <kbd className="rounded border border-paper-300 bg-paper-100 px-1.5 py-0.5 font-mono text-[10px] text-paper-700">
-                  ⌘ Shift M
-                </kbd>{" "}
-                切換
-              </p>
-            </div>
+            running ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 text-paper-600">
+                <span className="relative inline-flex h-3 w-3">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-recording/60" />
+                  <span className="relative inline-flex h-3 w-3 rounded-full bg-recording" />
+                </span>
+                <p className="text-sm font-medium text-paper-700">聆聽中…請開始說話</p>
+              </div>
+            ) : (
+              <div className="flex h-full flex-col items-center justify-center gap-2 text-paper-600">
+                <p className="text-sm">按「開始錄音」即可錄音翻譯</p>
+                <p className="text-xs text-paper-500">
+                  也可用快捷鍵{" "}
+                  <kbd className="rounded border border-paper-300 bg-paper-100 px-1.5 py-0.5 font-mono text-[10px] text-paper-700">
+                    ⌘ Shift M
+                  </kbd>{" "}
+                  切換
+                </p>
+              </div>
+            )
           ) : (
             <ul className="space-y-2 text-base leading-relaxed text-paper-900">
               {history.map((h, i) => (
