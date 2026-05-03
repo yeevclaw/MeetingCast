@@ -50,6 +50,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/stt_engine"]
+    "externalBin": ["binaries/stt_engine"],
+    "macOS": {
+      "infoPlist": "./Info.plist",
+      "entitlements": "./Entitlements.plist",
+      "signingIdentity": "-",
+      "minimumSystemVersion": "13.0"
+    }
   }
 }
