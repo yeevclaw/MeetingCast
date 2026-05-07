@@ -12,6 +12,22 @@ import os
 import sys
 from pathlib import Path
 
+# Point SSL libs at the certifi-bundled CA file BEFORE importing anything
+# that opens an HTTPS connection (huggingface_hub, deepgram-sdk via aiohttp,
+# etc.). PyInstaller bundles cacert.pem when --collect-all certifi is set,
+# but the macOS system trust store isn't visible inside the bundle, so
+# without this, every HTTPS request fails with CERTIFICATE_VERIFY_FAILED on
+# user machines (dev machine works because Python finds the OpenSSL system
+# certs there). setdefault preserves any explicit override.
+try:
+    import certifi  # type: ignore
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    # certifi missing only happens in dev mode without the optional dep —
+    # falling through is fine because the system trust store is reachable.
+    pass
+
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "prototype"))
 

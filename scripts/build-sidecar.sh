@@ -86,6 +86,7 @@ cd "$ROOT/python-sidecar"
   --collect-all huggingface_hub \
   --collect-all torch \
   --collect-all torchaudio \
+  --collect-all certifi \
   --noconfirm \
   stt_engine.py
 
