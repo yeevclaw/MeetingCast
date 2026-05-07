@@ -1,4 +1,11 @@
 mlx-whisper>=0.4
+# mlx 0.21+ compiles its metallib targeting MSL 4.0 (added in macOS 26
+# Tahoe). On macOS 15.x Sequoia and earlier, the dyld load fails with
+# "language version 4.0 which is not supported on this OS" and the
+# sidecar prewarm reports "Failed to load the default metallib". Pin
+# below 0.21 so the bundled metallib stays at MSL 3.2 — works on
+# Sequoia and Tahoe alike.
+mlx<0.21
 silero-vad>=5.1
 sounddevice>=0.4.6
 numpy>=1.26
