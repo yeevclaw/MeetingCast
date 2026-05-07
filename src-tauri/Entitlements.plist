@@ -4,17 +4,39 @@
 <dict>
   <key>com.apple.security.device.audio-input</key>
   <true/>
-  <!-- Required for the PyInstaller-bundled stt_engine sidecar: at runtime
-       PyInstaller extracts Python.framework into /tmp/_MEI*/ and dlopens
-       it from there. Under hardened runtime + library validation, macOS
-       Sequoia rejects the load with "different Team IDs" because the
-       extracted framework wasn't co-signed with our ad-hoc identifier.
-       This entitlement disables that check so the sidecar can boot. The
-       dev machine (used by the developer running this build) doesn't see
-       the rejection because of TCC/Gatekeeper trust caching, so this only
-       surfaces on a truly fresh user's Mac — making it invisible to the
-       standard `tccutil reset` clean-machine test. -->
+  <!-- The four entitlements below are the standard set for shipping a
+       PyInstaller-bundled binary under hardened runtime with ad-hoc
+       signing on macOS Sequoia. Each addresses a specific point where
+       AMFI / dyld will SIGKILL the process otherwise:
+
+       disable-library-validation: PyInstaller extracts Python.framework
+         into /tmp/_MEI*/ at runtime; hardened runtime rejects the dlopen
+         with "different Team IDs" since the framework wasn't co-signed
+         with our ad-hoc identifier.
+
+       allow-unsigned-executable-memory: PyInstaller's own bootloader
+         maps and executes its decompressed bytecode/extension blob from
+         memory pages that aren't backed by a signed file.
+
+       allow-jit: numba (transitive dep via mlx-whisper) JIT-compiles
+         host code at runtime; without this entitlement the JIT alloc
+         is killed.
+
+       allow-dyld-environment-variables: PyInstaller injects DYLD_*
+         vars to point dyld at its bundled libs; hardened runtime
+         strips these unless the entitlement is granted.
+
+       Dev machine doesn't see any of these because TCC/Gatekeeper trust
+       caching exempts locally-built binaries — so neither the smoke test
+       nor `tccutil reset` clean-machine test surfaces them. They only
+       fire on a truly remote install. -->
   <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
   <true/>
 </dict>
 </plist>
