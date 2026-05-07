@@ -40,6 +40,26 @@ SPEC_DIR="$ROOT/python-sidecar/build"
 echo "==> Cleaning previous build"
 rm -rf "$BUILD_DIR" "$DIST_DIR"
 
+# MLX 0.20's mlx/_os_warning.py runs at import time:
+#   tuple(map(int, platform.mac_ver()[0].split(".")))
+# Inside the PyInstaller-bundled binary on some Sequoia machines,
+# platform.mac_ver()[0] comes back as the empty string (sw_vers
+# subprocess + stdio rebinding race), and int("") raises ValueError —
+# crashing the prewarm thread before anything useful can be loaded.
+# Friend's M4 Sequoia 15.5 fresh install hit this; dev (Tahoe) doesn't
+# because mac_ver() resolves correctly there. Replace the check with a
+# no-op; minimum macOS is enforced at the bundle layer
+# (tauri.conf.json::bundle.macOS.minimumSystemVersion).
+echo "==> Patching mlx/_os_warning.py (defangs PyInstaller mac_ver race)"
+MLX_OS_WARN="$VENV/lib/python3.13/site-packages/mlx/_os_warning.py"
+if [[ -f "$MLX_OS_WARN" ]]; then
+  cat > "$MLX_OS_WARN" <<'PYEOF'
+# Patched by scripts/build-sidecar.sh — the original platform.mac_ver()
+# parse crashes on PyInstaller bundles where mac_ver returns "". Bundle
+# layer enforces minimumSystemVersion already.
+PYEOF
+fi
+
 echo "==> Running PyInstaller (this can take a few minutes the first time)"
 cd "$ROOT/python-sidecar"
 
