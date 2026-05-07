@@ -621,7 +621,15 @@ export default function ControlWindow() {
           <span className={running ? "font-medium text-paper-900" : ""}>
             {running ? "錄音中" : "閒置"}
           </span>
-          <MicMeter active={running && useMic} deviceLabel={selectedDevice} />
+          {/* MicMeter opens its own Web Audio mic stream to compute level,
+              which on some Macs (notably M4 + Sequoia) conflicts with the
+              sidecar's concurrent PortAudio open — CoreAudio routes audio
+              to one client and the other gets silence, killing VAD and
+              producing no transcripts. So only run MicMeter when idle: it
+              becomes a "press 開始錄音 to start" pre-flight check that mic
+              is actually capturing. During recording, the pulsing red dot
+              + 錄音中 text + timer is enough live feedback. */}
+          <MicMeter active={!running && useMic} deviceLabel={selectedDevice} />
         </span>
         <span className="flex items-center gap-3">
           <span
