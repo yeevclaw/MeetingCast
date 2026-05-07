@@ -518,11 +518,23 @@ pub async fn prewarm(
     mgr: SharedManager,
     cfg: SharedConfig,
 ) -> Result<(), String> {
-    let need_spawn = mgr.lock().await.stdin.is_none();
+    let need_spawn = {
+        let mut m = mgr.lock().await;
+        if m.stdin.is_some() || m.starting {
+            false
+        } else {
+            m.starting = true;
+            true
+        }
+    };
     if !need_spawn {
         return Ok(());
     }
-    spawn_inner(app, mgr, cfg).await
+    if let Err(e) = spawn_inner(app, mgr.clone(), cfg).await {
+        mgr.lock().await.starting = false;
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[tauri::command]

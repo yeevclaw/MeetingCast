@@ -53,22 +53,65 @@ class DeepgramSTT:
                 await conn.send_close_stream()
 
             send_task = asyncio.create_task(sender())
+            pending_parts: list[str] = []
+            pending_start: float | None = None
+            pending_end: float = 0.0
+
+            def flush_pending():
+                nonlocal pending_parts, pending_start, pending_end
+                text = " ".join(pending_parts).strip()
+                if not text:
+                    return None
+                transcript = Transcript(
+                    text=text,
+                    is_final=True,
+                    t_start=pending_start or 0.0,
+                    t_end=pending_end,
+                )
+                pending_parts = []
+                pending_start = None
+                pending_end = 0.0
+                return transcript
+
             try:
                 async for msg in conn:
                     if not hasattr(msg, "channel") or not hasattr(msg, "is_final"):
-                        continue  # skip Metadata / SpeechStarted / UtteranceEnd
+                        # UtteranceEnd is the strongest signal that the final
+                        # chunks collected so far form one translatable thought.
+                        # Some SDK versions expose it as a class name rather
+                        # than a field, so use a loose type-name check.
+                        if "utteranceend" in type(msg).__name__.lower():
+                            transcript = flush_pending()
+                            if transcript:
+                                yield transcript
+                        continue  # skip Metadata / SpeechStarted
                     alts = getattr(msg.channel, "alternatives", None) or []
                     if not alts:
                         continue
                     text = alts[0].transcript or ""
                     if not text.strip():
                         continue
-                    yield Transcript(
-                        text=text.strip(),
-                        is_final=bool(msg.is_final),
-                        t_start=msg.start,
-                        t_end=msg.start + msg.duration,
-                    )
+                    start = float(getattr(msg, "start", 0.0) or 0.0)
+                    end = start + float(getattr(msg, "duration", 0.0) or 0.0)
+                    if bool(msg.is_final):
+                        if pending_start is None:
+                            pending_start = start
+                        pending_parts.append(text.strip())
+                        pending_end = end
+                        if bool(getattr(msg, "speech_final", False)):
+                            transcript = flush_pending()
+                            if transcript:
+                                yield transcript
+                    else:
+                        yield Transcript(
+                            text=text.strip(),
+                            is_final=False,
+                            t_start=start,
+                            t_end=end,
+                        )
+                transcript = flush_pending()
+                if transcript:
+                    yield transcript
             finally:
                 send_task.cancel()
                 try:

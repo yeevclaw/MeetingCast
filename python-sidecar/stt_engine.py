@@ -258,64 +258,68 @@ async def _run_prewarm_step(step: str, fn) -> None:
 
 
 async def main():
-    # Run heavy prewarm in threads so the asyncio loop stays responsive
-    # to incoming commands. Order matters: the model load is the longest
-    # step (~10 s first run) so kick it off first; the mic prewarm runs
-    # in parallel and triggers the macOS permission prompt while the model
-    # warms in the background. Each task emits prewarm events so the UI
-    # can show progress instead of a featureless 5–10 s freeze.
+    # Start heavy prewarm in background threads, but do not block the command
+    # loop on it. If HuggingFace is slow or the user wants cloud STT, the
+    # sidecar should still be "ready" enough to accept start/stop/list_devices
+    # commands instead of freezing the whole app behind the startup overlay.
+    # A local start still runs ensure_loaded() in run_stt, so correctness does
+    # not depend on this speculative warmup finishing first.
     model_task = asyncio.create_task(_run_prewarm_step("model", _prewarm_local_model))
     mic_task = asyncio.create_task(_run_prewarm_step("mic", _prewarm_mic))
-    await asyncio.gather(model_task, mic_task)
     emit({"type": "ready"})
     stt_task: asyncio.Task | None = None
     cancel_event: asyncio.Event | None = None
 
-    async for raw in stdin_lines():
-        if not raw:
-            continue
-        try:
-            cmd = json.loads(raw)
-        except json.JSONDecodeError as e:
-            emit({"type": "error", "message": f"invalid json: {e}"})
-            continue
-
-        cmd_type = cmd.get("type")
-        if cmd_type == "start":
-            if stt_task and not stt_task.done():
-                emit({"type": "error", "message": "already running"})
+    try:
+        async for raw in stdin_lines():
+            if not raw:
                 continue
-            cancel_event = asyncio.Event()
-            stt_task = asyncio.create_task(run_stt(cmd, cancel_event))
-        elif cmd_type == "stop":
-            if stt_task and not stt_task.done():
-                cancel_event.set()
-                stt_task.cancel()
-                try:
-                    await stt_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            stt_task = None
-        elif cmd_type == "shutdown":
-            if stt_task and not stt_task.done():
-                stt_task.cancel()
-                try:
-                    await stt_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            return
-        elif cmd_type == "list_devices":
             try:
-                devices = list_input_devices()
-            except Exception as e:
-                # Always emit `devices` so the Rust-side oneshot resolves —
-                # without it the UI hangs until the timeout fires.
-                emit({"type": "devices", "devices": []})
-                emit({"type": "error", "message": f"list_devices: {e}"})
+                cmd = json.loads(raw)
+            except json.JSONDecodeError as e:
+                emit({"type": "error", "message": f"invalid json: {e}"})
+                continue
+
+            cmd_type = cmd.get("type")
+            if cmd_type == "start":
+                if stt_task and not stt_task.done():
+                    emit({"type": "error", "message": "already running"})
+                    continue
+                cancel_event = asyncio.Event()
+                stt_task = asyncio.create_task(run_stt(cmd, cancel_event))
+            elif cmd_type == "stop":
+                if stt_task and not stt_task.done():
+                    cancel_event.set()
+                    stt_task.cancel()
+                    try:
+                        await stt_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                stt_task = None
+            elif cmd_type == "shutdown":
+                if stt_task and not stt_task.done():
+                    stt_task.cancel()
+                    try:
+                        await stt_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                return
+            elif cmd_type == "list_devices":
+                try:
+                    devices = list_input_devices()
+                except Exception as e:
+                    # Always emit `devices` so the Rust-side oneshot resolves —
+                    # without it the UI hangs until the timeout fires.
+                    emit({"type": "devices", "devices": []})
+                    emit({"type": "error", "message": f"list_devices: {e}"})
+                else:
+                    emit({"type": "devices", "devices": devices})
             else:
-                emit({"type": "devices", "devices": devices})
-        else:
-            emit({"type": "error", "message": f"unknown command: {cmd_type}"})
+                emit({"type": "error", "message": f"unknown command: {cmd_type}"})
+    finally:
+        for task in (model_task, mic_task):
+            if not task.done():
+                task.cancel()
 
 
 if __name__ == "__main__":

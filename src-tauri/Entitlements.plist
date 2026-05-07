@@ -4,5 +4,17 @@
 <dict>
   <key>com.apple.security.device.audio-input</key>
   <true/>
+  <!-- Required for the PyInstaller-bundled stt_engine sidecar: at runtime
+       PyInstaller extracts Python.framework into /tmp/_MEI*/ and dlopens
+       it from there. Under hardened runtime + library validation, macOS
+       Sequoia rejects the load with "different Team IDs" because the
+       extracted framework wasn't co-signed with our ad-hoc identifier.
+       This entitlement disables that check so the sidecar can boot. The
+       dev machine (used by the developer running this build) doesn't see
+       the rejection because of TCC/Gatekeeper trust caching, so this only
+       surfaces on a truly fresh user's Mac — making it invisible to the
+       standard `tccutil reset` clean-machine test. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
 </dict>
 </plist>

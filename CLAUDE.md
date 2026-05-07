@@ -67,7 +67,9 @@ Phase 1 + 2 + 3 + 大部分 Phase 4 完成。`pnpm tauri build` 端到端產出 
 2. **macOS 三件套就位**（缺一個簽章就會壞回 linker-signed，fresh install 報 damaged 或不跳麥克風授權對話框）：
    - `tauri.conf.json` 的 `bundle.macOS` 含 `infoPlist`、`entitlements`、`signingIdentity: "-"`、`minimumSystemVersion`
    - `src-tauri/Info.plist`（每個用到的系統權限對應一個 `NS*UsageDescription`）
-   - `src-tauri/Entitlements.plist`（每個權限對應一個 `com.apple.security.device.*` 或 `personal-information.*`）
+   - `src-tauri/Entitlements.plist`：
+     - 每個權限對應一個 `com.apple.security.device.*` 或 `personal-information.*`
+     - **必須有 `com.apple.security.cs.disable-library-validation`** — 沒有的話 PyInstaller sidecar 在 fresh user 機器會失敗（hardened runtime 拒絕載入跨 Team ID 的 Python.framework，錯誤 `spawn: No such file or directory (os error 2)`）。dev 機因為 TCC/Gatekeeper 信任 cache 看不到這問題，**`tccutil reset` 的乾淨機測試也驗不出來**。
 
 3. **Build sidecar**（Python 改過才要）：`./scripts/build-sidecar.sh`
 
