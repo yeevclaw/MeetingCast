@@ -60,40 +60,124 @@ Phase 1 + 2 + 3 + 大部分 Phase 4 完成。`pnpm tauri build` 端到端產出 
 
 ## 包版 SOP（macOS .dmg ship 流程）
 
-**任何時候要產 `.dmg` 分發給其他人，完整跑這套不可跳步**。詳細驗證命令與紅燈標準見 memory `project_macos_signing.md`。
+**dev 機驗不到的坑特別多。詳版查表見 memory `project_macos_signing.md`。**
 
-1. **版本同步** — `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` 三處版本號一致。
+### 包版前 — 配置不變動的話跳過，只在新加 dependency / 新 macOS 版本 / 第一次 ship 時驗
 
-2. **macOS 三件套就位**（缺一個簽章就會壞回 linker-signed，fresh install 報 damaged 或不跳麥克風授權對話框）：
-   - `tauri.conf.json` 的 `bundle.macOS` 含 `infoPlist`、`entitlements`、`signingIdentity: "-"`、`minimumSystemVersion`
-   - `src-tauri/Info.plist`（每個用到的系統權限對應一個 `NS*UsageDescription`）
-   - `src-tauri/Entitlements.plist`：
-     - 每個權限對應一個 `com.apple.security.device.*` 或 `personal-information.*`
-     - **必須有 `com.apple.security.cs.disable-library-validation`** — 沒有的話 PyInstaller sidecar 在 fresh user 機器會失敗（hardened runtime 拒絕載入跨 Team ID 的 Python.framework，錯誤 `spawn: No such file or directory (os error 2)`）。dev 機因為 TCC/Gatekeeper 信任 cache 看不到這問題，**`tccutil reset` 的乾淨機測試也驗不出來**。
+**`src-tauri/Entitlements.plist` 必含 5 個 key**：
 
-3. **Build sidecar**（Python 改過才要）：`./scripts/build-sidecar.sh`
+```xml
+<key>com.apple.security.device.audio-input</key>             <!-- 麥克風 -->
+<key>com.apple.security.cs.disable-library-validation</key>  <!-- Python.framework 跨 Team ID dlopen -->
+<key>com.apple.security.cs.allow-unsigned-executable-memory</key>  <!-- PyInstaller bootloader -->
+<key>com.apple.security.cs.allow-jit</key>                   <!-- numba JIT (mlx-whisper 傳遞依賴) -->
+<key>com.apple.security.cs.allow-dyld-environment-variables</key>  <!-- PyInstaller 用 DYLD_* -->
+```
 
-4. **Build .dmg**：`pnpm tauri build`
+少一個就會在 fresh Mac 上 SIGKILL 或 spawn 失敗，dev 機因 TCC 信任 cache 不會炸。
 
-5. **驗證簽章** — 三條都過才算 build 成功：
-   ```bash
-   APP=src-tauri/target/release/bundle/macos/MeetingCast.app
-   codesign -dvv "$APP"          # Identifier=com.tpisoftware.meetingcast + flags=adhoc,runtime + Sealed Resources version=2
-   defaults read "$APP/Contents/Info.plist" NSMicrophoneUsageDescription   # 印出中文用途字串
-   codesign -d --entitlements - "$APP"   # 含 com.apple.security.device.audio-input
+**`src-tauri/Info.plist`**：每個用到的權限有對應 `NS*UsageDescription`（中文字串）
+
+**`src-tauri/tauri.conf.json::bundle.macOS`**：含 `infoPlist`、`entitlements`、`signingIdentity: "-"`、`minimumSystemVersion: "13.0"`
+
+**`prototype/requirements.txt`**：`mlx<0.21`（0.21+ 編譯 metallib 用 MSL 4.0，只有 macOS 26 Tahoe 支援；user 多在 Sequoia 15.x）
+
+**`scripts/build-sidecar.sh`** 跑 PyInstaller 之前必做：
+- 把 `mlx/_os_warning.py` 替換成 no-op（`platform.mac_ver()` 在 PyInstaller bundle 會回空字串、原檔的 `int("".split(".")[0])` 會 raise ValueError）
+- PyInstaller args 含 `--collect-all certifi`（缺它的話 user 機器所有 HTTPS 都 `CERTIFICATE_VERIFY_FAILED`）
+
+**`python-sidecar/stt_engine.py`** 任何 import 之前要設：
+```python
+import certifi
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+```
+
+**`src-tauri/src/sidecar.rs::locate_sidecar()`** 必須回傳對應 cwd（不能 hardcode `project_root()`）：
+- dev 模式：cwd = repo root
+- production：cwd = binary 自己的 parent dir
+- hardcode 成 `env!("CARGO_MANIFEST_DIR")` 的話 user 機器上 spawn 直接 ENOENT
+
+### 包版步驟
+
+1. **三處版本同步** — `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json`
+2. **`cargo update -p meetingcast --offline`** 同步 Cargo.lock
+3. **改 Python 才 rebuild sidecar**：`./scripts/build-sidecar.sh`（含 smoke test）
+4. **`pnpm tauri build`**
+
+### 驗證簽章（不可跳）
+
+```bash
+APP=src-tauri/target/release/bundle/macos/MeetingCast.app
+
+# 兩條都跑，主程式 + sidecar 都要過
+codesign -dvv "$APP/Contents/MacOS/meetingcast"
+codesign -dvv "$APP/Contents/MacOS/stt_engine"
+# 預期：Identifier=com.tpisoftware.meetingcast(.stt_engine)
+#       flags=0x10002(adhoc,runtime) — 不能是 linker-signed
+#       Sealed Resources version=2 — 不能是 none
+#       Info.plist entries=N — 不能是 not bound（只有主程式有這條）
+
+# 5 個 entitlements 都要在 stt_engine 上
+codesign -d --entitlements - "$APP/Contents/MacOS/stt_engine" 2>&1 | grep "Key"
+# 預期 5 行：device.audio-input + 4 個 cs.* (disable-library-validation,
+# allow-unsigned-executable-memory, allow-jit, allow-dyld-environment-variables)
+
+# 麥克風用途字串
+defaults read "$APP/Contents/Info.plist" NSMicrophoneUsageDescription
+```
+
+### 乾淨機測試（dev 機驗不到的問題列表）
+
+dev 機通過 = ship 通過是錯的。dev 機因為 TCC / Gatekeeper / Python 系統信任庫 cache，**所有今天踩過的坑都看不到**：
+
+| Dev 機看得到 | Fresh user Mac 才會炸 |
+|---|---|
+| linker-signed | hardened runtime 缺 entitlement → SIGKILL |
+| Info.plist 缺 NSMicrophoneUsageDescription | Python.framework Team ID mismatch |
+| 主程式 codesign 壞 | MLX 的 metallib MSL 版本與 user OS 對不上 |
+| sidecar 找不到 binary | `platform.mac_ver()` 在 PyInstaller 回空字串 |
+| | spawn cwd 不存在 → ENOENT |
+| | SSL CA 找不到 → CERTIFICATE_VERIFY_FAILED |
+| | MicMeter Web Audio + sidecar PortAudio 競爭麥克風 |
+| | prewarm overlay 太早關 → 第一次錄音卡 GPU |
+
+**dev 機本機的 `tccutil reset` 乾淨機測試只能驗到「主程式跑得起來」這層，驗不到上面右邊那一整列**。真正的乾淨機測試只能找 fresh Mac（朋友 / 同事的另一台機器）做。
+
+### 分發
+
+```bash
+cp src-tauri/target/release/bundle/dmg/MeetingCast_<ver>_aarch64.dmg ~/Desktop/
+```
+
+收件人**一定要跑** `xattr -cr /Applications/MeetingCast.app`（經 Slack / Mail / Drive 下載都會被加 quarantine，ad-hoc 簽章 + quarantine 在 Sequoia 直接報 damaged 或被 SIGKILL）。AirDrop / USB 不需要。
+
+### Fresh Mac 上 sidecar 不動的診斷順序
+
+收件人回報「卡在啟動」/「按錄音沒反應」時，按這順序查：
+
+1. **`cat ~/Library/Application\ Support/MeetingCast/errors.log`** — 看最新條目
+2. **`xattr /Applications/MeetingCast.app/Contents/MacOS/stt_engine`** — 任何輸出都代表 quarantine 沒清乾淨
+3. **`/Applications/MeetingCast.app/Contents/MacOS/stt_engine`** 直接從 terminal 跑 — bypass app 的 Rust spawn path，看到完整 stderr
+4. 如果 sidecar 在 terminal 跑得起來但 app 中卡住 → 兩條 mic stream 競爭（看 0.1.13 註記）或 Tauri stdio pipe 問題
+5. **手動驅動 sidecar 測 STT**：terminal 跑 sidecar 後，把這行貼進 stdin：
+   ```json
+   {"type":"start","backend":"local","source":{"type":"mic"},"language":"zh"}
    ```
+   出 transcript 代表 STT 本身 OK，問題在 app 層
+6. **切到 cloud backend** 隔離問題：cloud 出字 / local 不出字 → 問題在 mlx-whisper / 麥克風層；兩個都不出 → 純音源問題
 
-6. **乾淨機測試（強制）** — dev 機 TCC 紀錄會掩蓋簽章壞檔，**沒做這步等於沒測**：
-   ```bash
-   tccutil reset Microphone com.tpisoftware.meetingcast
-   rm -rf /Applications/MeetingCast.app
-   open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg   # 拖 .app 到 /Applications
-   ```
-   開 MeetingCast → 按開始錄音 → **應該跳系統授權對話框**。沒跳就回 step 5 抓問題。
+### 版本踩坑歷史（避免再犯）
 
-7. 分發前提醒收件人：經 Safari / Slack / Email 下載要 `xattr -cr /Applications/MeetingCast.app` 才能開（quarantine + ad-hoc 簽章碰到 Sequoia 報 damaged）。
-
-> 0.1.0 ~ 0.1.3 連四個 release 都壞但 dev 機看不出來 — 這個 SOP 的存在就是為了不再發生。
+- 0.1.0–0.1.3：缺 entitlements 三件套 → linker-signed → fresh Mac 報 damaged
+- 0.1.7：缺 disable-library-validation → ENOENT
+- 0.1.8：MLX 0.31 metallib MSL 4.0 → Sequoia 拒絕
+- 0.1.9：mlx/_os_warning.py 用 `platform.mac_ver()` 在 PyInstaller 回空字串 crash
+- 0.1.10：缺三個 cs.allow-* entitlements → AMFI SIGKILL
+- 0.1.11：sidecar spawn cwd hardcode 成 dev 機路徑 → ENOENT 真兇
+- 0.1.12：缺 certifi bundle → 所有 HTTPS 失敗
+- 0.1.13：MicMeter Web Audio 跟 sidecar PortAudio 搶麥克風 → 沒 transcript
+- 0.1.14：sidecar 太早 emit ready → overlay 關太早 → 第一次按錄音 GPU 還在 prewarm
 
 ## 核心原則
 
