@@ -138,12 +138,27 @@ const SIDECAR_BIN_NAME: &str = "stt_engine";
 /// Returns (program, leading_args). Leading args are arguments inserted
 /// before any caller-supplied args — used to pass the script path when
 /// running via the dev-mode Python interpreter.
-fn locate_sidecar() -> Result<(PathBuf, Vec<String>), String> {
+/// Resolve the sidecar program + leading args + working directory to use
+/// when spawning. The cwd has to come back from this function (rather than
+/// always being `project_root()` like before) because in a release `.app`
+/// installed on a remote user's Mac, `project_root()` is the developer's
+/// build-time path embedded by `env!("CARGO_MANIFEST_DIR")` — that path
+/// doesn't exist on the user's machine, and `Command::current_dir(<missing>)`
+/// makes posix_spawn fail with ENOENT after fork (surfaces as the misleading
+/// "spawn sidecar: No such file or directory"). Returning a real cwd in
+/// each branch fixes that.
+fn locate_sidecar() -> Result<(PathBuf, Vec<String>, PathBuf), String> {
     let root = project_root();
     let python = root.join("prototype/.venv/bin/python");
     let script = root.join("python-sidecar/stt_engine.py");
     if python.exists() && script.exists() {
-        return Ok((python, vec![script.to_string_lossy().to_string()]));
+        // Dev mode: cwd = repo root so any relative `prototype/samples/...`
+        // path passed by the UI for WAV demo mode resolves correctly.
+        return Ok((
+            python,
+            vec![script.to_string_lossy().to_string()],
+            root,
+        ));
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -164,7 +179,11 @@ fn locate_sidecar() -> Result<(PathBuf, Vec<String>), String> {
                 dir.join(format!("{}-{}", SIDECAR_BIN_NAME, target_triple)),
             ] {
                 if candidate.exists() {
-                    return Ok((candidate, vec![]));
+                    // Production: cwd = the binary's own folder
+                    // (`Contents/MacOS/`). It's guaranteed to exist on the
+                    // user's machine (we just resolved it) and stt_engine
+                    // doesn't depend on cwd for any of its own paths.
+                    return Ok((candidate, vec![], dir.to_path_buf()));
                 }
             }
         }
@@ -187,8 +206,7 @@ async fn spawn_inner_body(
     mgr: SharedManager,
     cfg_arc: SharedConfig,
 ) -> Result<(), String> {
-    let (program, leading_args) = locate_sidecar()?;
-    let root = project_root();
+    let (program, leading_args, cwd) = locate_sidecar()?;
 
     let deepgram_key = {
         let cfg = cfg_arc.lock().await;
@@ -199,7 +217,7 @@ async fn spawn_inner_body(
     for arg in &leading_args {
         cmd.arg(arg);
     }
-    cmd.current_dir(&root)
+    cmd.current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
