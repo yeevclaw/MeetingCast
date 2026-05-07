@@ -479,9 +479,15 @@ export default function ControlWindow() {
       }),
       listen("stt:ready", () => {
         setSidecarReady(true);
-        // Whatever individual step events we missed — flip everything to
-        // done since the sidecar declared global readiness.
-        setStepStatus({ spawn: "done", model: "done", mic: "done" });
+        // `ready` only confirms the sidecar's stdin loop is alive — model and
+        // mic prewarm tasks are still running in the background at this point
+        // (they fire their own prewarm events). Only spawn is truly done.
+        // Marking model/mic as done here would dismiss the overlay too early
+        // and the user could click 開始錄音 while the model is still loading
+        // weights to GPU — first transcribe then queues behind prewarm and
+        // click-to-red lag is multiple seconds. Let the per-step prewarm
+        // events flip individual statuses on their own.
+        setStepStatus((s) => ({ ...s, spawn: "done" }));
       }),
       listen<PrewarmPayload>("stt:prewarm", (e) => {
         const { step, state, message } = e.payload;
@@ -890,7 +896,21 @@ export default function ControlWindow() {
         </div>
       )}
 
-      {sidecarReady !== true && !modelLoading && !needsWelcome && (
+      {(() => {
+        if (modelLoading || needsWelcome) return null;
+        // Show overlay until every prewarm step has resolved (done or
+        // error). Previously this gated only on `sidecarReady`, but ready
+        // fires the moment the sidecar's stdin loop comes up — model and
+        // mic prewarm tasks run in the background and may take 5–30 s to
+        // finish. Dismissing too early let users press 開始錄音 while the
+        // model was still loading weights to GPU; first transcribe then
+        // queued behind prewarm and click-to-red took several seconds.
+        if (sidecarReady !== true) return true;
+        const allResolved = (Object.values(stepStatus) as StepStatus[]).every(
+          (s) => s === "done" || s === "error",
+        );
+        return !allResolved;
+      })() && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-paper-900/30 backdrop-blur-sm">
           <div className="w-[300px] rounded-2xl border border-paper-200 bg-white px-6 py-5 shadow-xl">
             <p className="mb-4 text-center font-medium text-paper-900">正在啟動辨識引擎</p>
