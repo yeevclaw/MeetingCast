@@ -11,4 +11,5 @@ sounddevice>=0.4.6
 numpy>=1.26
 anthropic>=0.40
 deepgram-sdk>=3.7
+websockets>=13
 python-dotenv>=1.0

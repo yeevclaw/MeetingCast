@@ -5,7 +5,7 @@ import type { AudioDevice, Config } from "@/lib/types";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 
-type Backend = "local" | "cloud";
+type Backend = "local" | "cloud" | "openai";
 
 export default function SettingsModal({
   onClose,
@@ -25,6 +25,7 @@ export default function SettingsModal({
   const [cfg, setCfg] = useState<Config | null>(null);
   const [showAnthropic, setShowAnthropic] = useState(false);
   const [showDeepgram, setShowDeepgram] = useState(false);
+  const [showOpenai, setShowOpenai] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState<string>("");
@@ -147,6 +148,27 @@ export default function SettingsModal({
               </div>
             </Field>
 
+            <Field
+              label="OpenAI API key"
+              hint="僅 openai backend 使用；platform.openai.com/api-keys"
+            >
+              <div className="flex gap-2">
+                <input
+                  type={showOpenai ? "text" : "password"}
+                  className="flex-1 rounded border border-paper-300 px-2 py-1 font-mono text-xs"
+                  value={cfg.api.openai_api_key}
+                  onChange={(e) => update({ openai_api_key: e.target.value })}
+                  placeholder="（可留空）"
+                />
+                <button
+                  className="rounded border border-paper-300 px-2 text-xs text-paper-700 hover:bg-paper-100"
+                  onClick={() => setShowOpenai(!showOpenai)}
+                >
+                  {showOpenai ? "隱藏" : "顯示"}
+                </button>
+              </div>
+            </Field>
+
             <Field label="翻譯模型">
               <select
                 className="w-full rounded border border-paper-300 px-2 py-1"
@@ -166,7 +188,7 @@ export default function SettingsModal({
               hint={
                 running
                   ? "錄音中無法切換，請先停止"
-                  : "預設 mlx-whisper（免費、離線可用）；切 cloud 需填 Deepgram API key"
+                  : "預設 mlx-whisper（免費、離線可用）；cloud / openai 需填對應 API key"
               }
             >
               <select
@@ -177,7 +199,14 @@ export default function SettingsModal({
               >
                 <option value="local">local (mlx-whisper)</option>
                 <option value="cloud">cloud (deepgram)</option>
+                <option value="openai">openai (realtime-whisper)</option>
               </select>
+              {backend === "openai" && (
+                <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
+                  ⚠ OpenAI Realtime Whisper 僅輸出簡體中文，且不支援術語表注入。
+                  優點：邊講邊出字（live captioning）、技術詞彙準確度較佳。
+                </p>
+              )}
             </Field>
 
             <Field

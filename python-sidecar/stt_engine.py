@@ -105,6 +105,10 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     if deepgram_api_key:
         os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
 
+    openai_api_key = api_cfg.get("openai_api_key")
+    if openai_api_key:
+        os.environ["OPENAI_API_KEY"] = openai_api_key
+
     # Validate the requested mic device early. If the user's persisted device
     # got unplugged (USB / Bluetooth) we want to fall back to the system
     # default and warn — not crash, get re-spawned by the watchdog, and crash

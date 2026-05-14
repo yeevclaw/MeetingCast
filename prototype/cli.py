@@ -96,7 +96,7 @@ async def run_vad_demo(wav_path: str, translate: bool, initial_prompt: str | Non
 
 
 async def run_streaming(chunks, backend_name: str, translate: bool, label: str, initial_prompt: str | None = None):
-    kwargs = {"initial_prompt": initial_prompt} if backend_name == "local" else {}
+    kwargs = {"initial_prompt": initial_prompt} if backend_name in ("local", "openai") else {}
     stt = get_backend(backend_name, **kwargs)
     translator = Translator() if translate else None
 
@@ -147,9 +147,9 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 1 pipeline runner")
     parser.add_argument(
         "--backend",
-        choices=["local", "cloud"],
+        choices=["local", "cloud", "openai"],
         default="local",
-        help="local = mlx-whisper; cloud = Deepgram",
+        help="local = mlx-whisper; cloud = Deepgram; openai = gpt-realtime-whisper",
     )
     parser.add_argument(
         "--file",
@@ -222,7 +222,7 @@ def main():
     print(f"backend: {args.backend}  |  file: {args.file}")
     t_init = time.perf_counter()
     backend_kwargs: dict = {"language": args.language}
-    if args.backend == "local":
+    if args.backend in ("local", "openai"):
         backend_kwargs["initial_prompt"] = initial_prompt
     stt = get_backend(args.backend, **backend_kwargs)
     print(f"init: {(time.perf_counter() - t_init) * 1000:.0f} ms")

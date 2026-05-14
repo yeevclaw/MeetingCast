@@ -208,9 +208,9 @@ async fn spawn_inner_body(
 ) -> Result<(), String> {
     let (program, leading_args, cwd) = locate_sidecar()?;
 
-    let deepgram_key = {
+    let (deepgram_key, openai_key) = {
         let cfg = cfg_arc.lock().await;
-        cfg.api.deepgram_api_key.clone()
+        (cfg.api.deepgram_api_key.clone(), cfg.api.openai_api_key.clone())
     };
 
     let mut cmd = Command::new(&program);
@@ -224,6 +224,9 @@ async fn spawn_inner_body(
         .kill_on_drop(true);
     if !deepgram_key.is_empty() {
         cmd.env("DEEPGRAM_API_KEY", deepgram_key);
+    }
+    if !openai_key.is_empty() {
+        cmd.env("OPENAI_API_KEY", openai_key);
     }
 
     let mut child = cmd.spawn().map_err(|e| {
@@ -480,9 +483,13 @@ pub async fn start_stt(
         }
     }
 
-    let (deepgram_api_key, initial_prompt) = {
+    let (deepgram_api_key, openai_api_key, initial_prompt) = {
         let cfg = config.lock().await;
-        (cfg.api.deepgram_api_key.clone(), cfg.whisper_initial_prompt())
+        (
+            cfg.api.deepgram_api_key.clone(),
+            cfg.api.openai_api_key.clone(),
+            cfg.whisper_initial_prompt(),
+        )
     };
     let language_str = language.unwrap_or_else(|| "zh".into());
     let cmd = serde_json::json!({
@@ -493,6 +500,7 @@ pub async fn start_stt(
         "initial_prompt": initial_prompt,
         "api": {
             "deepgram_api_key": deepgram_api_key,
+            "openai_api_key": openai_api_key,
         },
     });
     {

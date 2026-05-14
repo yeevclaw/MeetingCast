@@ -49,6 +49,7 @@ export type Config = {
   api: {
     anthropic_api_key: string;
     deepgram_api_key: string;
+    openai_api_key: string;
     model: string;
   };
   audio: {

@@ -76,7 +76,7 @@ function formatElapsed(ms: number): string {
 
 export default function ControlWindow() {
   const [running, setRunning] = useState(false);
-  const [backend, setBackend] = useState<"local" | "cloud">("local");
+  const [backend, setBackend] = useState<"local" | "cloud" | "openai">("local");
   const [useMic, setUseMic] = useState(true);
   const [selectedDevice, setSelectedDevice] = useState<string>("");
   const [micAvailable, setMicAvailable] = useState<boolean | null>(null);
@@ -333,6 +333,11 @@ export default function ControlWindow() {
       }
       if (backendRef.current === "cloud" && !cfg.api.deepgram_api_key.trim()) {
         showToast("error", "切到 cloud 辨識需要 Deepgram API key", 5000);
+        setShowSettings(true);
+        return;
+      }
+      if (backendRef.current === "openai" && !cfg.api.openai_api_key.trim()) {
+        showToast("error", "切到 openai 辨識需要 OpenAI API key", 5000);
         setShowSettings(true);
         return;
       }
