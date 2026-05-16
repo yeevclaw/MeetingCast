@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::config::SharedConfig;
 use crate::errors;
@@ -83,6 +84,17 @@ pub struct SidecarManager {
     /// (resolving with an error on the awaiting side) if a second request
     /// arrives before the first response.
     pending_devices: Option<oneshot::Sender<Vec<AudioDevice>>>,
+    /// Wall-clock time of the most recent non-empty final transcript. `Some`
+    /// only between a successful `start_stt` and the next `stop_stt` (or the
+    /// idle watcher firing). The watcher compares `now - last_activity_at`
+    /// against the configured idle threshold; the stdout reader resets it on
+    /// every speech-bearing final, so background noise alone can't keep an
+    /// expensive cloud session alive after the user walked away.
+    last_activity_at: Option<Instant>,
+    /// Task handle of the per-session idle watcher. Aborted on stop so it
+    /// doesn't keep ticking after the session ends and then auto-stop a
+    /// session that's already finished.
+    idle_watcher: Option<JoinHandle<()>>,
 }
 
 impl SidecarManager {
@@ -96,6 +108,8 @@ impl SidecarManager {
             stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LINES),
             ready: false,
             pending_devices: None,
+            last_activity_at: None,
+            idle_watcher: None,
         }
     }
 
@@ -104,6 +118,10 @@ impl SidecarManager {
     /// by lib.rs's RunEvent::ExitRequested hook for a graceful quit.
     pub async fn request_shutdown(&mut self) {
         self.intentional_stop = true;
+        self.last_activity_at = None;
+        if let Some(h) = self.idle_watcher.take() {
+            h.abort();
+        }
         if let Some(stdin) = self.stdin.as_mut() {
             let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
             let _ = stdin.flush().await;
@@ -274,6 +292,17 @@ async fn spawn_inner_body(
                         // that stabilizes once the full word is recognized.
                         SidecarEvent::Transcript { text, is_final, t_start, t_end } if is_final => {
                             let rewritten = cfg_o.lock().await.apply_glossary_aliases(&text);
+                            // Reset the idle watcher's activity clock on any
+                            // speech-bearing final. Empty transcripts (which
+                            // some backends emit on noise) deliberately do NOT
+                            // reset — that's the entire point of the auto-stop
+                            // (the user walked away, all we hear is fan noise).
+                            if !rewritten.trim().is_empty() {
+                                let mut m = mgr_o.lock().await;
+                                if m.last_activity_at.is_some() {
+                                    m.last_activity_at = Some(Instant::now());
+                                }
+                            }
                             emit_event(
                                 &app_o,
                                 SidecarEvent::Transcript {
@@ -319,6 +348,13 @@ async fn spawn_inner_body(
             m.stdin = None;
             m.starting = false;
             m.ready = false;
+            // Crash teardown: drop the idle watcher so it doesn't keep
+            // ticking against a dead session. The reincarnated child gets
+            // a fresh watcher via the re-issued start command below.
+            m.last_activity_at = None;
+            if let Some(h) = m.idle_watcher.take() {
+                h.abort();
+            }
             (
                 m.intentional_stop,
                 m.restart_attempts,
@@ -483,12 +519,13 @@ pub async fn start_stt(
         }
     }
 
-    let (deepgram_api_key, openai_api_key, initial_prompt) = {
+    let (deepgram_api_key, openai_api_key, initial_prompt, idle_minutes) = {
         let cfg = config.lock().await;
         (
             cfg.api.deepgram_api_key.clone(),
             cfg.api.openai_api_key.clone(),
             cfg.whisper_initial_prompt(),
+            cfg.idle_auto_stop_minutes,
         )
     };
     let language_str = language.unwrap_or_else(|| "zh".into());
@@ -517,6 +554,23 @@ pub async fn start_stt(
                 .map_err(|e| format!("flush stdin: {e}"))?;
             m.last_start = Some(cmd.clone());
             let _ = app.emit("session:reset", ());
+            // Reset the idle clock and (re)start the per-session watcher. If
+            // a previous watcher is somehow still alive (shouldn't happen
+            // after a clean stop_stt, but covers the watchdog-restart path),
+            // abort it first so we don't have two timers racing.
+            m.last_activity_at = Some(Instant::now());
+            if let Some(h) = m.idle_watcher.take() {
+                h.abort();
+            }
+            if idle_minutes > 0 {
+                let mgr_w = state.inner().clone();
+                let app_w = app.clone();
+                m.idle_watcher = Some(tokio::spawn(idle_watch_loop(
+                    app_w,
+                    mgr_w,
+                    idle_minutes,
+                )));
+            }
         } else {
             return Err("sidecar still not running".into());
         }
@@ -616,6 +670,10 @@ pub async fn stop_stt(
         let mut m = state.lock().await;
         m.intentional_stop = true;
         m.last_start = None;
+        m.last_activity_at = None;
+        if let Some(h) = m.idle_watcher.take() {
+            h.abort();
+        }
         let cmd = serde_json::json!({"type": "stop"});
         if let Some(stdin) = m.stdin.as_mut() {
             let line = format!("{cmd}\n");
@@ -630,6 +688,41 @@ pub async fn stop_stt(
     // better than racing the file write with concurrent appends.
     session::stop_session(recorder.inner()).await;
     Ok(())
+}
+
+/// Per-session idle watcher: polls `last_activity_at` and emits the
+/// `stt:idle_timeout` event when the configured threshold elapses without
+/// any speech-bearing final transcripts. The frontend listens for the event
+/// and calls `stop_stt` — keeping the actual teardown in one place rather
+/// than duplicating session::stop_session + stdin commands here.
+async fn idle_watch_loop(app: AppHandle, mgr: SharedManager, idle_minutes: u32) {
+    let threshold = Duration::from_secs(60 * idle_minutes as u64);
+    // Poll at 30s or 1/4 of the threshold, whichever is smaller. Cap at the
+    // floor so very short thresholds (e.g. 1 min) still get a useful check
+    // cadence without spamming the mutex.
+    let poll = std::cmp::min(Duration::from_secs(30), threshold / 4)
+        .max(Duration::from_secs(5));
+    loop {
+        tokio::time::sleep(poll).await;
+        let elapsed = {
+            let m = mgr.lock().await;
+            match m.last_activity_at {
+                Some(t) => Instant::now().duration_since(t),
+                // None means stop_stt already cleared us — exit cleanly
+                None => return,
+            }
+        };
+        if elapsed >= threshold {
+            let _ = app.emit("stt:idle_timeout", idle_minutes);
+            // Clear our own state so a late-arriving final can't re-arm
+            // the watcher before the frontend stop_stt lands. The frontend
+            // is responsible for the actual session teardown.
+            let mut m = mgr.lock().await;
+            m.last_activity_at = None;
+            m.idle_watcher = None;
+            return;
+        }
+    }
 }
 
 /// Ask the sidecar to enumerate input-capable audio devices via sounddevice.

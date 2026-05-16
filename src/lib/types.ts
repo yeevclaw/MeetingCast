@@ -57,6 +57,7 @@ export type Config = {
   };
   glossaries: GlossaryBook[];
   active_glossary: string | null;
+  idle_auto_stop_minutes: number;
 };
 
 export type StoredUtterance = {

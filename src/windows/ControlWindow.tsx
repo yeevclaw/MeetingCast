@@ -553,6 +553,13 @@ export default function ControlWindow() {
         setRunning(false);
         showToast("error", e.payload, 0);
       }),
+      listen<number>("stt:idle_timeout", (e) => {
+        const minutes = e.payload;
+        showToast("warning", `已閒置 ${minutes} 分鐘無人說話，自動停止錄音`, 8000);
+        if (runningRef.current) {
+          handleStop();
+        }
+      }),
       listen("hotkey:toggle", () => {
         if (runningRef.current) {
           handleStop();

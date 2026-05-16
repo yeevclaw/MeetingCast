@@ -88,6 +88,11 @@ export default function SettingsModal({
     setCfg({ ...cfg, audio: { ...cfg.audio, ...patch } });
   }
 
+  function updateIdleMinutes(v: number) {
+    if (!cfg) return;
+    setCfg({ ...cfg, idle_auto_stop_minutes: v });
+  }
+
   return (
     <div className="absolute inset-0 z-10 flex items-stretch justify-center bg-paper-900/30 p-4">
       <div className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-lg border border-paper-200 bg-white shadow-xl">
@@ -274,6 +279,24 @@ export default function SettingsModal({
                 )}
               </Field>
             )}
+
+            <Field
+              label="閒置自動停止（分鐘）"
+              hint="超過設定分鐘無人說話則自動停止，避免 OpenAI 雲端方案空轉計費；0 = 停用"
+            >
+              <input
+                type="number"
+                min={0}
+                max={120}
+                step={1}
+                className="w-24 rounded border border-paper-300 px-2 py-1"
+                value={cfg.idle_auto_stop_minutes}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  updateIdleMinutes(Number.isFinite(v) && v >= 0 ? v : 0);
+                }}
+              />
+            </Field>
 
             <Field label="檔案">
               <div className="flex flex-wrap gap-2">

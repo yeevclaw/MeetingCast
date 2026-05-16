@@ -106,6 +106,21 @@ pub struct Config {
     /// injection all behave as if the glossary were empty.
     #[serde(default)]
     pub active_glossary: Option<String>,
+
+    /// Minutes of recorded silence (no real-speech final transcripts) before
+    /// the session auto-stops. Primary motivation: OpenAI Realtime Whisper is
+    /// billed per minute of session time, so leaving the recording on after a
+    /// meeting ends silently burns budget. The check runs against any
+    /// non-empty final transcript regardless of backend (the safety applies
+    /// to all three — local/cloud/openai), so a user forgetting to stop
+    /// after a meal break gets caught even on the free mlx path.
+    /// `0` disables the auto-stop entirely.
+    #[serde(default = "default_idle_minutes")]
+    pub idle_auto_stop_minutes: u32,
+}
+
+fn default_idle_minutes() -> u32 {
+    5
 }
 
 impl Config {
