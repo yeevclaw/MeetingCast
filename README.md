@@ -37,13 +37,15 @@
 
 1. 從 [Releases](https://github.com/yeevclaw/MeetingCast/releases) 下載 `MeetingCast_<version>_aarch64.dmg`
 2. 開啟 dmg，把 `MeetingCast.app` 拖到 `Applications`
-3. **重要**：因為是 ad-hoc 簽章，經 Safari / Slack / Email 下載會被加 quarantine，需在 Terminal 跑：
+3. **重要**：因為是 ad-hoc 簽章，經 Safari / Slack / Email 下載會被加 quarantine，直接開啟會跳出「MeetingCast 已損毀，無法打開」對話框。需在 Terminal 跑：
    ```bash
    xattr -cr /Applications/MeetingCast.app
    ```
    （透過 AirDrop / USB 傳的不需要）
-4. 雙擊開啟，第一次會跳麥克風授權對話框，按允許
-5. 在 Welcome wizard 填入 Anthropic API key
+4. 雙擊開啟。首次啟動會開三個視窗（控制＋英文＋越南文），並在背景下載 ~1.6 GB 語音模型，進度顯示在啟動檢查清單
+5. 第一次會跳麥克風授權對話框，按允許
+   - 若不小心按到「不允許」：到 系統設定 → 隱私權與安全性 → 麥克風 開啟 MeetingCast，然後重新啟動 App
+6. 在 Welcome wizard 填入 Anthropic API key
 
 ### 二、使用
 
