@@ -442,10 +442,12 @@ pub async fn start_session(
 }
 
 /// Finalize the active session (write end time + counts) and clear the slot.
-/// No-op if no session is active.
-pub async fn stop_session(state: &SharedRecorder) {
+/// Returns the just-closed session id (so callers like `stop_stt` can trigger
+/// post-session work such as auto-summary), or `None` if no session was active.
+pub async fn stop_session(state: &SharedRecorder) -> Option<String> {
     let mut guard = state.lock().await;
     if let Some(rec) = guard.take() {
+        let id = rec.session_id.clone();
         if let Err(e) = rec.finalize() {
             errors::record(
                 "session_finalize_failed",
@@ -453,5 +455,8 @@ pub async fn stop_session(state: &SharedRecorder) {
                 Some(serde_json::json!({ "session_id": rec.session_id })),
             );
         }
+        Some(id)
+    } else {
+        None
     }
 }

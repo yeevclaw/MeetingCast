@@ -81,6 +81,39 @@ pub struct AudioConfig {
     pub input_device: String,
 }
 
+/// Opt-in post-meeting auto-summary. When `auto_generate` is true, stopping a
+/// recording (manually or via idle timeout) kicks off `generate_summary` for
+/// each language in `auto_targets` using `auto_template`, writing the results
+/// into the session folder so they're waiting in History. Defaults keep the
+/// feature off; old configs without a `[summary]` table parse with these.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SummaryConfig {
+    #[serde(default)]
+    pub auto_generate: bool,
+    #[serde(default = "default_auto_template")]
+    pub auto_template: String,
+    #[serde(default = "default_auto_targets")]
+    pub auto_targets: Vec<String>,
+}
+
+fn default_auto_template() -> String {
+    "exec_brief".into()
+}
+
+fn default_auto_targets() -> Vec<String> {
+    vec!["zh".into()]
+}
+
+impl Default for SummaryConfig {
+    fn default() -> Self {
+        Self {
+            auto_generate: false,
+            auto_template: default_auto_template(),
+            auto_targets: default_auto_targets(),
+        }
+    }
+}
+
 /// Legacy 0.1.5 single-glossary entry, BTreeMap-keyed. Kept solely so
 /// `load()` can read pre-0.1.6 configs and migrate them into a default
 /// "預設" book. Removed from the on-disk schema after the next save.
@@ -133,6 +166,11 @@ pub struct Config {
     /// without the field parse as `false`.
     #[serde(default)]
     pub onboarding_complete: bool,
+
+    /// Post-meeting auto-summary preferences. Absent in old configs; defaults
+    /// leave the feature disabled.
+    #[serde(default)]
+    pub summary: SummaryConfig,
 }
 
 fn default_idle_minutes() -> u32 {
@@ -563,6 +601,30 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.api.summary_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn summary_config_defaults_when_absent_and_round_trips() {
+        // Old configs (pre-[summary]) must parse with auto-summary disabled
+        // and the documented defaults.
+        let old: Config = toml::from_str("[api]\nmodel = \"claude-haiku-4-5\"\n").unwrap();
+        assert!(!old.summary.auto_generate);
+        assert_eq!(old.summary.auto_template, "exec_brief");
+        assert_eq!(old.summary.auto_targets, vec!["zh".to_string()]);
+
+        // A saved config must survive serialize → parse unchanged.
+        let mut cfg = Config::default();
+        cfg.summary.auto_generate = true;
+        cfg.summary.auto_template = "minutes".into();
+        cfg.summary.auto_targets = vec!["zh".into(), "en".into()];
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.summary.auto_generate);
+        assert_eq!(reparsed.summary.auto_template, "minutes");
+        assert_eq!(
+            reparsed.summary.auto_targets,
+            vec!["zh".to_string(), "en".to_string()]
+        );
     }
 
     #[test]

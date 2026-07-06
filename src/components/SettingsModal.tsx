@@ -6,6 +6,23 @@ import type { AudioDevice, Config } from "@/lib/types";
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 const SUMMARY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
 
+// Kept in sync with HistoryModal's SUMMARY_TEMPLATES labels (not exported
+// there). If the template set changes, update both.
+const SUMMARY_TEMPLATES: Array<{ id: string; label: string }> = [
+  { id: "exec_brief", label: "AI 智能總結" },
+  { id: "minutes", label: "會議記錄" },
+  { id: "discussion", label: "討論 / 腦力激盪" },
+  { id: "decision_log", label: "決策推理" },
+  { id: "client_call", label: "客戶 / 銷售會議" },
+  { id: "slide_outline", label: "簡報重點" },
+];
+
+const SUMMARY_TARGETS: Array<{ id: string; label: string }> = [
+  { id: "zh", label: "中文" },
+  { id: "en", label: "English" },
+  { id: "vi", label: "Tiếng Việt" },
+];
+
 type Backend = "local" | "cloud" | "openai";
 
 export default function SettingsModal({
@@ -92,6 +109,11 @@ export default function SettingsModal({
   function updateIdleMinutes(v: number) {
     if (!cfg) return;
     setCfg({ ...cfg, idle_auto_stop_minutes: v });
+  }
+
+  function updateSummary(patch: Partial<Config["summary"]>) {
+    if (!cfg) return;
+    setCfg({ ...cfg, summary: { ...cfg.summary, ...patch } });
   }
 
   return (
@@ -311,6 +333,74 @@ export default function SettingsModal({
                   updateIdleMinutes(Number.isFinite(v) && v >= 0 ? v : 0);
                 }}
               />
+            </Field>
+
+            <Field
+              label="會後自動總結"
+              hint="錄音結束後自動用 AI 產生總結，完成後於歷史紀錄查看"
+            >
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 cursor-pointer accent-paper-900"
+                  checked={cfg.summary.auto_generate}
+                  onChange={(e) => updateSummary({ auto_generate: e.target.checked })}
+                />
+                錄音結束後自動產生總結
+              </label>
+
+              {cfg.summary.auto_generate && (
+                <div className="mt-3 space-y-3 border-l-2 border-paper-200 pl-3">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-paper-700">
+                      總結模板
+                    </label>
+                    <select
+                      className="w-full rounded border border-paper-300 px-2 py-1"
+                      value={cfg.summary.auto_template}
+                      onChange={(e) => updateSummary({ auto_template: e.target.value })}
+                    >
+                      {SUMMARY_TEMPLATES.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-paper-700">
+                      產生語言
+                    </label>
+                    <div className="flex flex-wrap gap-3">
+                      {SUMMARY_TARGETS.map((t) => {
+                        const checked = cfg.summary.auto_targets.includes(t.id);
+                        return (
+                          <label
+                            key={t.id}
+                            className="flex cursor-pointer items-center gap-1.5 text-sm text-paper-700"
+                          >
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 cursor-pointer accent-paper-900"
+                              checked={checked}
+                              onChange={(e) => {
+                                const next = e.target.checked
+                                  ? [...cfg.summary.auto_targets, t.id]
+                                  : cfg.summary.auto_targets.filter((x) => x !== t.id);
+                                updateSummary({ auto_targets: next });
+                              }}
+                            />
+                            {t.label}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <p className="text-xs text-paper-500">
+                    每個語言各呼叫一次 Claude API（與手動產生總結相同）
+                  </p>
+                </div>
+              )}
             </Field>
 
             <Field label="檔案">

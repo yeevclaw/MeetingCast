@@ -404,7 +404,7 @@ export default function ControlWindow() {
       // finalizes meta.json — once stop_session runs the recorder slot is
       // empty and subsequent appends silently drop on the floor.
       await flushPending();
-      await invoke("stop_stt");
+      const sessionId = await invoke<string | null>("stop_stt");
       // Drop rolling translation context so a new session doesn't carry
       // pronouns / topic from the previous meeting into its first sentence.
       invoke("clear_translation_context").catch(() => {});
@@ -414,10 +414,41 @@ export default function ControlWindow() {
       ) {
         setShowHistoryCoach(true);
       }
+      // Opt-in post-meeting auto-summary. Re-read config (the user may have
+      // just toggled it in Settings) and, only if the session actually
+      // captured something, generate a summary per configured language. The
+      // recording-stopped UI resets independently via the `stt:stopped`
+      // listener — that event fires during these awaits, so the ~30s of
+      // summary work below never strands the button on 停止錄音.
+      if (sessionId && finalizedThisSessionRef.current > 0) {
+        let cfg: Config | null = null;
+        try {
+          cfg = await invoke<Config>("get_config");
+        } catch {
+          cfg = null;
+        }
+        if (cfg?.summary?.auto_generate && cfg.summary.auto_targets.length > 0) {
+          showToast("info", "會議結束，自動產生總結中…完成後可在歷史紀錄查看", 6000);
+          // Sequential (not Promise.all) so the per-language calls don't
+          // collide on the Anthropic rate limit. Each target is isolated:
+          // one failure toasts but doesn't abort the rest.
+          for (const target of cfg.summary.auto_targets) {
+            try {
+              await invoke("generate_summary", {
+                sessionId,
+                target,
+                template: cfg.summary.auto_template,
+              });
+            } catch {
+              showToast("error", `自動總結失敗（${target}）`, 5000);
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(`stop: ${err}`);
     }
-  }, [flushPending]);
+  }, [flushPending, showToast]);
 
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [

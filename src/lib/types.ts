@@ -60,6 +60,11 @@ export type Config = {
   active_glossary: string | null;
   idle_auto_stop_minutes: number;
   onboarding_complete: boolean;
+  summary: {
+    auto_generate: boolean;
+    auto_template: string;
+    auto_targets: string[];
+  };
 };
 
 export type StoredUtterance = {

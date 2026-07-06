@@ -666,7 +666,7 @@ pub async fn sidecar_ready(state: tauri::State<'_, SharedManager>) -> Result<boo
 pub async fn stop_stt(
     state: tauri::State<'_, SharedManager>,
     recorder: tauri::State<'_, SharedRecorder>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     {
         let mut m = state.lock().await;
         m.intentional_stop = true;
@@ -687,8 +687,9 @@ pub async fn stop_stt(
     // the recorder slot is already empty (see session_append_utterance).
     // That's the right tradeoff: a meta.json with one fewer count is
     // better than racing the file write with concurrent appends.
-    session::stop_session(recorder.inner()).await;
-    Ok(())
+    // Return the just-closed session id so the frontend can kick off
+    // opt-in post-session work (auto-summary); `None` = nothing was open.
+    Ok(session::stop_session(recorder.inner()).await)
 }
 
 /// Per-session idle watcher: polls `last_activity_at` and emits the
