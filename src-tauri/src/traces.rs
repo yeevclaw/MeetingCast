@@ -42,6 +42,12 @@ pub struct TraceRecord {
     pub retries: u32,
     /// "ok" | "error" | "filtered" | "empty".
     pub outcome: String,
+    /// Glossary terms present in the source whose required target translation
+    /// was missing from the delivered output. Observe-only — recorded for
+    /// review but never blocks or rewrites the translation. `None` when the
+    /// check found no violations or wasn't run (summaries, filtered replies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glossary_violations: Option<Vec<String>>,
 }
 
 pub fn trace_path() -> PathBuf {
@@ -101,6 +107,7 @@ mod tests {
             stop_reason: Some("end_turn".into()),
             retries: 1,
             outcome: "ok".into(),
+            glossary_violations: None,
         }
     }
 
@@ -129,6 +136,7 @@ mod tests {
         // Option::None fields are skipped, not emitted as null.
         assert!(!json.contains("ttft_ms"));
         assert!(!json.contains("stop_reason"));
+        assert!(!json.contains("glossary_violations"));
         // Required fields always present.
         assert!(json.contains("\"total_ms\":640"));
         let back: TraceRecord = serde_json::from_str(&json).unwrap();

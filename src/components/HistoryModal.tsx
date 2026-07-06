@@ -34,6 +34,7 @@ type SummaryChunk = { session_id: string; target: SummaryLang; text: string };
 type SummaryDone = { session_id: string; target: SummaryLang; path: string };
 type SummaryError = { session_id: string; target: SummaryLang; message: string };
 type SummaryRestart = { session_id: string; target: SummaryLang };
+type SummaryVerify = { session_id: string; target: SummaryLang; issues: string[] };
 
 function formatStarted(iso: string): string {
   const d = new Date(iso);
@@ -86,6 +87,11 @@ export default function HistoryModal({
   );
   const [streamingTarget, setStreamingTarget] = useState<SummaryLang | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  // Deterministic structure-check findings from `summary:verify`, keyed by
+  // lang. Rendered as a non-blocking warning above the summary content.
+  const [summaryIssues, setSummaryIssues] = useState<
+    Record<SummaryLang, string[] | null>
+  >({ zh: null, en: null, vi: null });
   // Single template selection shared across the three lang tabs — most users
   // pick a style for the whole meeting, not per-lang.
   const [summaryTemplate, setSummaryTemplate] =
@@ -125,6 +131,7 @@ export default function HistoryModal({
     setConfirmDelete(false);
     setSummaryError(null);
     setSummaries({ zh: null, en: null, vi: null });
+    setSummaryIssues({ zh: null, en: null, vi: null });
     setViewMode("transcript");
     setPendingRegenerate(null);
     try {
@@ -169,6 +176,13 @@ export default function HistoryModal({
       listen<SummaryRestart>("summary:restart", (e) => {
         if (e.payload.session_id !== selectedIdRef.current) return;
         setSummaries((s) => ({ ...s, [e.payload.target]: "" }));
+        setSummaryIssues((s) => ({ ...s, [e.payload.target]: null }));
+      }),
+      // Deterministic structure check flagged missing / reordered headings (or
+      // an out-of-range slide count). Non-blocking — the summary is still shown.
+      listen<SummaryVerify>("summary:verify", (e) => {
+        if (e.payload.session_id !== selectedIdRef.current) return;
+        setSummaryIssues((s) => ({ ...s, [e.payload.target]: e.payload.issues }));
       }),
       listen<SummaryDone>("summary:done", (e) => {
         if (e.payload.session_id !== selectedIdRef.current) return;
@@ -207,6 +221,7 @@ export default function HistoryModal({
       // Clear existing content so the user sees fresh streaming, not a
       // mash of old + new text.
       setSummaries((s) => ({ ...s, [target]: "" }));
+      setSummaryIssues((s) => ({ ...s, [target]: null }));
       setStreamingTarget(target);
       setViewMode(target);
       try {
@@ -238,6 +253,7 @@ export default function HistoryModal({
     // overwrites it. If the user backs out without regenerating, the old
     // file is still there and re-loads on next session open.
     setSummaries((s) => ({ ...s, [target]: null }));
+    setSummaryIssues((s) => ({ ...s, [target]: null }));
     setPendingRegenerate(null);
     setSummaryError(null);
   }, []);
@@ -477,6 +493,7 @@ export default function HistoryModal({
                   content={summaries[viewMode]}
                   streaming={streamingTarget === viewMode}
                   error={summaryError}
+                  issues={summaryIssues[viewMode]}
                   template={summaryTemplate}
                   onTemplateChange={setSummaryTemplate}
                   onGenerate={() => handleGenerateSummary(viewMode)}
@@ -563,6 +580,7 @@ function SummaryPane({
   content,
   streaming,
   error,
+  issues,
   template,
   onTemplateChange,
   onGenerate,
@@ -576,6 +594,7 @@ function SummaryPane({
   content: string | null;
   streaming: boolean;
   error: string | null;
+  issues: string[] | null;
   template: SummaryTemplate;
   onTemplateChange: (t: SummaryTemplate) => void;
   onGenerate: () => void;
@@ -698,6 +717,11 @@ function SummaryPane({
                 </button>
               </div>
             )
+          )}
+          {issues && issues.length > 0 && (
+            <p className="rounded bg-warn-50 px-3 py-2 text-xs text-warn-900">
+              ⚠ 總結結構不完整：{issues.join("、")}
+            </p>
           )}
           <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-paper-900">
             {content ?? ""}

@@ -149,7 +149,7 @@ impl Config {
 
     /// Iterate the entries that should drive STT bias + alias rewrite +
     /// prompt injection. Empty when no active book or the active book is empty.
-    fn active_entries(&self) -> &[GlossaryEntry] {
+    pub(crate) fn active_entries(&self) -> &[GlossaryEntry] {
         self.active_book()
             .map(|b| b.entries.as_slice())
             .unwrap_or(&[])

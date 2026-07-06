@@ -12,6 +12,7 @@ mod session;
 mod sidecar;
 mod traces;
 mod translator;
+mod verify;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

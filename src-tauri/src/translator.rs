@@ -15,6 +15,7 @@ use crate::config::SharedConfig;
 use crate::errors;
 use crate::session;
 use crate::traces::{self, TraceRecord};
+use crate::verify;
 
 /// Accumulates per-request trace state (latency, token usage, cache activity,
 /// outcome) and flushes exactly one `TraceRecord` on drop — so every exit path
@@ -35,6 +36,7 @@ struct TraceGuard {
     stop_reason: Option<String>,
     retries: u32,
     outcome: &'static str,
+    glossary_violations: Option<Vec<String>>,
 }
 
 impl TraceGuard {
@@ -53,6 +55,7 @@ impl TraceGuard {
             stop_reason: None,
             retries: 0,
             outcome: "error",
+            glossary_violations: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl Drop for TraceGuard {
             stop_reason: self.stop_reason.clone(),
             retries: self.retries,
             outcome: self.outcome.to_string(),
+            glossary_violations: self.glossary_violations.clone(),
         });
     }
 }
@@ -552,12 +556,13 @@ pub async fn translate(
     text: String,
     target: String,
 ) -> Result<(), String> {
-    let (api_key, model, glossary_block) = {
+    let (api_key, model, glossary_block, glossary_entries) = {
         let cfg = config.lock().await;
         (
             cfg.api.anthropic_api_key.clone(),
             cfg.api.model.clone(),
             cfg.render_glossary_section(&target),
+            cfg.active_entries().to_vec(),
         )
     };
     if api_key.is_empty() {
@@ -637,6 +642,24 @@ pub async fn translate(
             }
         };
 
+    // Language guard: the 32-char meta prefix filter can't catch a full reply
+    // that stayed in Chinese for an en/vi target. Re-check the whole text; if it
+    // reads as Chinese, clear the chunks already on screen with an empty
+    // `replace` and treat the utterance as filtered — same delivered-empty
+    // semantics as the meta filter, just decided after the stream completed.
+    let wrong_lang = !is_meta && verify::wrong_language(&full_text, &target);
+    if wrong_lang {
+        let _ = app.emit(
+            &replace_event,
+            ChunkPayload { id: id.clone(), text: String::new() },
+        );
+        errors::record(
+            "translation_wrong_language",
+            &full_text.chars().take(80).collect::<String>(),
+            Some(serde_json::json!({ "target": target, "id": id })),
+        );
+    }
+
     let _ = app.emit(&done_event, DonePayload { id: id.clone() });
 
     // The translation is still delivered above even when truncated — just log
@@ -653,14 +676,27 @@ pub async fn translate(
     // target sees this pair as recent context. Skip if filtered as meta or
     // if the model returned an empty string (e.g. hallucination per rule 6).
     let final_text = full_text.trim().to_string();
-    guard.outcome = if is_meta {
+    guard.outcome = if is_meta || wrong_lang {
         "filtered"
     } else if final_text.is_empty() {
         "empty"
     } else {
         "ok"
     };
-    if !is_meta && !final_text.is_empty() {
+    if !is_meta && !wrong_lang && !final_text.is_empty() {
+        // Observe-only glossary check: log any glossary term present in the
+        // source whose required target translation is missing from the output.
+        // Never blocks or retranslates — the delivered text stands.
+        let violations = verify::check_glossary(&text, &final_text, &glossary_entries, &target);
+        if !violations.is_empty() {
+            errors::record(
+                "glossary_violation",
+                &violations.join("; "),
+                Some(serde_json::json!({ "id": id, "target": target })),
+            );
+            guard.glossary_violations = Some(violations);
+        }
+
         let mut map = ctx.lock().await;
         let entry = map.entry(target.clone()).or_insert_with(VecDeque::new);
         // Insert ordered by t_start (the id is the stringified t_start). On an
@@ -1092,6 +1128,31 @@ pub async fn generate_summary(
             json!({ "session_id": session_id, "target": target, "message": msg }),
         );
         return Err(msg);
+    }
+
+    // Deterministic structure check (pure string logic — no extra LLM call).
+    // Heading templates must carry every expected H2 in order; slide_outline
+    // must land in the supported slide count. Findings are non-fatal — we still
+    // write whatever streamed — but surfaced via `summary:verify` + error log so
+    // the user knows the summary may be incomplete.
+    let structure_issues: Vec<String> = if template == "slide_outline" {
+        verify::check_slide_outline(&full).into_iter().collect()
+    } else if let Some(headings) = template_headings(&template, &target) {
+        let expected: Vec<String> = headings.iter().map(|h| h.to_string()).collect();
+        verify::check_summary_structure(&expected, &full)
+    } else {
+        Vec::new()
+    };
+    if !structure_issues.is_empty() {
+        errors::record(
+            "summary_structure",
+            &structure_issues.join("; "),
+            Some(json!({ "session_id": session_id, "target": target })),
+        );
+        let _ = app.emit(
+            "summary:verify",
+            json!({ "session_id": session_id, "target": target, "issues": structure_issues }),
+        );
     }
 
     let path = session::session_dir(&session_id).join(format!("summary.{target}.md"));
