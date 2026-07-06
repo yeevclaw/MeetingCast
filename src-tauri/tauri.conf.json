@@ -51,6 +51,7 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/stt_engine"],
+    "resources": ["../prototype/samples/weather_90s.wav"],
     "macOS": {
       "infoPlist": "./Info.plist",
       "entitlements": "./Entitlements.plist",

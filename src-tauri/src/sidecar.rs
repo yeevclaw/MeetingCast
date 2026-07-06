@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::path::BaseDirectory;
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
@@ -723,6 +724,32 @@ async fn idle_watch_loop(app: AppHandle, mgr: SharedManager, idle_minutes: u32) 
             return;
         }
     }
+}
+
+/// Resolve the bundled demo WAV (weather_90s.wav) to an absolute path.
+///
+/// Release builds carry it as a Tauri resource — `../`-relative resource
+/// paths land under `Resources/_up_/` inside the .app bundle. Dev builds
+/// fall back to the repo-relative copy via `project_root()` (the same
+/// notion of the repo root `locate_sidecar` uses for the dev venv).
+/// Returning an absolute path (instead of the old hardcoded relative one)
+/// matters because the release sidecar's cwd is `Contents/MacOS/`, where
+/// a relative `prototype/samples/...` path resolves to nothing.
+#[tauri::command]
+pub async fn demo_wav_path(app: AppHandle) -> Result<String, String> {
+    if let Ok(p) = app
+        .path()
+        .resolve("_up_/prototype/samples/weather_90s.wav", BaseDirectory::Resource)
+    {
+        if p.exists() {
+            return Ok(p.to_string_lossy().to_string());
+        }
+    }
+    let dev = project_root().join("prototype/samples/weather_90s.wav");
+    if dev.exists() {
+        return Ok(dev.to_string_lossy().to_string());
+    }
+    Err("demo wav not found: neither the bundled resource nor the dev-tree copy exists".into())
 }
 
 /// Ask the sidecar to enumerate input-capable audio devices via sounddevice.

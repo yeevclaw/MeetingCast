@@ -50,6 +50,7 @@ pub fn run() {
             sidecar::restart_sidecar,
             sidecar::sidecar_ready,
             sidecar::list_audio_devices,
+            sidecar::demo_wav_path,
             translator::translate,
             translator::clear_translation_context,
             translator::generate_summary,

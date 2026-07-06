@@ -21,8 +21,6 @@ import type {
   TranscriptPayload,
 } from "@/lib/types";
 
-const DEMO_WAV = "prototype/samples/weather_90s.wav";
-
 type Toast = { kind: "info" | "warning" | "error"; message: string };
 
 type CrashPayload = { attempt: number; max: number; stderr_tail?: string };
@@ -352,13 +350,25 @@ export default function ControlWindow() {
     setError(null);
     setHistory([]);
     setLatestZh("");
-    const source: Source = useMicRef.current
-      ? {
+    try {
+      let source: Source;
+      if (useMicRef.current) {
+        source = {
           type: "mic",
           ...(selectedDeviceRef.current ? { device: selectedDeviceRef.current } : {}),
+        };
+      } else {
+        // Resolve the bundled demo WAV to an absolute path in Rust — the old
+        // hardcoded repo-relative path only existed in dev checkouts.
+        let path: string;
+        try {
+          path = await invoke<string>("demo_wav_path");
+        } catch {
+          showToast("error", "找不到內建示範音檔", 5000);
+          return;
         }
-      : { type: "wav", path: DEMO_WAV };
-    try {
+        source = { type: "wav", path };
+      }
       await invoke("start_stt", { backend: backendRef.current, source });
     } catch (err) {
       setError(`start: ${err}`);
