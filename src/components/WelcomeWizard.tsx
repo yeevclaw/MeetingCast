@@ -8,6 +8,28 @@ import type { Config } from "@/lib/types";
 
 type Step = "intro" | "keys" | "ready";
 
+/** Tri-state result from the Rust validate_*_key commands. */
+type KeyCheck = "valid" | "invalid" | "unknown";
+
+function KeyCheckHint({ check }: { check: KeyCheck | null }) {
+  if (check === "valid") {
+    return <p className="mt-1 text-xs text-paper-700">✓ 金鑰有效</p>;
+  }
+  if (check === "invalid") {
+    return (
+      <p className="mt-1 text-xs text-danger-700">金鑰無效，請確認是否複製完整</p>
+    );
+  }
+  if (check === "unknown") {
+    return (
+      <p className="mt-1 text-xs text-warn-700">
+        ⚠ 暫時無法驗證（網路問題），先繼續也可以
+      </p>
+    );
+  }
+  return null;
+}
+
 export default function WelcomeWizard({
   initialConfig,
   onDone,
@@ -30,9 +52,40 @@ export default function WelcomeWizard({
   const [showDeepgram, setShowDeepgram] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [validating, setValidating] = useState(false);
+  const [anthropicCheck, setAnthropicCheck] = useState<KeyCheck | null>(null);
+  const [deepgramCheck, setDeepgramCheck] = useState<KeyCheck | null>(null);
 
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
   const modelDone = stepStatus.model === "done";
+  const hasInvalidKey = anthropicCheck === "invalid" || deepgramCheck === "invalid";
+
+  async function handleKeysNext() {
+    setValidating(true);
+    try {
+      // Deepgram is optional — only validate when the field is non-empty.
+      const [a, d] = await Promise.all([
+        invoke<KeyCheck>("validate_anthropic_key", { key: anthropic.trim() }),
+        deepgram.trim()
+          ? invoke<KeyCheck>("validate_deepgram_key", { key: deepgram.trim() })
+          : Promise.resolve<KeyCheck | null>(null),
+      ]);
+      setAnthropicCheck(a);
+      setDeepgramCheck(d);
+      // Only a confirmed-invalid key blocks; "unknown" (network trouble)
+      // never does — the user shouldn't be locked out of their own app
+      // because the wifi is flaky.
+      if (a !== "invalid" && d !== "invalid") {
+        setStep("ready");
+      }
+    } catch {
+      // The command itself failed — treat as unverifiable and let the user
+      // through; start_stt still guards with a toast when the key is bad.
+      setStep("ready");
+    } finally {
+      setValidating(false);
+    }
+  }
 
   async function handleFinish() {
     setSaving(true);
@@ -118,7 +171,10 @@ export default function WelcomeWizard({
                     type={showAnthropic ? "text" : "password"}
                     className="flex-1 rounded border border-paper-300 px-2 py-1.5 font-mono text-xs"
                     value={anthropic}
-                    onChange={(e) => setAnthropic(e.target.value)}
+                    onChange={(e) => {
+                      setAnthropic(e.target.value);
+                      setAnthropicCheck(null);
+                    }}
                     placeholder="sk-ant-api03-..."
                     autoFocus
                   />
@@ -131,6 +187,7 @@ export default function WelcomeWizard({
                   </button>
                 </div>
                 <p className="mt-1 text-xs text-paper-500">用來呼叫 Claude 翻譯（必填）</p>
+                <KeyCheckHint check={anthropicCheck} />
               </div>
 
               <div>
@@ -150,7 +207,10 @@ export default function WelcomeWizard({
                     type={showDeepgram ? "text" : "password"}
                     className="flex-1 rounded border border-paper-300 px-2 py-1.5 font-mono text-xs"
                     value={deepgram}
-                    onChange={(e) => setDeepgram(e.target.value)}
+                    onChange={(e) => {
+                      setDeepgram(e.target.value);
+                      setDeepgramCheck(null);
+                    }}
                     placeholder="（留空也可，預設用本地 mlx-whisper）"
                   />
                   <button
@@ -164,6 +224,7 @@ export default function WelcomeWizard({
                 <p className="mt-1 text-xs text-paper-500">
                   只在你想切到 cloud STT 時才需要；之後可在「設定」補
                 </p>
+                <KeyCheckHint check={deepgramCheck} />
               </div>
             </div>
 
@@ -183,13 +244,22 @@ export default function WelcomeWizard({
                 >
                   略過，稍後在設定填
                 </button>
+                {hasInvalidKey && (
+                  <button
+                    className="text-xs text-danger-700 underline-offset-2 hover:underline"
+                    onClick={() => setStep("ready")}
+                    type="button"
+                  >
+                    仍要繼續
+                  </button>
+                )}
                 <button
                   className="rounded bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-700 disabled:bg-paper-400"
-                  onClick={() => setStep("ready")}
-                  disabled={!anthropic.trim()}
+                  onClick={handleKeysNext}
+                  disabled={!anthropic.trim() || validating}
                   type="button"
                 >
-                  下一步
+                  {validating ? "驗證中…" : "下一步"}
                 </button>
               </div>
             </footer>

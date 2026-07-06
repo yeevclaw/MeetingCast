@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 mod config;
 mod errors;
+mod keycheck;
 mod session;
 mod sidecar;
 mod translator;
@@ -55,6 +56,8 @@ pub fn run() {
             translator::read_summary,
             config::get_config,
             config::set_config,
+            keycheck::validate_anthropic_key,
+            keycheck::validate_deepgram_key,
             errors::open_config_folder,
             errors::open_errors_log,
             session::session_append_utterance,
