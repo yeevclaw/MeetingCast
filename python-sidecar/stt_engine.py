@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 # Point SSL libs at the certifi-bundled CA file BEFORE importing anything
@@ -35,9 +36,19 @@ from audio_stream import wav_chunks  # noqa: E402
 from stt import get_backend  # noqa: E402
 
 
+# Serializes stdout writes. The async command loop emits from the event-loop
+# thread while the background model-download poller (see _poll_model_download)
+# emits from a daemon thread — without this lock two interleaved half-lines
+# would corrupt the line-delimited JSON protocol. json.dumps runs outside the
+# lock to keep the critical section as short as the write itself.
+_emit_lock = threading.Lock()
+
+
 def emit(event: dict) -> None:
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    with _emit_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 async def stdin_lines():
@@ -191,32 +202,96 @@ def _prewarm_mic():
     Mirrors the InputStream args used by the real audio_capture.mic_chunks
     so we exercise the same CoreAudio code path — opening with mismatched
     args (no callback / different blocksize) doesn't reliably trigger the
-    permission probe. Failures are non-fatal — the sidecar still serves
-    WAV demo sources and the real start_stt will surface a friendly error
-    if the mic is unavailable when actually needed.
+    permission probe.
+
+    A genuine open failure (no input device, unsupported format, CoreAudio
+    HAL error) is left to propagate so _run_prewarm_step surfaces it as a
+    prewarm mic error instead of hiding it in stderr. NOTE: this does NOT
+    detect a macOS TCC permission denial — a denied mic delivers silence,
+    not an exception, so opening succeeds either way.
     """
+    import time
+    import sounddevice as sd  # type: ignore
+
+    def _no_op(indata, frames, time_info, status):
+        pass
+
+    stream = sd.InputStream(
+        samplerate=16000,
+        channels=1,
+        dtype="float32",
+        blocksize=1600,
+        callback=_no_op,
+    )
+    stream.start()
+    # Hold the stream open just long enough for macOS to probe CoreAudio
+    # and either show its permission prompt or succeed silently.
+    time.sleep(0.1)
+    # Teardown errors are harmless — the probe has already exercised the mic
+    # by this point — so keep the narrow swallow only here.
     try:
-        import time
-        import sounddevice as sd  # type: ignore
-
-        def _no_op(indata, frames, time_info, status):
-            pass
-
-        stream = sd.InputStream(
-            samplerate=16000,
-            channels=1,
-            dtype="float32",
-            blocksize=1600,
-            callback=_no_op,
-        )
-        stream.start()
-        # Hold the stream open just long enough for macOS to probe CoreAudio
-        # and either show its permission prompt or succeed silently.
-        time.sleep(0.1)
         stream.stop()
         stream.close()
-    except Exception as e:  # noqa: BLE001
-        print(f"[mic prewarm] {e}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Total on-disk size of the whisper-large-v3-turbo snapshot, measured on a
+# fully-cached machine (sum of non-symlink files under the HF hub model dir).
+# Revision a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb of
+# mlx-community/whisper-large-v3-turbo. Used only to render a download-progress
+# percentage — an approximation is fine; a future re-quantized upload would
+# shift this but the bar just reads slightly off until re-measured.
+WHISPER_MODEL_TOTAL_BYTES = 1_613_979_798
+
+# HF hub cache dir name for the whisper model repo (repo id with '/' → '--').
+_WHISPER_CACHE_DIRNAME = "models--mlx-community--whisper-large-v3-turbo"
+
+
+def _dir_size(path: Path) -> int:
+    """Sum the sizes of all regular, non-symlink files under `path`. Symlinks
+    are skipped so we don't double-count HF's snapshot/*→blobs/* links against
+    the real blob (which we already count directly). In-progress downloads land
+    as `blobs/*.incomplete`, which are real files and thus included."""
+    if not path.exists():
+        return 0
+    total = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_symlink() or not f.is_file():
+                continue
+            total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _poll_model_download(stop_event: threading.Event) -> None:
+    """Emit `prewarm/model/progress` events roughly every 2s by polling the
+    growing HF cache dir. Runs on a daemon thread; stops when `stop_event` is
+    set. All internal failures are swallowed — on any error we simply stop
+    reporting and the UI degrades to today's indeterminate spinner."""
+    try:
+        import huggingface_hub.constants as hf_constants
+        model_dir = Path(hf_constants.HF_HUB_CACHE) / _WHISPER_CACHE_DIRNAME
+    except Exception:  # noqa: BLE001
+        return
+    # Never report 100% while the download/GPU-load is still in flight — clamp
+    # to 99% of total so the real `done` event is what completes the bar.
+    cap = int(WHISPER_MODEL_TOTAL_BYTES * 0.99)
+    while not stop_event.is_set():
+        try:
+            downloaded = min(_dir_size(model_dir), cap)
+            emit({
+                "type": "prewarm",
+                "step": "model",
+                "state": "progress",
+                "downloaded_bytes": downloaded,
+                "total_bytes": WHISPER_MODEL_TOTAL_BYTES,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        stop_event.wait(2.0)
 
 
 def _prewarm_local_model():
@@ -229,18 +304,39 @@ def _prewarm_local_model():
     so click-time becomes near-instant.
 
     Also doubles as ensure_loaded() — if the snapshot is missing, the
-    underlying mlx_whisper.transcribe call performs the download.
+    underlying mlx_whisper.transcribe call performs the download. On a cache
+    miss a poller thread reports download progress; on a cache hit we skip the
+    poller entirely so a returning user never sees a progress flash.
 
     Non-fatal — if the user only ever uses the cloud backend or the demo
     WAV, this overhead is wasted but the sidecar still works.
     """
+    stop_event = threading.Event()
+    poller: threading.Thread | None = None
     try:
         import numpy as np
         import mlx.core as mx  # type: ignore
         import mlx_whisper  # type: ignore
+        import huggingface_hub  # type: ignore
 
         from stt.local import MLXWhisperSTT
         engine = MLXWhisperSTT(language="zh")
+
+        # Cache-hit fast path: if every file is already local, report nothing
+        # (no UI flash) and go straight to the warm-up transcribe.
+        cache_hit = False
+        try:
+            huggingface_hub.snapshot_download(engine.model_repo, local_files_only=True)
+            cache_hit = True
+        except Exception:  # noqa: BLE001
+            cache_hit = False
+
+        if not cache_hit:
+            poller = threading.Thread(
+                target=_poll_model_download, args=(stop_event,), daemon=True
+            )
+            poller.start()
+
         # Bypass _transcribe_audio's RMS gate (which would skip silent input
         # and never actually load the model) — call mlx_whisper directly.
         mlx_whisper.transcribe(
@@ -259,6 +355,12 @@ def _prewarm_local_model():
             pass
     except Exception as e:  # noqa: BLE001
         print(f"[model prewarm] {e}", file=sys.stderr, flush=True)
+    finally:
+        # Stop the poller before _run_prewarm_step emits `done`, so the last
+        # progress event can't arrive after completion and re-open the row.
+        stop_event.set()
+        if poller is not None:
+            poller.join(timeout=3)
 
 
 async def _run_prewarm_step(step: str, fn) -> None:

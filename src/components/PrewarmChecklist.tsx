@@ -19,9 +19,13 @@ export const PREWARM_STEPS: Array<{ id: StepId; label: string }> = [
 export default function PrewarmChecklist({
   stepStatus,
   stepError,
+  modelProgress,
 }: {
   stepStatus: Record<StepId, StepStatus>;
   stepError: Partial<Record<StepId, string>>;
+  // Live byte counters for the model-download step. Present only while a
+  // first-run download is in flight; a cache hit never sets it.
+  modelProgress?: { downloaded: number; total: number } | null;
 }) {
   return (
     <ul className="space-y-2.5">
@@ -45,6 +49,12 @@ export default function PrewarmChecklist({
               >
                 {s.label}
               </p>
+              {s.id === "model" && status === "in_progress" && modelProgress && (
+                <p className="mt-0.5 text-[11px] text-paper-500">
+                  已下載 {Math.round(modelProgress.downloaded / 1e6)} MB / 約{" "}
+                  {(modelProgress.total / 1e9).toFixed(1)} GB
+                </p>
+              )}
               {err && status === "error" && (() => {
                 const f = friendly(err);
                 return (

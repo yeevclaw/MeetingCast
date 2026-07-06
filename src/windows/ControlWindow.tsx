@@ -26,8 +26,16 @@ type Toast = { kind: "info" | "warning" | "error"; message: string };
 type CrashPayload = { attempt: number; max: number; stderr_tail?: string };
 type RestoredPayload = { attempt: number };
 // `state` stays a plain string (not a union) so a future sidecar that emits
-// e.g. "progress" doesn't get miscast — unknown states are ignored below.
-type PrewarmPayload = { step: string; state: string; message?: string | null };
+// an unknown state doesn't get miscast — unhandled states are ignored below.
+// `downloaded_bytes` / `total_bytes` are only present on the model step's
+// "progress" state; both optional keeps the payload wire-compatible.
+type PrewarmPayload = {
+  step: string;
+  state: string;
+  message?: string | null;
+  downloaded_bytes?: number | null;
+  total_bytes?: number | null;
+};
 
 function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
   return (
@@ -97,6 +105,10 @@ export default function ControlWindow() {
     mic: "pending",
   });
   const [stepError, setStepError] = useState<Partial<Record<StepId, string>>>({});
+  const [modelProgress, setModelProgress] = useState<{
+    downloaded: number;
+    total: number;
+  } | null>(null);
   const [retryingPrewarm, setRetryingPrewarm] = useState(false);
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
@@ -549,15 +561,15 @@ export default function ControlWindow() {
         setStepStatus((s) => ({ ...s, spawn: "done" }));
       }),
       listen<PrewarmPayload>("stt:prewarm", (e) => {
-        const { step, state, message } = e.payload;
+        const { step, state, message, downloaded_bytes, total_bytes } = e.payload;
         const id = step as StepId;
         // First sidecar event of any kind also confirms the spawn step. The
         // child has reached our Python entry; the bootstrapper is past.
         setStepStatus((s) => {
           const next: Record<StepId, StepStatus> = { ...s };
           if (next.spawn !== "done") next.spawn = "done";
-          // Only the three known states change a step; anything else (e.g. a
-          // future "progress" state) leaves the current status untouched.
+          // Only start/done/error change a step's status; "progress" updates
+          // the byte counters below without touching the (in_progress) row.
           if (state === "start") next[id] = "in_progress";
           else if (state === "done") next[id] = "done";
           else if (state === "error") next[id] = "error";
@@ -565,6 +577,20 @@ export default function ControlWindow() {
         });
         if (state === "error" && message) {
           setStepError((m) => ({ ...m, [id]: message }));
+        }
+        // Model-download progress: stash the counters for the checklist and
+        // clear them once the step resolves (done or error) so a stale bar
+        // never lingers on the model row.
+        if (step === "model") {
+          if (
+            state === "progress" &&
+            downloaded_bytes != null &&
+            total_bytes != null
+          ) {
+            setModelProgress({ downloaded: downloaded_bytes, total: total_bytes });
+          } else if (state === "done" || state === "error") {
+            setModelProgress(null);
+          }
         }
       }),
       listen("stt:started", () => {
@@ -669,6 +695,7 @@ export default function ControlWindow() {
     setRetryingPrewarm(true);
     setStepStatus({ spawn: "in_progress", model: "pending", mic: "pending" });
     setStepError({});
+    setModelProgress(null);
     setSidecarReady(false);
     try {
       await invoke("restart_sidecar");
@@ -952,6 +979,7 @@ export default function ControlWindow() {
           onDone={() => setNeedsWelcome(null)}
           stepStatus={stepStatus}
           stepError={stepError}
+          modelProgress={modelProgress}
           retryPrewarm={retryPrewarm}
           micAvailable={micAvailable}
         />
@@ -994,7 +1022,7 @@ export default function ControlWindow() {
               <p className="font-medium text-paper-900">正在準備辨識模型</p>
             </div>
             <p className="max-w-xs text-center text-xs text-paper-600">
-              首次啟動需下載 ~1.5 GB（mlx-whisper large-v3-turbo）。下次直接使用快取，這只是首次需要等。
+              首次啟動需下載約 1.6 GB（mlx-whisper large-v3-turbo）。下次直接使用快取，這只是首次需要等。
             </p>
           </div>
         </div>
@@ -1018,7 +1046,11 @@ export default function ControlWindow() {
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-paper-900/30 backdrop-blur-sm">
           <div className="w-[300px] rounded-2xl border border-paper-200 bg-white px-6 py-5 shadow-xl">
             <p className="mb-4 text-center font-medium text-paper-900">正在啟動辨識引擎</p>
-            <PrewarmChecklist stepStatus={stepStatus} stepError={stepError} />
+            <PrewarmChecklist
+              stepStatus={stepStatus}
+              stepError={stepError}
+              modelProgress={modelProgress}
+            />
             {hasPrewarmError ? (
               <div className="mt-4 flex flex-col items-center gap-2">
                 <button
@@ -1030,12 +1062,12 @@ export default function ControlWindow() {
                   {retryingPrewarm ? "重新啟動中…" : "重試"}
                 </button>
                 <p className="text-center text-[11px] text-paper-500">
-                  首次啟動需下載 ~1.5 GB；網路不穩可重試
+                  首次啟動需下載約 1.6 GB；網路不穩可重試
                 </p>
               </div>
             ) : (
               <p className="mt-4 text-center text-[11px] text-paper-500">
-                首次啟動需下載 ~1.5 GB 語音模型，之後會直接讀取快取
+                首次啟動需下載約 1.6 GB 語音模型，之後會直接讀取快取
               </p>
             )}
           </div>

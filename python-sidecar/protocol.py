@@ -15,4 +15,9 @@ Python → Rust (events):
     {"type": "transcript", "text": "...", "is_final": bool, "t_start": float, "t_end": float}
     {"type": "stopped"}                                  -- after stop command
     {"type": "error", "message": "..."}
+    {"type": "prewarm", "step": "model"|"mic", "state": "start"|"progress"|"done"|"error",
+     "message": "..."?,                                  -- present when state == "error"
+     "downloaded_bytes": int?, "total_bytes": int?}      -- present when state == "progress"
+                                                          -- (model download only; missing dir → 0,
+                                                          --  downloaded clamped ≤ 99% of total until done)
 """

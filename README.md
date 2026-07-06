@@ -27,7 +27,7 @@
 - Anthropic API key（[申請](https://console.anthropic.com/)）
 - （選用）Deepgram API key — 想用雲端 STT 才需要
 
-首次啟動會下載 Whisper 模型 ~1.5 GB（`large-v3-turbo`）。
+首次啟動會下載 Whisper 模型約 1.6 GB（`large-v3-turbo`）。
 
 ---
 

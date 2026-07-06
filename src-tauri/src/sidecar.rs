@@ -45,6 +45,13 @@ pub enum SidecarEvent {
         state: String,
         #[serde(default)]
         message: Option<String>,
+        /// Bytes fetched so far — only present on `state == "progress"` for
+        /// the model-download step. Additive/optional so old and new sidecars
+        /// stay wire-compatible in both directions.
+        #[serde(default)]
+        downloaded_bytes: Option<u64>,
+        #[serde(default)]
+        total_bytes: Option<u64>,
     },
     Transcript {
         text: String,
@@ -454,12 +461,14 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
-        SidecarEvent::Prewarm { step, state, message } => app.emit(
+        SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes } => app.emit(
             "stt:prewarm",
             serde_json::json!({
                 "step": step,
                 "state": state,
                 "message": message,
+                "downloaded_bytes": downloaded_bytes,
+                "total_bytes": total_bytes,
             }),
         ),
         SidecarEvent::Warning { message } => app.emit("stt:warning", message),

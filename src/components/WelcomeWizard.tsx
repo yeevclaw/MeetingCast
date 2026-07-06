@@ -35,6 +35,7 @@ export default function WelcomeWizard({
   onDone,
   stepStatus,
   stepError,
+  modelProgress,
   retryPrewarm,
   micAvailable,
 }: {
@@ -42,6 +43,7 @@ export default function WelcomeWizard({
   onDone: () => void;
   stepStatus: Record<StepId, StepStatus>;
   stepError: Partial<Record<StepId, string>>;
+  modelProgress?: { downloaded: number; total: number } | null;
   retryPrewarm: () => void;
   micAvailable: boolean | null;
 }) {
@@ -272,7 +274,11 @@ export default function WelcomeWizard({
             </p>
 
             <div className="mt-5">
-              <PrewarmChecklist stepStatus={stepStatus} stepError={stepError} />
+              <PrewarmChecklist
+                stepStatus={stepStatus}
+                stepError={stepError}
+                modelProgress={modelProgress}
+              />
             </div>
 
             {hasPrewarmError && (
