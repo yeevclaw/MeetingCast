@@ -5,6 +5,10 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import GlossaryModal from "@/components/GlossaryModal";
 import HistoryModal from "@/components/HistoryModal";
 import MicMeter from "@/components/MicMeter";
+import PrewarmChecklist, {
+  type StepId,
+  type StepStatus,
+} from "@/components/PrewarmChecklist";
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { friendly } from "@/lib/errors";
@@ -26,18 +30,6 @@ type RestoredPayload = { attempt: number };
 // `state` stays a plain string (not a union) so a future sidecar that emits
 // e.g. "progress" doesn't get miscast — unknown states are ignored below.
 type PrewarmPayload = { step: string; state: string; message?: string | null };
-
-type StepStatus = "pending" | "in_progress" | "done" | "error";
-type StepId = "spawn" | "model" | "mic";
-
-// "就緒" is intentionally not a row — when the ready event fires, the
-// overlay dismisses and the user moves on, so a row that never visibly
-// ticks would just look stuck. Three concrete steps is clearer.
-const PREWARM_STEPS: Array<{ id: StepId; label: string }> = [
-  { id: "spawn", label: "啟動辨識子程序" },
-  { id: "model", label: "載入語音模型" },
-  { id: "mic", label: "初始化麥克風" },
-];
 
 function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
   return (
@@ -119,10 +111,12 @@ export default function ControlWindow() {
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    // First-run detection: show wizard until anthropic key is set.
+    // First-run detection: show wizard until onboarding has been completed
+    // (or skipped) once. Existing users who already have a key configured
+    // never see it; a keyless skip isn't re-nagged on the next launch.
     invoke<Config>("get_config")
       .then((cfg) => {
-        if (!cfg.api.anthropic_api_key.trim()) {
+        if (!cfg.onboarding_complete && !cfg.api.anthropic_api_key.trim()) {
           setNeedsWelcome(cfg);
         }
         setSelectedDevice(cfg.audio?.input_device ?? "");
@@ -871,6 +865,10 @@ export default function ControlWindow() {
         <WelcomeWizard
           initialConfig={needsWelcome}
           onDone={() => setNeedsWelcome(null)}
+          stepStatus={stepStatus}
+          stepError={stepError}
+          retryPrewarm={retryPrewarm}
+          micAvailable={micAvailable}
         />
       )}
 
@@ -935,47 +933,7 @@ export default function ControlWindow() {
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-paper-900/30 backdrop-blur-sm">
           <div className="w-[300px] rounded-2xl border border-paper-200 bg-white px-6 py-5 shadow-xl">
             <p className="mb-4 text-center font-medium text-paper-900">正在啟動辨識引擎</p>
-            <ul className="space-y-2.5">
-              {PREWARM_STEPS.map((s) => {
-                const status = stepStatus[s.id];
-                const err = stepError[s.id];
-                return (
-                  <li key={s.id} className="flex items-start gap-3 text-sm">
-                    <StepIcon status={status} />
-                    <div className="flex-1">
-                      <p
-                        className={
-                          status === "done"
-                            ? "text-paper-500 line-through decoration-paper-400"
-                            : status === "in_progress"
-                              ? "font-medium text-paper-900"
-                              : status === "error"
-                                ? "font-medium text-danger-700"
-                                : "text-paper-500"
-                        }
-                      >
-                        {s.label}
-                      </p>
-                      {err && status === "error" && (() => {
-                        const f = friendly(err);
-                        return (
-                          <>
-                            <p className="mt-0.5 break-all text-[11px] text-danger-700">
-                              {f.primary}
-                            </p>
-                            {f.secondary && (
-                              <p className="mt-0.5 break-all text-[11px] text-danger-700">
-                                {f.secondary}
-                              </p>
-                            )}
-                          </>
-                        );
-                      })()}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
+            <PrewarmChecklist stepStatus={stepStatus} stepError={stepError} />
             {hasPrewarmError ? (
               <div className="mt-4 flex flex-col items-center gap-2">
                 <button
@@ -999,33 +957,6 @@ export default function ControlWindow() {
         </div>
       )}
     </main>
-  );
-}
-
-function StepIcon({ status }: { status: StepStatus }) {
-  if (status === "done") {
-    return (
-      <span className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-paper-700 text-white">
-        <svg viewBox="0 0 16 16" className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M3 8.5 L6.5 12 L13 4.5" />
-        </svg>
-      </span>
-    );
-  }
-  if (status === "in_progress") {
-    return (
-      <span className="mt-0.5 inline-block h-4 w-4 flex-shrink-0 animate-spin rounded-full border-2 border-paper-200 border-t-paper-900" />
-    );
-  }
-  if (status === "error") {
-    return (
-      <span className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-danger-700 text-[10px] font-bold text-white">
-        ×
-      </span>
-    );
-  }
-  return (
-    <span className="mt-0.5 inline-block h-4 w-4 flex-shrink-0 rounded-full border-2 border-paper-300" />
   );
 }
 

@@ -1,15 +1,27 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import PrewarmChecklist, {
+  type StepId,
+  type StepStatus,
+} from "@/components/PrewarmChecklist";
 import type { Config } from "@/lib/types";
 
-type Step = "intro" | "keys";
+type Step = "intro" | "keys" | "ready";
 
 export default function WelcomeWizard({
   initialConfig,
   onDone,
+  stepStatus,
+  stepError,
+  retryPrewarm,
+  micAvailable,
 }: {
   initialConfig: Config;
   onDone: () => void;
+  stepStatus: Record<StepId, StepStatus>;
+  stepError: Partial<Record<StepId, string>>;
+  retryPrewarm: () => void;
+  micAvailable: boolean | null;
 }) {
   const [step, setStep] = useState<Step>("intro");
   const [anthropic, setAnthropic] = useState(initialConfig.api.anthropic_api_key);
@@ -18,6 +30,9 @@ export default function WelcomeWizard({
   const [showDeepgram, setShowDeepgram] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
+  const modelDone = stepStatus.model === "done";
 
   async function handleFinish() {
     setSaving(true);
@@ -30,6 +45,7 @@ export default function WelcomeWizard({
           anthropic_api_key: anthropic.trim(),
           deepgram_api_key: deepgram.trim(),
         },
+        onboarding_complete: true,
       };
       await invoke("set_config", { config: next });
       onDone();
@@ -55,6 +71,14 @@ export default function WelcomeWizard({
                 <li>🌐 並行翻譯成英文與越南文，分別顯示在兩個獨立視窗</li>
                 <li>📺 譯文視窗可拖到外接螢幕，給外籍同仁閱讀</li>
               </ul>
+              <div className="rounded-lg border border-paper-200 bg-paper-100 px-3 py-2.5">
+                <p className="text-xs font-medium text-paper-700">接下來會發生什麼</p>
+                <ul className="mt-1.5 space-y-1 text-xs text-paper-600">
+                  <li>🪟 App 會開啟三個視窗：控制視窗＋英文、越南文譯文視窗（可拖到外接螢幕）</li>
+                  <li>🎤 macOS 會跳出麥克風授權對話框，請按「允許」</li>
+                  <li>⬇️ 首次啟動會在背景下載語音模型（約 1.6 GB），下載期間可先完成設定</li>
+                </ul>
+              </div>
               <p className="text-xs text-paper-500">
                 第一次啟動需要設定 API 金鑰，下一步開始。
               </p>
@@ -69,7 +93,7 @@ export default function WelcomeWizard({
               </button>
             </footer>
           </>
-        ) : (
+        ) : step === "keys" ? (
           <>
             <h2 className="text-xl font-semibold text-paper-900">設定 API 金鑰</h2>
             <p className="mt-1 text-sm text-paper-600">完成後即可開始錄音</p>
@@ -141,13 +165,9 @@ export default function WelcomeWizard({
                   只在你想切到 cloud STT 時才需要；之後可在「設定」補
                 </p>
               </div>
-
-              {error && (
-                <p className="rounded bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</p>
-              )}
             </div>
 
-            <footer className="mt-6 flex justify-between">
+            <footer className="mt-6 flex items-center justify-between">
               <button
                 className="rounded px-3 py-2 text-sm text-paper-600 hover:bg-paper-100"
                 onClick={() => setStep("intro")}
@@ -155,13 +175,80 @@ export default function WelcomeWizard({
               >
                 ← 上一步
               </button>
+              <div className="flex items-center gap-3">
+                <button
+                  className="text-xs text-paper-500 underline-offset-2 hover:text-paper-700 hover:underline"
+                  onClick={() => setStep("ready")}
+                  type="button"
+                >
+                  略過，稍後在設定填
+                </button>
+                <button
+                  className="rounded bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-700 disabled:bg-paper-400"
+                  onClick={() => setStep("ready")}
+                  disabled={!anthropic.trim()}
+                  type="button"
+                >
+                  下一步
+                </button>
+              </div>
+            </footer>
+          </>
+        ) : (
+          <>
+            <h2 className="text-xl font-semibold text-paper-900">正在準備辨識引擎</h2>
+            <p className="mt-1 text-sm text-paper-600">
+              下方步驟會自動完成，不需等待也可以先按完成
+            </p>
+
+            <div className="mt-5">
+              <PrewarmChecklist stepStatus={stepStatus} stepError={stepError} />
+            </div>
+
+            {hasPrewarmError && (
+              <div className="mt-4 flex flex-col items-center gap-2">
+                <button
+                  className="rounded border border-paper-300 px-4 py-1.5 text-sm text-paper-700 hover:bg-paper-100"
+                  onClick={retryPrewarm}
+                  type="button"
+                >
+                  重試
+                </button>
+                <p className="text-center text-[11px] text-paper-500">
+                  首次啟動需下載 ~1.6 GB；網路不穩可重試
+                </p>
+              </div>
+            )}
+
+            {micAvailable === false && (
+              <p className="mt-4 rounded border border-warn-200 bg-warn-50 px-3 py-2 text-xs text-warn-900">
+                ⚠️ 麥克風尚未授權 — 完成後請依主畫面指示開啟系統設定
+              </p>
+            )}
+
+            {error && (
+              <p className="mt-4 rounded bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</p>
+            )}
+
+            <footer className="mt-6 flex justify-between">
+              <button
+                className="rounded px-3 py-2 text-sm text-paper-600 hover:bg-paper-100"
+                onClick={() => setStep("keys")}
+                type="button"
+              >
+                ← 上一步
+              </button>
               <button
                 className="rounded bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-700 disabled:bg-paper-400"
                 onClick={handleFinish}
-                disabled={!anthropic.trim() || saving}
+                disabled={saving}
                 type="button"
               >
-                {saving ? "儲存中…" : "完成"}
+                {saving
+                  ? "儲存中…"
+                  : modelDone
+                    ? "完成"
+                    : "完成（模型會在背景繼續下載）"}
               </button>
             </footer>
           </>

@@ -117,6 +117,12 @@ pub struct Config {
     /// `0` disables the auto-stop entirely.
     #[serde(default = "default_idle_minutes")]
     pub idle_auto_stop_minutes: u32,
+
+    /// True once the Welcome wizard has been finished (or explicitly
+    /// skipped), so it isn't shown again on later launches. Old configs
+    /// without the field parse as `false`.
+    #[serde(default)]
+    pub onboarding_complete: bool,
 }
 
 fn default_idle_minutes() -> u32 {
@@ -519,6 +525,20 @@ mod tests {
         cfg.migrate_legacy_glossary();
         assert!(cfg.glossaries.is_empty());
         assert!(cfg.active_glossary.is_none());
+    }
+
+    #[test]
+    fn onboarding_flag_defaults_false_and_round_trips() {
+        // Old configs (pre-flag) must parse with onboarding_complete = false.
+        let old: Config = toml::from_str("[api]\nanthropic_api_key = \"sk\"\n").unwrap();
+        assert!(!old.onboarding_complete);
+
+        // And a saved `true` must survive serialize → parse.
+        let mut cfg = Config::default();
+        cfg.onboarding_complete = true;
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.onboarding_complete);
     }
 
     #[test]
