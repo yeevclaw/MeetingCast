@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import type { AudioDevice, Config } from "@/lib/types";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
+const SUMMARY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
 
 type Backend = "local" | "cloud" | "openai";
 
@@ -181,6 +182,20 @@ export default function SettingsModal({
                 onChange={(e) => update({ model: e.target.value })}
               >
                 {MODELS.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </Field>
+
+            <Field label="總結模型" hint="會議紀錄的 AI 總結使用；預設 Sonnet 4.6">
+              <select
+                className="w-full rounded border border-paper-300 px-2 py-1"
+                value={cfg.api.summary_model}
+                onChange={(e) => update({ summary_model: e.target.value })}
+              >
+                {SUMMARY_MODELS.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>

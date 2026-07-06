@@ -17,10 +17,19 @@ pub struct ApiConfig {
     pub openai_api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// Model used for meeting summaries (History → 產生總結). Kept separate from
+    /// `model` (live translation) so the user can spend on a stronger model for
+    /// the one-shot summary while keeping translation cheap/fast.
+    #[serde(default = "default_summary_model")]
+    pub summary_model: String,
 }
 
 fn default_model() -> String {
     "claude-haiku-4-5".into()
+}
+
+fn default_summary_model() -> String {
+    "claude-sonnet-4-6".into()
 }
 
 impl Default for ApiConfig {
@@ -30,6 +39,7 @@ impl Default for ApiConfig {
             deepgram_api_key: String::new(),
             openai_api_key: String::new(),
             model: default_model(),
+            summary_model: default_summary_model(),
         }
     }
 }
@@ -539,6 +549,20 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert!(reparsed.onboarding_complete);
+    }
+
+    #[test]
+    fn summary_model_defaults_when_absent_and_round_trips() {
+        // Old configs (pre-field) must parse with the Sonnet default.
+        let old: Config = toml::from_str("[api]\nmodel = \"claude-haiku-4-5\"\n").unwrap();
+        assert_eq!(old.api.summary_model, "claude-sonnet-4-6");
+
+        // A saved override must survive serialize → parse.
+        let mut cfg = Config::default();
+        cfg.api.summary_model = "claude-haiku-4-5".into();
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.api.summary_model, "claude-haiku-4-5");
     }
 
     #[test]

@@ -35,6 +35,13 @@ const RULES: Array<{ test: RegExp; map: (m: RegExpMatchArray) => Omit<FriendlyEr
     }),
   },
   {
+    test: /模型 id 無效/,
+    map: () => ({
+      primary: "模型 id 無效或已下架",
+      secondary: "請在設定確認翻譯/總結模型名稱",
+    }),
+  },
+  {
     test: /anthropic 429/,
     map: () => ({
       primary: "Anthropic API 觸及配額限制",

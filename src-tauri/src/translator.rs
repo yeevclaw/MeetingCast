@@ -236,6 +236,13 @@ async fn post_anthropic_with_retry(
                     last_err = msg;
                     continue;
                 }
+                // A 404 (or a body flagging not_found_error) on this endpoint
+                // almost always means the configured model id is wrong or
+                // retired — prefix with an actionable Chinese hint the frontend
+                // banner keys off (see src/lib/errors.ts).
+                if status.as_u16() == 404 || body_text.contains("not_found_error") {
+                    return Err(format!("模型 id 無效（請在設定檢查 model 名稱）: {msg}"));
+                }
                 return Err(msg);
             }
             Err(e) => {
@@ -523,6 +530,16 @@ pub async fn translate(
 
     let _ = app.emit(&done_event, DonePayload { id: id.clone() });
 
+    // The translation is still delivered above even when truncated — just log
+    // it so a systematically-too-low max_tokens shows up in the error record.
+    if guard.stop_reason.as_deref() == Some("max_tokens") {
+        errors::record(
+            "translation_truncated",
+            "translation output hit max_tokens",
+            Some(serde_json::json!({ "target": target, "id": id })),
+        );
+    }
+
     // Write back to the rolling context so the next translate call for this
     // target sees this pair as recent context. Skip if filtered as meta or
     // if the model returned an empty string (e.g. hallucination per rule 6).
@@ -556,8 +573,6 @@ pub async fn translate(
     }
     Ok(())
 }
-
-const SUMMARY_MODEL: &str = "claude-sonnet-4-6";
 
 #[derive(Serialize, Clone)]
 struct SummaryChunk {
@@ -782,9 +797,23 @@ pub async fn generate_summary(
         return Err("這場會議沒有可總結的逐字稿".into());
     }
     let transcript_body = transcript_lines.join("\n");
+    // Guard against a single Sonnet call on an unreasonably long transcript —
+    // both a cost and a context-window risk. 150k chars is well beyond any
+    // real meeting we support one-shot.
+    if transcript_body.chars().count() > 150_000 {
+        let msg = "逐字稿過長（超過 15 萬字），暫不支援單次總結".to_string();
+        let _ = app.emit(
+            "summary:error",
+            json!({ "session_id": session_id, "target": target, "message": msg.clone() }),
+        );
+        return Err(msg);
+    }
     let duration_min = (meta.duration_secs as f64 / 60.0).ceil() as u64;
 
-    let api_key = config.lock().await.api.anthropic_api_key.clone();
+    let (api_key, summary_model) = {
+        let cfg = config.lock().await;
+        (cfg.api.anthropic_api_key.clone(), cfg.api.summary_model.clone())
+    };
     if api_key.is_empty() {
         return Err("Anthropic API key not configured (open Settings)".into());
     }
@@ -794,7 +823,7 @@ pub async fn generate_summary(
     );
 
     let body = json!({
-        "model": SUMMARY_MODEL,
+        "model": summary_model,
         "max_tokens": 4096,
         "stream": true,
         "system": [{
@@ -809,7 +838,7 @@ pub async fn generate_summary(
         "summary",
         session_id.clone(),
         target.clone(),
-        SUMMARY_MODEL.to_string(),
+        summary_model.clone(),
     );
     let resp = match post_anthropic_with_retry(&api_key, &body, &mut guard.retries).await {
         Ok(r) => r,
@@ -918,6 +947,25 @@ pub async fn generate_summary(
             &e,
             Some(json!({ "session_id": session_id })),
         );
+    }
+
+    // The partial summary was written and meta refreshed above, so the user
+    // keeps what did stream. But a max_tokens stop means it's incomplete —
+    // surface that instead of a clean "done" so they know to shorten input or
+    // pick a leaner template.
+    if guard.stop_reason.as_deref() == Some("max_tokens") {
+        guard.outcome = "ok";
+        errors::record(
+            "summary_truncated",
+            "summary output hit max_tokens",
+            Some(json!({ "session_id": session_id, "target": target })),
+        );
+        let msg = "總結輸出達到長度上限而被截斷，請改用較精簡的模板或縮短會議".to_string();
+        let _ = app.emit(
+            "summary:error",
+            json!({ "session_id": session_id, "target": target, "message": msg.clone() }),
+        );
+        return Err(msg);
     }
 
     guard.outcome = "ok";

@@ -51,6 +51,7 @@ export type Config = {
     deepgram_api_key: string;
     openai_api_key: string;
     model: string;
+    summary_model: string;
   };
   audio: {
     input_device: string;
