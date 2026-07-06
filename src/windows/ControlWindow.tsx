@@ -23,7 +23,9 @@ type Toast = { kind: "info" | "warning" | "error"; message: string };
 
 type CrashPayload = { attempt: number; max: number; stderr_tail?: string };
 type RestoredPayload = { attempt: number };
-type PrewarmPayload = { step: string; state: "start" | "done" | "error"; message?: string | null };
+// `state` stays a plain string (not a union) so a future sidecar that emits
+// e.g. "progress" doesn't get miscast — unknown states are ignored below.
+type PrewarmPayload = { step: string; state: string; message?: string | null };
 
 type StepStatus = "pending" | "in_progress" | "done" | "error";
 type StepId = "spawn" | "model" | "mic";
@@ -502,8 +504,11 @@ export default function ControlWindow() {
         setStepStatus((s) => {
           const next: Record<StepId, StepStatus> = { ...s };
           if (next.spawn !== "done") next.spawn = "done";
-          next[id] =
-            state === "start" ? "in_progress" : state === "done" ? "done" : "error";
+          // Only the three known states change a step; anything else (e.g. a
+          // future "progress" state) leaves the current status untouched.
+          if (state === "start") next[id] = "in_progress";
+          else if (state === "done") next[id] = "done";
+          else if (state === "error") next[id] = "error";
           return next;
         });
         if (state === "error" && message) {
@@ -607,6 +612,10 @@ export default function ControlWindow() {
       await invoke("restart_sidecar");
     } catch (e) {
       setError(`restart: ${e}`);
+      // Flip the spawn row back to error so the overlay shows the red row +
+      // retry button again instead of spinning on "in_progress" forever.
+      setStepStatus((s) => ({ ...s, spawn: "error" }));
+      setStepError((m) => ({ ...m, spawn: String(e) }));
     } finally {
       setRetryingPrewarm(false);
     }
@@ -947,9 +956,21 @@ export default function ControlWindow() {
                       >
                         {s.label}
                       </p>
-                      {err && status === "error" && (
-                        <p className="mt-0.5 break-all text-[11px] text-danger-700">{err}</p>
-                      )}
+                      {err && status === "error" && (() => {
+                        const f = friendly(err);
+                        return (
+                          <>
+                            <p className="mt-0.5 break-all text-[11px] text-danger-700">
+                              {f.primary}
+                            </p>
+                            {f.secondary && (
+                              <p className="mt-0.5 break-all text-[11px] text-danger-700">
+                                {f.secondary}
+                              </p>
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                   </li>
                 );

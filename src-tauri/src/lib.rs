@@ -85,8 +85,15 @@ pub fn run() {
             let mgr: sidecar::SharedManager = app.state::<sidecar::SharedManager>().inner().clone();
             let cfg: config::SharedConfig = app.state::<config::SharedConfig>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = sidecar::prewarm(app_handle, mgr, cfg).await {
+                if let Err(e) = sidecar::prewarm(app_handle.clone(), mgr, cfg).await {
                     errors::record("sidecar_prewarm_failed", &e, None);
+                    // Surface the failure to the frontend — without this the
+                    // prewarm overlay's spawn row spins forever because the
+                    // sidecar never comes up to emit its own prewarm events.
+                    let _ = app_handle.emit(
+                        "stt:prewarm",
+                        serde_json::json!({ "step": "spawn", "state": "error", "message": e }),
+                    );
                 }
             });
             Ok(())
