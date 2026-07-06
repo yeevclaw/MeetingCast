@@ -28,6 +28,9 @@ python-sidecar/build/
 python-sidecar/dist/
 src-tauri/binaries/
 
+# Eval run outputs (regenerable via prototype/eval/run_eval.py)
+prototype/eval/results/
+
 # Node
 node_modules/
 dist/
