@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -147,6 +147,24 @@ struct DonePayload {
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// Process-wide reqwest client shared across every Anthropic call. Pooling one
+/// client reuses TCP + TLS connections instead of paying a fresh handshake per
+/// `Client::new()`. `connect_timeout` bounds DNS + TCP + TLS setup; `read_timeout`
+/// is a between-chunk idle cap that trips only when the stream stalls for that
+/// long — safe for long summaries. Deliberately NO total `.timeout()`: it would
+/// abort a legitimately long streaming summary mid-flight.
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn http_client() -> &'static Client {
+    HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
 /// Backoff between retries. Two retries (250 ms then 750 ms) catches the
 /// transient blips that surface as `request failed` (DNS hiccup, captive-
 /// portal probe, TLS handshake reset) while bounding worst-case added
@@ -155,23 +173,35 @@ const RETRY_BACKOFF_MS: &[u64] = &[250, 750];
 
 /// POST to Anthropic with bounded retries. Retries cover (a) transport
 /// failures where the request never reached the server (`reqwest::Error`
-/// from `send()`), and (b) explicit overload signals from the API
-/// (HTTP 429 rate-limit, 503 unavailable). Other 4xx/5xx surface
-/// immediately — retrying a 401 or 400 just produces the same answer
-/// while spending more wallclock against the user's perceived latency.
+/// from `send()`), and (b) explicit overload / transient-server signals from
+/// the API: HTTP 429 (rate-limit), 500 (internal), 503 (unavailable), and 529
+/// (overloaded). Other 4xx/5xx surface immediately — retrying a 401 or 400
+/// just produces the same answer while spending more wallclock against the
+/// user's perceived latency. When the server sends a `Retry-After` header with
+/// an integer-seconds value, the next backoff is `max(fixed_backoff, retry_after)`
+/// capped at 10s so we respect the server's pacing without stalling the UI
+/// indefinitely.
 async fn post_anthropic_with_retry(
     api_key: &str,
     body: &Value,
     retries: &mut u32,
 ) -> Result<Response, String> {
-    let client = Client::new();
+    let client = http_client();
     let mut last_err: String = "no attempts made".into();
+    // Set by a retryable response carrying Retry-After; consumed by the next
+    // iteration's sleep (max'd against the fixed backoff, capped at 10s).
+    let mut pending_delay_ms: Option<u64> = None;
     for attempt in 0..=RETRY_BACKOFF_MS.len() {
         // Report attempts performed regardless of eventual success/failure so
         // the caller's trace records the true retry count on every exit path.
         *retries = attempt as u32;
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS[attempt - 1])).await;
+            let backoff = RETRY_BACKOFF_MS[attempt - 1];
+            let delay = pending_delay_ms
+                .take()
+                .map(|ra| ra.max(backoff))
+                .unwrap_or(backoff);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         let resp = client
             .post(ANTHROPIC_URL)
@@ -187,9 +217,17 @@ async fn post_anthropic_with_retry(
                 if status.is_success() {
                     return Ok(r);
                 }
+                // Read Retry-After before consuming the body with `.text()`.
+                let retry_after_ms = r
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|secs| secs.saturating_mul(1000).min(10_000));
                 let body_text = r.text().await.unwrap_or_default();
                 let msg = format!("anthropic {status}: {body_text}");
-                if status.as_u16() == 429 || status.as_u16() == 503 {
+                if matches!(status.as_u16(), 429 | 500 | 503 | 529) {
+                    pending_delay_ms = retry_after_ms;
                     last_err = msg;
                     continue;
                 }
