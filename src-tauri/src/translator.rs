@@ -366,6 +366,183 @@ fn is_meta_prefix(buffer: &str) -> bool {
     META_MARKERS.iter().any(|m| head.contains(m))
 }
 
+/// Outcome of draining one translation SSE stream.
+enum StreamOutcome {
+    /// Stream finished cleanly. `full_text` includes the buffered meta-scan
+    /// prefix; `is_meta` is set when the response was dropped as a meta-leak.
+    Completed { full_text: String, is_meta: bool },
+    /// Stream broke mid-flight (transport error or an `error` SSE event).
+    /// `partial_emitted` records whether any chunk already reached the UI.
+    Broken { partial_emitted: bool, err: String },
+}
+
+/// Drain one translation SSE stream: run the meta-scan buffer, emit
+/// `translation:chunk` deltas, accumulate the full text, and feed usage /
+/// stop_reason / ttft into `guard`. Returns `Completed` on a clean finish or
+/// `Broken` the moment the connection errors — the caller decides whether to
+/// retry non-streaming.
+async fn consume_translation_stream(
+    resp: Response,
+    app: &AppHandle,
+    chunk_event: &str,
+    id: &str,
+    target: &str,
+    guard: &mut TraceGuard,
+) -> StreamOutcome {
+    let mut stream = resp.bytes_stream().eventsource();
+
+    // Buffer the first META_SCAN_CHARS chars before emitting anything. If those
+    // leading chars match a meta-response blocklist (Claude breaking character
+    // on garbage input), drop the entire stream silently.
+    let mut buffer = String::new();
+    let mut decided = false;
+    let mut is_meta = false;
+    // Accumulate the full translation so the caller can write it back into the
+    // rolling context. Includes the buffered prefix.
+    let mut full_translation = String::new();
+    let mut emitted_any = false;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ev) => match ev.event.as_str() {
+                "message_start" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_start(&parsed);
+                    }
+                }
+                "message_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_delta(&parsed);
+                    }
+                }
+                "content_block_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        if let Some(delta) = parsed
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|t| t.as_str())
+                        {
+                            guard.mark_ttft();
+                            if decided {
+                                full_translation.push_str(delta);
+                                if !is_meta {
+                                    emitted_any = true;
+                                    let _ = app.emit(
+                                        chunk_event,
+                                        ChunkPayload { id: id.to_string(), text: delta.to_string() },
+                                    );
+                                }
+                            } else {
+                                buffer.push_str(delta);
+                                if buffer.chars().count() >= META_SCAN_CHARS {
+                                    decided = true;
+                                    is_meta = is_meta_prefix(&buffer);
+                                    if is_meta {
+                                        errors::record(
+                                            "translation_meta_filtered",
+                                            &buffer.chars().take(80).collect::<String>(),
+                                            Some(serde_json::json!({ "target": target, "id": id })),
+                                        );
+                                    } else {
+                                        full_translation.push_str(&buffer);
+                                        emitted_any = true;
+                                        let _ = app.emit(
+                                            chunk_event,
+                                            ChunkPayload { id: id.to_string(), text: buffer.clone() },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                "message_stop" => break,
+                "error" => {
+                    return StreamOutcome::Broken {
+                        partial_emitted: emitted_any,
+                        err: format!("anthropic stream error: {}", ev.data),
+                    };
+                }
+                _ => {}
+            },
+            Err(e) => {
+                return StreamOutcome::Broken {
+                    partial_emitted: emitted_any,
+                    err: format!("sse stream: {e}"),
+                };
+            }
+        }
+    }
+
+    // Stream ended before buffer threshold — apply check anyway and flush.
+    if !decided && !buffer.is_empty() {
+        is_meta = is_meta_prefix(&buffer);
+        if is_meta {
+            errors::record(
+                "translation_meta_filtered",
+                &buffer,
+                Some(serde_json::json!({ "target": target, "id": id })),
+            );
+        } else {
+            full_translation.push_str(&buffer);
+            let _ = app.emit(
+                chunk_event,
+                ChunkPayload { id: id.to_string(), text: buffer.clone() },
+            );
+        }
+    }
+
+    StreamOutcome::Completed { full_text: full_translation, is_meta }
+}
+
+/// Single non-streaming re-issue of a translate request after the SSE stream
+/// broke. Reuses `body` with `stream:false`, sends it once through the shared
+/// client (no retry loop — that already ran on the original streaming call),
+/// and folds usage / stop_reason into `guard` (bumping the retry count).
+async fn translate_once_nonstreaming(
+    api_key: &str,
+    body: &Value,
+    guard: &mut TraceGuard,
+) -> Result<String, String> {
+    guard.retries += 1;
+    let mut nb = body.clone();
+    nb["stream"] = Value::Bool(false);
+    let resp = http_client()
+        .post(ANTHROPIC_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&nb)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("anthropic {status}: {body_text}"));
+    }
+    let parsed: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+    if let Some(usage) = parsed.get("usage") {
+        guard.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+        guard.output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
+        guard.cache_creation_input_tokens =
+            usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+        guard.cache_read_input_tokens =
+            usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+    }
+    if let Some(sr) = parsed.get("stop_reason").and_then(|v| v.as_str()) {
+        guard.stop_reason = Some(sr.to_string());
+    }
+    let text = parsed
+        .get("content")
+        .and_then(|c| c.get(0))
+        .and_then(|b| b.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(text)
+}
+
 #[tauri::command]
 pub async fn translate(
     app: AppHandle,
@@ -427,106 +604,38 @@ pub async fn translate(
 
     let chunk_event = format!("translation:chunk:{}", target);
     let done_event = format!("translation:done:{}", target);
-    let mut stream = resp.bytes_stream().eventsource();
+    let replace_event = format!("translation:replace:{}", target);
 
-    // Buffer the first META_SCAN_CHARS chars before emitting anything. If
-    // those leading chars match a meta-response blocklist (Claude breaking
-    // character on garbage input), drop the entire stream silently.
-    let mut buffer = String::new();
-    let mut decided = false;
-    let mut is_meta = false;
-    // Accumulate the full translation so we can write it back into the
-    // rolling context for subsequent calls. Includes the buffered prefix.
-    let mut full_translation = String::new();
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(ev) => match ev.event.as_str() {
-                "message_start" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_start(&parsed);
+    let (full_text, is_meta) =
+        match consume_translation_stream(resp, &app, &chunk_event, &id, &target, &mut guard).await {
+            StreamOutcome::Completed { full_text, is_meta } => (full_text, is_meta),
+            StreamOutcome::Broken { partial_emitted, err } => {
+                // The connection dropped mid-stream but the request was accepted.
+                // Retry once WITHOUT streaming, then replace whatever partial the
+                // UI already showed with the complete text.
+                match translate_once_nonstreaming(&api_key, &body, &mut guard).await {
+                    Ok(text) => {
+                        let _ = app.emit(
+                            &replace_event,
+                            ChunkPayload { id: id.clone(), text: text.clone() },
+                        );
+                        (text, false)
+                    }
+                    Err(e2) => {
+                        errors::record(
+                            "translation_stream_broken",
+                            &format!("stream broke: {err}; non-streaming retry failed: {e2}"),
+                            Some(serde_json::json!({
+                                "target": target,
+                                "id": id,
+                                "partial_emitted": partial_emitted,
+                            })),
+                        );
+                        return Err(e2);
                     }
                 }
-                "message_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_delta(&parsed);
-                    }
-                }
-                "content_block_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        if let Some(delta) = parsed
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                        {
-                            guard.mark_ttft();
-                            if decided {
-                                full_translation.push_str(delta);
-                                if !is_meta {
-                                    let _ = app.emit(
-                                        &chunk_event,
-                                        ChunkPayload {
-                                            id: id.clone(),
-                                            text: delta.to_string(),
-                                        },
-                                    );
-                                }
-                            } else {
-                                buffer.push_str(delta);
-                                if buffer.chars().count() >= META_SCAN_CHARS {
-                                    decided = true;
-                                    is_meta = is_meta_prefix(&buffer);
-                                    if is_meta {
-                                        errors::record(
-                                            "translation_meta_filtered",
-                                            &buffer.chars().take(80).collect::<String>(),
-                                            Some(serde_json::json!({
-                                                "target": target,
-                                                "id": id,
-                                            })),
-                                        );
-                                    } else {
-                                        full_translation.push_str(&buffer);
-                                        let _ = app.emit(
-                                            &chunk_event,
-                                            ChunkPayload {
-                                                id: id.clone(),
-                                                text: buffer.clone(),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                "message_stop" => break,
-                "error" => {
-                    return Err(format!("anthropic stream error: {}", ev.data));
-                }
-                _ => {}
-            },
-            Err(e) => return Err(format!("sse stream: {e}")),
-        }
-    }
-
-    // Stream ended before buffer threshold — apply check anyway and flush.
-    if !decided && !buffer.is_empty() {
-        is_meta = is_meta_prefix(&buffer);
-        if is_meta {
-            errors::record(
-                "translation_meta_filtered",
-                &buffer,
-                Some(serde_json::json!({ "target": target, "id": id })),
-            );
-        } else {
-            full_translation.push_str(&buffer);
-            let _ = app.emit(
-                &chunk_event,
-                ChunkPayload { id: id.clone(), text: buffer.clone() },
-            );
-        }
-    }
+            }
+        };
 
     let _ = app.emit(&done_event, DonePayload { id: id.clone() });
 
@@ -543,7 +652,7 @@ pub async fn translate(
     // Write back to the rolling context so the next translate call for this
     // target sees this pair as recent context. Skip if filtered as meta or
     // if the model returned an empty string (e.g. hallucination per rule 6).
-    let final_text = full_translation.trim().to_string();
+    let final_text = full_text.trim().to_string();
     guard.outcome = if is_meta {
         "filtered"
     } else if final_text.is_empty() {
@@ -739,11 +848,82 @@ fn build_slide_outline_system(target_label: &str, target: &str, glossary_block: 
     )
 }
 
+/// Outcome of draining one summary SSE stream.
+enum SummaryStreamOutcome {
+    /// Stream finished cleanly with the full accumulated markdown.
+    Completed(String),
+    /// Stream broke mid-flight; carries the error message.
+    Broken(String),
+}
+
+/// Drain one summary SSE stream: emit `summary:chunk` deltas, accumulate the
+/// full markdown, and feed usage / stop_reason / ttft into `guard`.
+async fn consume_summary_stream(
+    resp: Response,
+    app: &AppHandle,
+    session_id: &str,
+    target: &str,
+    guard: &mut TraceGuard,
+) -> SummaryStreamOutcome {
+    let mut stream = resp.bytes_stream().eventsource();
+    let mut full = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ev) => match ev.event.as_str() {
+                "message_start" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_start(&parsed);
+                    }
+                }
+                "message_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_delta(&parsed);
+                    }
+                }
+                "content_block_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        if let Some(delta) = parsed
+                            .get("delta")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|t| t.as_str())
+                        {
+                            guard.mark_ttft();
+                            full.push_str(delta);
+                            let _ = app.emit(
+                                "summary:chunk",
+                                SummaryChunk {
+                                    session_id: session_id.to_string(),
+                                    target: target.to_string(),
+                                    text: delta.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+                "message_stop" => break,
+                "error" => {
+                    return SummaryStreamOutcome::Broken(format!(
+                        "anthropic stream error: {}",
+                        ev.data
+                    ));
+                }
+                _ => {}
+            },
+            Err(e) => {
+                return SummaryStreamOutcome::Broken(format!("sse stream: {e}"));
+            }
+        }
+    }
+    SummaryStreamOutcome::Completed(full)
+}
+
 /// Stream a structured meeting summary for one session/target. Reads the
-/// session's zh transcript, calls Sonnet 4.6 with a fixed prompt, emits
+/// session's zh transcript, calls the configured summary model, emits
 /// `summary:chunk` events as text streams in, then writes the full markdown
 /// to `summary.{target}.md` in the session directory before emitting
-/// `summary:done`. On failure, emits `summary:error` and returns Err.
+/// `summary:done`. On a mid-stream break, retries once (emitting
+/// `summary:restart` so the UI clears its partial buffer). On failure, emits
+/// `summary:error` and returns Err.
 #[tauri::command]
 pub async fn generate_summary(
     app: AppHandle,
@@ -856,63 +1036,53 @@ pub async fn generate_summary(
         }
     };
 
-    let mut stream = resp.bytes_stream().eventsource();
-    let mut full = String::new();
-
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(ev) => match ev.event.as_str() {
-                "message_start" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_start(&parsed);
-                    }
-                }
-                "message_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_delta(&parsed);
-                    }
-                }
-                "content_block_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        if let Some(delta) = parsed
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                        {
-                            guard.mark_ttft();
-                            full.push_str(delta);
-                            let _ = app.emit(
-                                "summary:chunk",
-                                SummaryChunk {
-                                    session_id: session_id.clone(),
-                                    target: target.clone(),
-                                    text: delta.to_string(),
-                                },
+    let full = match consume_summary_stream(resp, &app, &session_id, &target, &mut guard).await {
+        SummaryStreamOutcome::Completed(full) => full,
+        SummaryStreamOutcome::Broken(err) => {
+            // The stream dropped mid-summary. Tell the UI to clear the partial
+            // it accumulated, then re-issue ONCE as a fresh stream so the new
+            // chunks don't append onto stale text.
+            let _ = app.emit(
+                "summary:restart",
+                json!({ "session_id": session_id, "target": target }),
+            );
+            let mut retry_attempts: u32 = 0;
+            match post_anthropic_with_retry(&api_key, &body, &mut retry_attempts).await {
+                Ok(resp2) => {
+                    guard.retries += 1 + retry_attempts;
+                    match consume_summary_stream(resp2, &app, &session_id, &target, &mut guard).await
+                    {
+                        SummaryStreamOutcome::Completed(full) => full,
+                        SummaryStreamOutcome::Broken(err2) => {
+                            errors::record(
+                                "summary_stream_broken",
+                                &format!("stream broke: {err}; re-stream failed: {err2}"),
+                                Some(json!({ "session_id": session_id, "target": target })),
                             );
+                            let _ = app.emit(
+                                "summary:error",
+                                json!({ "session_id": session_id, "target": target, "message": err2.clone() }),
+                            );
+                            return Err(err2);
                         }
                     }
                 }
-                "message_stop" => break,
-                "error" => {
-                    let msg = format!("anthropic stream error: {}", ev.data);
+                Err(e2) => {
+                    guard.retries += 1 + retry_attempts;
+                    errors::record(
+                        "summary_stream_broken",
+                        &format!("stream broke: {err}; re-post failed: {e2}"),
+                        Some(json!({ "session_id": session_id, "target": target })),
+                    );
                     let _ = app.emit(
                         "summary:error",
-                        json!({ "session_id": session_id, "target": target, "message": msg }),
+                        json!({ "session_id": session_id, "target": target, "message": e2.clone() }),
                     );
-                    return Err(msg);
+                    return Err(e2);
                 }
-                _ => {}
-            },
-            Err(e) => {
-                let msg = format!("sse stream: {e}");
-                let _ = app.emit(
-                    "summary:error",
-                    json!({ "session_id": session_id, "target": target, "message": msg }),
-                );
-                return Err(msg);
             }
         }
-    }
+    };
 
     if full.trim().is_empty() {
         guard.outcome = "empty";

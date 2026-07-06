@@ -476,6 +476,17 @@ export default function ControlWindow() {
         const u = pendingUtterancesRef.current.get(e.payload.id);
         if (u) u.vi += e.payload.text;
       }),
+      // Emitted when the streaming translate broke and a non-streaming retry
+      // produced the full text — REPLACE (not append) whatever partial the
+      // chunk handler accumulated. translation:done follows and finalizes.
+      listen<ChunkPayload>("translation:replace:en", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) u.en = e.payload.text;
+      }),
+      listen<ChunkPayload>("translation:replace:vi", (e) => {
+        const u = pendingUtterancesRef.current.get(e.payload.id);
+        if (u) u.vi = e.payload.text;
+      }),
       listen<DonePayload>("translation:done:en", (e) => {
         const u = pendingUtterancesRef.current.get(e.payload.id);
         if (u) {

@@ -33,6 +33,7 @@ const SUMMARY_TEMPLATES: Array<{
 type SummaryChunk = { session_id: string; target: SummaryLang; text: string };
 type SummaryDone = { session_id: string; target: SummaryLang; path: string };
 type SummaryError = { session_id: string; target: SummaryLang; message: string };
+type SummaryRestart = { session_id: string; target: SummaryLang };
 
 function formatStarted(iso: string): string {
   const d = new Date(iso);
@@ -162,6 +163,12 @@ export default function HistoryModal({
           ...s,
           [e.payload.target]: (s[e.payload.target] ?? "") + e.payload.text,
         }));
+      }),
+      // Emitted when a mid-stream break triggers a full re-stream: drop the
+      // partial we accumulated so the retry's chunks don't append onto it.
+      listen<SummaryRestart>("summary:restart", (e) => {
+        if (e.payload.session_id !== selectedIdRef.current) return;
+        setSummaries((s) => ({ ...s, [e.payload.target]: "" }));
       }),
       listen<SummaryDone>("summary:done", (e) => {
         if (e.payload.session_id !== selectedIdRef.current) return;

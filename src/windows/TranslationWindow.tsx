@@ -43,6 +43,19 @@ export default function TranslationWindow({ lang }: { lang: Lang }) {
           return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
         });
       }),
+      // Non-streaming retry after a mid-stream break: REPLACE the displayed
+      // text for this utterance rather than appending onto the partial.
+      listen<ChunkPayload>(`translation:replace:${lang}`, (e) => {
+        const { id, text } = e.payload;
+        setUtterances((us) => {
+          const idx = us.findIndex((u) => u.id === id);
+          if (idx === -1) {
+            return [...us, { id, zh: "", en: "", vi: "", [lang]: text }] as Utterance[];
+          }
+          const updated: Utterance = { ...us[idx], [lang]: text };
+          return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
+        });
+      }),
       listen("session:reset", () => {
         setUtterances([]);
       }),
