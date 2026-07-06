@@ -20,4 +20,11 @@ Python → Rust (events):
      "downloaded_bytes": int?, "total_bytes": int?}      -- present when state == "progress"
                                                           -- (model download only; missing dir → 0,
                                                           --  downloaded clamped ≤ 99% of total until done)
+    {"type": "diag", "gate": "...", "t_start": float|null, "detail": {...}}
+                                                          -- local backend only: one per gate skip.
+                                                          -- gate ∈ {min_speech, rms_floor, consistency,
+                                                          --  segment_confidence, hallucination_phrase,
+                                                          --  single_char_dominance}. detail carries the
+                                                          --  relevant numbers (no audio). Rust records
+                                                          --  these to traces.jsonl; not shown in the UI.
 """

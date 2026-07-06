@@ -1,5 +1,6 @@
 import sys
 from collections import Counter, deque
+from collections.abc import Callable
 
 import mlx.core as mx
 import numpy as np
@@ -147,11 +148,16 @@ class MLXWhisperSTT:
         model_repo: str | None = None,
         max_speech_sec: float = 8.0,
         initial_prompt: str | None = None,
+        on_diag: Callable[[str, float | None, dict], None] | None = None,
     ):
         self.language = language
         self.model_repo = model_repo or self.MODEL_REPO
         self.max_speech_sec = max_speech_sec
         self.initial_prompt = initial_prompt
+        # Optional sink for gate-skip diagnostics. When wired (by the sidecar)
+        # each skip is reported as a structured event; when None (CLI / tests)
+        # the legacy stderr lines are printed instead, so behavior is unchanged.
+        self._on_diag = on_diag
         self._vad_model = None
         # Adaptive noise floor — populated by stream() from windows that
         # silero-vad classifies as non-speech. Defaults to the static floor
@@ -185,15 +191,31 @@ class MLXWhisperSTT:
             p25 = float(np.percentile(self._noise_ring, 25))
             self._dynamic_threshold = max(RMS_NOISE_THRESHOLD, p25 * NOISE_MARGIN)
 
+    def _diag(
+        self, gate: str, t_start: float | None, detail: dict, stderr_msg: str
+    ) -> None:
+        """Report one gate skip. Routes to the injected on_diag callback when
+        present (structured event), otherwise prints the legacy stderr line so
+        the CLI keeps its current output. A failing callback is swallowed —
+        diagnostics must never break the transcription path."""
+        if self._on_diag is not None:
+            try:
+                self._on_diag(gate, t_start, detail)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            print(stderr_msg, file=sys.stderr)
+
     def _transcribe_audio(self, audio) -> str:
         # Gate 1a: segment-mean RMS. Skip segments quieter than the adaptive
         # noise floor without ever calling Whisper. Cheapest possible drop.
         if isinstance(audio, np.ndarray):
             rms = _segment_rms(audio)
             if rms < self._dynamic_threshold:
-                print(
+                self._diag(
+                    "rms_floor", None,
+                    {"rms": round(rms, 5), "threshold": round(self._dynamic_threshold, 5)},
                     f"[low-energy skipped] rms={rms:.4f} < {self._dynamic_threshold:.4f}",
-                    file=sys.stderr,
                 )
                 return ""
 
@@ -210,10 +232,13 @@ class MLXWhisperSTT:
                 chunk_rms = np.sqrt(np.mean(chunks ** 2, axis=1))
                 active_ratio = float((chunk_rms >= self._dynamic_threshold).mean())
                 if active_ratio < CONSISTENCY_MIN_ACTIVE_RATIO:
-                    print(
+                    self._diag(
+                        "consistency", None,
+                        {"active_ratio": round(active_ratio, 3),
+                         "min_ratio": CONSISTENCY_MIN_ACTIVE_RATIO,
+                         "n_chunks": n_chunks},
                         f"[low-consistency skipped] active_ratio={active_ratio:.2f} "
                         f"< {CONSISTENCY_MIN_ACTIVE_RATIO} ({n_chunks} chunks)",
-                        file=sys.stderr,
                     )
                     return ""
 
@@ -245,29 +270,34 @@ class MLXWhisperSTT:
         if segments:
             kept_texts: list[str] = []
             dropped_reasons: list[str] = []
+            dropped_details: list[dict] = []
             for seg in segments:
                 no_speech = float(seg.get("no_speech_prob", 0.0))
                 avg_logprob = float(seg.get("avg_logprob", 0.0))
                 compression = float(seg.get("compression_ratio", 0.0))
                 if no_speech > SEGMENT_NO_SPEECH_MAX:
                     dropped_reasons.append(f"no_speech={no_speech:.2f}")
+                    dropped_details.append({"no_speech_prob": round(no_speech, 3)})
                     continue
                 if avg_logprob < SEGMENT_AVG_LOGPROB_MIN:
                     dropped_reasons.append(f"logprob={avg_logprob:.2f}")
+                    dropped_details.append({"avg_logprob": round(avg_logprob, 3)})
                     continue
                 if compression > SEGMENT_COMPRESSION_RATIO_MAX:
                     dropped_reasons.append(f"compress={compression:.2f}")
+                    dropped_details.append({"compression_ratio": round(compression, 3)})
                     continue
                 t = str(seg.get("text", "")).strip()
                 if t:
                     kept_texts.append(t)
             text = " ".join(kept_texts).strip()
             if not text and dropped_reasons:
-                print(
+                self._diag(
+                    "segment_confidence", None,
+                    {"n_dropped": len(dropped_details), "dropped": dropped_details[:3]},
                     f"[low-confidence dropped] {len(dropped_reasons)} segments: "
                     f"{', '.join(dropped_reasons[:3])}"
                     + ("..." if len(dropped_reasons) > 3 else ""),
-                    file=sys.stderr,
                 )
         else:
             text = str(result.get("text", "")).strip()
@@ -276,9 +306,21 @@ class MLXWhisperSTT:
         # the long-form '謝謝觀看' / '示示示...' shapes the Whisper-internal
         # gates miss. Kept as the final safety net, not the primary defense.
         if _is_hallucination(text):
-            print(
-                f"[hallucination filtered] {text[:40]}{'...' if len(text) > 40 else ''}",
-                file=sys.stderr,
+            head = text[:40]
+            if _is_known_hallucination(text):
+                gate, detail = "hallucination_phrase", {"text_head": head}
+            else:
+                # Not a known phrase, so _is_hallucination fired on single-char
+                # dominance — recompute the ratio for the diagnostic.
+                chars = [c for c in text if not c.isspace()]
+                dominance = (
+                    Counter(chars).most_common(1)[0][1] / len(chars) if chars else 0.0
+                )
+                gate = "single_char_dominance"
+                detail = {"dominance": round(dominance, 3), "n_chars": len(chars), "text_head": head}
+            self._diag(
+                gate, None, detail,
+                f"[hallucination filtered] {head}{'...' if len(text) > 40 else ''}",
             )
             return ""
         return text
@@ -337,11 +379,12 @@ class MLXWhisperSTT:
                     # Gate 0: minimum speech duration. silero occasionally
                     # opens-and-closes within ~100 ms on a sharp click; a real
                     # syllable can't fit in that window. Drop pre-Whisper.
-                    if len(full_audio) / sample_rate < MIN_SPEECH_SEC:
-                        print(
-                            f"[short-speech skipped] {len(full_audio) / sample_rate:.2f}s "
-                            f"< {MIN_SPEECH_SEC}s",
-                            file=sys.stderr,
+                    dur = len(full_audio) / sample_rate
+                    if dur < MIN_SPEECH_SEC:
+                        self._diag(
+                            "min_speech", speech_start_sec,
+                            {"duration_sec": round(dur, 3), "min_sec": MIN_SPEECH_SEC},
+                            f"[short-speech skipped] {dur:.2f}s < {MIN_SPEECH_SEC}s",
                         )
                         speech_buffer = []
                         in_speech = False

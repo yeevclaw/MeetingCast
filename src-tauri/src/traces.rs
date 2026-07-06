@@ -2,6 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::config_dir;
@@ -77,6 +78,48 @@ pub fn record(rec: TraceRecord) {
     let Ok(line) = serde_json::to_string(&rec) else {
         return;
     };
+    append_line(&line);
+}
+
+/// One STT hallucination-gate skip forwarded by the sidecar. Shares
+/// traces.jsonl (and its rotation) with the API-call `TraceRecord` — the
+/// `kind` field ("stt_diag") disambiguates the two record shapes on read.
+/// Observe-only: recorded for offline gate tuning, never surfaced in the UI.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DiagRecord {
+    ts: String,
+    /// Always "stt_diag".
+    kind: String,
+    /// Which gate skipped the segment (min_speech / rms_floor / consistency /
+    /// segment_confidence / hallucination_phrase / single_char_dominance).
+    gate: String,
+    /// Utterance start time in seconds, when the gate site knows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    t_start: Option<f64>,
+    /// Small dict of the numbers that triggered the skip (no audio data).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<serde_json::Value>,
+}
+
+/// Append one STT gate-skip diagnostic to traces.jsonl. Best-effort, same as
+/// `record`.
+pub fn record_diag(gate: &str, t_start: Option<f64>, detail: Option<serde_json::Value>) {
+    let rec = DiagRecord {
+        ts: Utc::now().to_rfc3339(),
+        kind: "stt_diag".into(),
+        gate: gate.to_string(),
+        t_start,
+        detail,
+    };
+    let Ok(line) = serde_json::to_string(&rec) else {
+        return;
+    };
+    append_line(&line);
+}
+
+/// Shared append path used by both record writers: ensure dir, rotate if
+/// oversized, append one line. Best-effort — any IO failure is dropped.
+fn append_line(line: &str) {
     let path = trace_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -143,5 +186,26 @@ mod tests {
         assert_eq!(back.kind, "translate");
         assert_eq!(back.total_ms, 640);
         assert!(back.ttft_ms.is_none());
+    }
+
+    #[test]
+    fn diag_record_serializes_with_kind_and_omits_none() {
+        let rec = DiagRecord {
+            ts: "2026-07-06T00:00:00+00:00".into(),
+            kind: "stt_diag".into(),
+            gate: "rms_floor".into(),
+            t_start: None,
+            detail: Some(serde_json::json!({ "rms": 0.001, "threshold": 0.005 })),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"kind\":\"stt_diag\""));
+        assert!(json.contains("\"gate\":\"rms_floor\""));
+        assert!(json.contains("\"rms\":0.001"));
+        // None fields are skipped, not emitted as null.
+        assert!(!json.contains("t_start"));
+        let back: DiagRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.gate, "rms_floor");
+        assert!(back.t_start.is_none());
+        assert!(back.detail.is_some());
     }
 }

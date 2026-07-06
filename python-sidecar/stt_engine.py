@@ -51,6 +51,13 @@ def emit(event: dict) -> None:
         sys.stdout.flush()
 
 
+def _emit_diag(gate: str, t_start: float | None, detail: dict) -> None:
+    """Callback wired into the local STT backend: turns a hallucination-gate
+    skip into a line-delimited `diag` event. Runs on the event-loop thread
+    (inside the stream generator); emit()'s lock keeps the write safe anyway."""
+    emit({"type": "diag", "gate": gate, "t_start": t_start, "detail": detail})
+
+
 async def stdin_lines():
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
@@ -147,8 +154,12 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
         # boost mechanism that we can wire later. Avoid passing the kwarg so
         # we don't break DeepgramSTT's __init__ signature.
         backend_kwargs = {"language": language}
-        if backend_name == "local" and initial_prompt:
-            backend_kwargs["initial_prompt"] = initial_prompt
+        if backend_name == "local":
+            # Only the local backend has hallucination gates — route their
+            # skip diagnostics out as `diag` events. Cloud backends ignore it.
+            backend_kwargs["on_diag"] = _emit_diag
+            if initial_prompt:
+                backend_kwargs["initial_prompt"] = initial_prompt
         stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on

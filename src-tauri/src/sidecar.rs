@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use crate::config::SharedConfig;
 use crate::errors;
 use crate::session::{self, SharedRecorder};
+use crate::traces;
 
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
@@ -73,6 +74,16 @@ pub enum SidecarEvent {
     },
     Error {
         message: String,
+    },
+    /// A local-backend hallucination-gate skip. Recorded to traces.jsonl for
+    /// offline tuning — deliberately NOT forwarded to the frontend, and (being
+    /// a non-transcript) it must never reset the idle-activity clock.
+    Diag {
+        gate: String,
+        #[serde(default)]
+        t_start: Option<f64>,
+        #[serde(default)]
+        detail: Option<serde_json::Value>,
     },
 }
 
@@ -321,6 +332,11 @@ async fn spawn_inner_body(
                                 },
                             );
                         }
+                        // Persist to traces.jsonl only. No frontend event and
+                        // no idle-clock reset (see the Diag variant docs).
+                        SidecarEvent::Diag { gate, t_start, detail } => {
+                            traces::record_diag(&gate, t_start, detail);
+                        }
                         other => emit_event(&app_o, other),
                     }
                 }
@@ -478,6 +494,8 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         }
         // Routed via the oneshot in the stdout reader — should never reach here.
         SidecarEvent::Devices { .. } => Ok(()),
+        // Recorded to traces.jsonl in the stdout reader — never emitted.
+        SidecarEvent::Diag { .. } => Ok(()),
     };
 }
 
