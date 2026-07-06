@@ -122,7 +122,12 @@ impl Drop for TraceGuard {
 /// most recent sentence anyway.
 const CONTEXT_PAIRS: usize = 2;
 
-pub type TranslationContext = Arc<Mutex<HashMap<String, VecDeque<(String, String)>>>>;
+/// Per target: rolling window of `(t_start, zh source, target translation)`,
+/// kept sorted ascending by `t_start`. The leading `t_start` lets write-back
+/// order entries by utterance time rather than by completion order — parallel
+/// translate calls can finish out of order, and without the key the context
+/// would scramble (a later-finishing earlier utterance would look "newer").
+pub type TranslationContext = Arc<Mutex<HashMap<String, VecDeque<(f64, String, String)>>>>;
 
 pub fn new_context() -> TranslationContext {
     Arc::new(Mutex::new(HashMap::new()))
@@ -259,12 +264,12 @@ const SYSTEM_TEMPLATE: &str = "你是專業即時會議口譯員。將使用者�
 /// Wrap the source text with the most recent (zh, translated) pairs for this
 /// target, so Claude has pronoun + term continuity. Empty context returns
 /// the text unchanged so we don't pay tokens for a useless wrapper.
-fn build_user_message(text: &str, lang_label: &str, history: &VecDeque<(String, String)>) -> String {
+fn build_user_message(text: &str, lang_label: &str, history: &VecDeque<(f64, String, String)>) -> String {
     if history.is_empty() {
         return text.to_string();
     }
     let mut s = String::from("<context>\n");
-    for (zh, tgt) in history {
+    for (_, zh, tgt) in history {
         s.push_str("zh: ");
         s.push_str(zh);
         s.push('\n');
@@ -375,7 +380,7 @@ pub async fn translate(
         return Err("Anthropic API key not configured (open Settings)".into());
     }
 
-    let history_snapshot: VecDeque<(String, String)> = {
+    let history_snapshot: VecDeque<(f64, String, String)> = {
         let map = ctx.lock().await;
         map.get(&target).cloned().unwrap_or_default()
     };
@@ -532,7 +537,19 @@ pub async fn translate(
     if !is_meta && !final_text.is_empty() {
         let mut map = ctx.lock().await;
         let entry = map.entry(target.clone()).or_insert_with(VecDeque::new);
-        entry.push_back((text.clone(), final_text));
+        // Insert ordered by t_start (the id is the stringified t_start). On an
+        // unparseable id, treat this entry as newest. Trimming from the front
+        // keeps the most recent CONTEXT_PAIRS — and if this entry is older than
+        // everything already kept in a full deque, the insert-then-trim drops
+        // it right back off, so stale late arrivals don't evict fresher context.
+        let t_start = id
+            .parse::<f64>()
+            .unwrap_or_else(|_| entry.back().map(|(k, _, _)| k + 1.0).unwrap_or(0.0));
+        let pos = entry
+            .iter()
+            .position(|(k, _, _)| *k > t_start)
+            .unwrap_or(entry.len());
+        entry.insert(pos, (t_start, text.clone(), final_text));
         while entry.len() > CONTEXT_PAIRS {
             entry.pop_front();
         }
