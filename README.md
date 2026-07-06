@@ -93,6 +93,15 @@ mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak
 
 才會 fallback 到 venv Python。
 
+### 測試
+
+```bash
+cd src-tauri && cargo test                                      # Rust：sidecar / verify / config / traces
+cd prototype && .venv/bin/python -m unittest discover -s ../tests/python   # Python：STT hallucination gate + eval checks
+```
+
+翻譯 prompt 的離線回歸與 A/B：`prototype/eval/run_eval.py`（先 `--dry-run` 看成本，不碰網路）。細節見 [docs/LOOP_ENGINEERING.md](docs/LOOP_ENGINEERING.md)。
+
 ### 打包 .dmg
 
 完整 SOP 在 [CLAUDE.md](CLAUDE.md#包版-sopmacos-dmg-ship-流程)（必須照走，跳步會 ship 出壞檔）：
