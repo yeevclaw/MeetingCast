@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::{Client, Response};
@@ -13,6 +14,106 @@ use tokio::sync::Mutex;
 use crate::config::SharedConfig;
 use crate::errors;
 use crate::session;
+use crate::traces::{self, TraceRecord};
+
+/// Accumulates per-request trace state (latency, token usage, cache activity,
+/// outcome) and flushes exactly one `TraceRecord` on drop — so every exit path
+/// of `translate` / `generate_summary`, including early `?`/`return Err`, gets
+/// recorded without a `record()` call before each return. `outcome` defaults
+/// to "error"; the happy path overwrites it before returning.
+struct TraceGuard {
+    kind: &'static str,
+    id: String,
+    target: String,
+    model: String,
+    start: Instant,
+    ttft_ms: Option<u64>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    stop_reason: Option<String>,
+    retries: u32,
+    outcome: &'static str,
+}
+
+impl TraceGuard {
+    fn new(kind: &'static str, id: String, target: String, model: String) -> Self {
+        Self {
+            kind,
+            id,
+            target,
+            model,
+            start: Instant::now(),
+            ttft_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            stop_reason: None,
+            retries: 0,
+            outcome: "error",
+        }
+    }
+
+    fn mark_ttft(&mut self) {
+        if self.ttft_ms.is_none() {
+            self.ttft_ms = Some(self.start.elapsed().as_millis() as u64);
+        }
+    }
+
+    /// Record usage counters from a `message_start` event's `message.usage`.
+    fn absorb_message_start(&mut self, parsed: &Value) {
+        if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
+            self.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+            self.cache_creation_input_tokens = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64());
+            self.cache_read_input_tokens = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64());
+        }
+    }
+
+    /// Record cumulative output tokens + stop_reason from a `message_delta`.
+    fn absorb_message_delta(&mut self, parsed: &Value) {
+        if let Some(out) = parsed
+            .get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            self.output_tokens = Some(out);
+        }
+        if let Some(sr) = parsed
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|v| v.as_str())
+        {
+            self.stop_reason = Some(sr.to_string());
+        }
+    }
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        traces::record(TraceRecord {
+            ts: Utc::now().to_rfc3339(),
+            kind: self.kind.to_string(),
+            id: self.id.clone(),
+            target: self.target.clone(),
+            model: self.model.clone(),
+            ttft_ms: self.ttft_ms,
+            total_ms: self.start.elapsed().as_millis() as u64,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            stop_reason: self.stop_reason.clone(),
+            retries: self.retries,
+            outcome: self.outcome.to_string(),
+        });
+    }
+}
 
 /// Last N (zh source, target translation) pairs, per target language. Used
 /// as light context (pronoun resolution, term consistency) on each new
@@ -58,10 +159,17 @@ const RETRY_BACKOFF_MS: &[u64] = &[250, 750];
 /// (HTTP 429 rate-limit, 503 unavailable). Other 4xx/5xx surface
 /// immediately — retrying a 401 or 400 just produces the same answer
 /// while spending more wallclock against the user's perceived latency.
-async fn post_anthropic_with_retry(api_key: &str, body: &Value) -> Result<Response, String> {
+async fn post_anthropic_with_retry(
+    api_key: &str,
+    body: &Value,
+    retries: &mut u32,
+) -> Result<Response, String> {
     let client = Client::new();
     let mut last_err: String = "no attempts made".into();
     for attempt in 0..=RETRY_BACKOFF_MS.len() {
+        // Report attempts performed regardless of eventual success/failure so
+        // the caller's trace records the true retry count on every exit path.
+        *retries = attempt as u32;
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS[attempt - 1])).await;
         }
@@ -250,7 +358,8 @@ pub async fn translate(
         "messages": [{"role": "user", "content": user_message}]
     });
 
-    let resp = match post_anthropic_with_retry(&api_key, &body).await {
+    let mut guard = TraceGuard::new("translate", id.clone(), target.clone(), model.clone());
+    let resp = match post_anthropic_with_retry(&api_key, &body, &mut guard.retries).await {
         Ok(r) => r,
         Err(msg) => {
             errors::record(
@@ -283,6 +392,16 @@ pub async fn translate(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => match ev.event.as_str() {
+                "message_start" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_start(&parsed);
+                    }
+                }
+                "message_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_delta(&parsed);
+                    }
+                }
                 "content_block_delta" => {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
                         if let Some(delta) = parsed
@@ -290,6 +409,7 @@ pub async fn translate(
                             .and_then(|d| d.get("text"))
                             .and_then(|t| t.as_str())
                         {
+                            guard.mark_ttft();
                             if decided {
                                 full_translation.push_str(delta);
                                 if !is_meta {
@@ -364,6 +484,13 @@ pub async fn translate(
     // target sees this pair as recent context. Skip if filtered as meta or
     // if the model returned an empty string (e.g. hallucination per rule 6).
     let final_text = full_translation.trim().to_string();
+    guard.outcome = if is_meta {
+        "filtered"
+    } else if final_text.is_empty() {
+        "empty"
+    } else {
+        "ok"
+    };
     if !is_meta && !final_text.is_empty() {
         let mut map = ctx.lock().await;
         let entry = map.entry(target.clone()).or_insert_with(VecDeque::new);
@@ -623,7 +750,13 @@ pub async fn generate_summary(
         "messages": [{"role": "user", "content": user_text}]
     });
 
-    let resp = match post_anthropic_with_retry(&api_key, &body).await {
+    let mut guard = TraceGuard::new(
+        "summary",
+        session_id.clone(),
+        target.clone(),
+        SUMMARY_MODEL.to_string(),
+    );
+    let resp = match post_anthropic_with_retry(&api_key, &body, &mut guard.retries).await {
         Ok(r) => r,
         Err(msg) => {
             errors::record(
@@ -645,6 +778,16 @@ pub async fn generate_summary(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => match ev.event.as_str() {
+                "message_start" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_start(&parsed);
+                    }
+                }
+                "message_delta" => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
+                        guard.absorb_message_delta(&parsed);
+                    }
+                }
                 "content_block_delta" => {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
                         if let Some(delta) = parsed
@@ -652,6 +795,7 @@ pub async fn generate_summary(
                             .and_then(|d| d.get("text"))
                             .and_then(|t| t.as_str())
                         {
+                            guard.mark_ttft();
                             full.push_str(delta);
                             let _ = app.emit(
                                 "summary:chunk",
@@ -687,6 +831,7 @@ pub async fn generate_summary(
     }
 
     if full.trim().is_empty() {
+        guard.outcome = "empty";
         let msg = "模型回傳空內容".to_string();
         let _ = app.emit(
             "summary:error",
@@ -720,6 +865,7 @@ pub async fn generate_summary(
         );
     }
 
+    guard.outcome = "ok";
     let _ = app.emit(
         "summary:done",
         SummaryDone {

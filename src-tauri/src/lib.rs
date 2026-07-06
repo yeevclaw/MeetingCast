@@ -10,6 +10,7 @@ mod errors;
 mod keycheck;
 mod session;
 mod sidecar;
+mod traces;
 mod translator;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
