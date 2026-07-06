@@ -139,13 +139,13 @@ export default function ControlWindow() {
       .catch(() => setSidecarReady(true));
   }, []);
 
-  useEffect(() => {
-    // Acquire microphone permission AT APP LAUNCH instead of on the user's
-    // first 開始錄音 click. getUserMedia triggers macOS's privacy prompt
-    // for the .app bundle; once granted, the sidecar subprocess inherits
-    // permission and opens its own InputStream without re-prompting. We
-    // immediately stop the tracks because we only needed the permission,
-    // not the audio data.
+  // Probe microphone permission / availability. getUserMedia triggers
+  // macOS's privacy prompt for the .app bundle; once granted, the sidecar
+  // subprocess inherits permission and opens its own InputStream without
+  // re-prompting. We immediately stop the tracks because we only needed
+  // the permission, not the audio data. Reused by the mount effect, the
+  // banner's 重新檢查 button, and the window-focus re-check.
+  const probeMic = useCallback(() => {
     if (!navigator.mediaDevices?.getUserMedia) {
       // Fallback: check device availability via enumerateDevices (no prompt).
       navigator.mediaDevices
@@ -165,6 +165,12 @@ export default function ControlWindow() {
         setMicAvailable(false);
       });
   }, []);
+
+  useEffect(() => {
+    // Acquire microphone permission AT APP LAUNCH instead of on the user's
+    // first 開始錄音 click.
+    probeMic();
+  }, [probeMic]);
 
   useEffect(() => {
     runningRef.current = running;
@@ -597,6 +603,16 @@ export default function ControlWindow() {
   const micMissing = micAvailable === false && useMic;
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
 
+  // While the mic banner is showing, re-probe whenever the window regains
+  // focus — the user likely just flipped the toggle in System Settings and
+  // came back. No periodic polling; focus is the only trigger.
+  useEffect(() => {
+    if (!micMissing) return;
+    const onFocus = () => probeMic();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [micMissing, probeMic]);
+
   const retryPrewarm = useCallback(async () => {
     setRetryingPrewarm(true);
     setStepStatus({ spawn: "in_progress", model: "pending", mic: "pending" });
@@ -620,10 +636,27 @@ export default function ControlWindow() {
 
       {micMissing && (
         <div className="mx-4 mb-3 rounded-2xl border border-warn-200 bg-warn-50 px-4 py-3 text-sm">
-          <p className="font-medium text-warn-900">未偵測到麥克風</p>
+          <p className="font-medium text-warn-900">無法使用麥克風</p>
           <p className="mt-0.5 text-xs text-warn-700">
-            請確認麥克風已接好、系統設定有授權；或暫時取消下方麥克風選項改用 demo 檔測試
+            請確認麥克風已接上，並在 系統設定 → 隱私權與安全性 → 麥克風 允許
+            MeetingCast。授權後若仍顯示此訊息，請重新啟動 App（macOS 的限制）。
           </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              className="rounded border border-warn-200 bg-white px-2.5 py-1 text-xs font-medium text-warn-900 hover:bg-warn-50"
+              onClick={() => invoke("open_mic_settings").catch(() => {})}
+              type="button"
+            >
+              打開系統設定
+            </button>
+            <button
+              className="rounded border border-warn-200 px-2.5 py-1 text-xs text-warn-700 hover:bg-warn-50 hover:text-warn-900"
+              onClick={probeMic}
+              type="button"
+            >
+              重新檢查
+            </button>
+          </div>
         </div>
       )}
 

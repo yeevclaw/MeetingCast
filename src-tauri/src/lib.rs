@@ -60,6 +60,7 @@ pub fn run() {
             keycheck::validate_deepgram_key,
             errors::open_config_folder,
             errors::open_errors_log,
+            errors::open_mic_settings,
             session::session_append_utterance,
             session::list_sessions,
             session::get_session_transcript,

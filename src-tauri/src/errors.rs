@@ -39,6 +39,17 @@ pub async fn open_config_folder() -> Result<(), String> {
     Ok(())
 }
 
+/// Deep-link into macOS System Settings → Privacy & Security → Microphone
+/// so the user can grant MeetingCast mic access without hunting for the pane.
+#[tauri::command]
+pub async fn open_mic_settings() -> Result<(), String> {
+    Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        .spawn()
+        .map_err(|e| format!("open: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn open_errors_log() -> Result<(), String> {
     let path = log_path();
