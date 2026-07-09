@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 mod config;
 mod errors;
 mod keycheck;
+mod languages;
 mod session;
 mod sidecar;
 mod traces;

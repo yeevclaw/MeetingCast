@@ -1,0 +1,62 @@
+[
+  {
+    "code": "zh",
+    "native_name": "繁體中文",
+    "zh_ui_name": "中文",
+    "prompt_name": "Traditional Chinese (繁體中文)",
+    "deepgram_code": "zh",
+    "whisper_code": "zh",
+    "script_profile": "han",
+    "carrier": "本段語音可能包含以下術語：{terms}。",
+    "term_join": "、",
+    "empty_state": {
+      "waiting": "錄音開始後，譯文會顯示在這裡",
+      "hint": "請在控制視窗按「開始錄音」"
+    }
+  },
+  {
+    "code": "en",
+    "native_name": "English",
+    "zh_ui_name": "英文",
+    "prompt_name": "English",
+    "deepgram_code": "en",
+    "whisper_code": "en",
+    "script_profile": "latin",
+    "carrier": "This recording may contain the following terms: {terms}.",
+    "term_join": ", ",
+    "empty_state": {
+      "waiting": "Translation will appear here once recording starts",
+      "hint": "Press Start in the control window"
+    }
+  },
+  {
+    "code": "ja",
+    "native_name": "日本語",
+    "zh_ui_name": "日文",
+    "prompt_name": "Japanese (日本語)",
+    "deepgram_code": "ja",
+    "whisper_code": "ja",
+    "script_profile": "japanese",
+    "carrier": "この音声には以下の用語が含まれる可能性があります：{terms}。",
+    "term_join": "、",
+    "empty_state": {
+      "waiting": "録音を開始すると、翻訳がここに表示されます",
+      "hint": "コントロールウィンドウで「開始」を押してください"
+    }
+  },
+  {
+    "code": "vi",
+    "native_name": "Tiếng Việt",
+    "zh_ui_name": "越南文",
+    "prompt_name": "Vietnamese (Tiếng Việt)",
+    "deepgram_code": "vi",
+    "whisper_code": "vi",
+    "script_profile": "latin",
+    "carrier": "Đoạn ghi âm này có thể chứa các thuật ngữ sau: {terms}.",
+    "term_join": ", ",
+    "empty_state": {
+      "waiting": "Bản dịch sẽ hiện ở đây khi bắt đầu ghi âm",
+      "hint": "Bấm Bắt đầu ở cửa sổ điều khiển"
+    }
+  }
+]
