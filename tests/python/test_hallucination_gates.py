@@ -275,6 +275,46 @@ class TestWrongLanguage(unittest.TestCase):
     def test_zh_target_never_flags(self):
         self.assertFalse(is_wrong_language("整段都是中文的內容不會被判定", "zh"))
 
+    # --- C4 canonical branches per script profile (mirror verify.rs). The
+    # philosophy is "never kill a real translation", so the True cases are
+    # unambiguously the wrong language and the False cases are legit output.
+
+    def test_en_target_kana_dominant_is_true(self):
+        # Model stayed in Japanese for an English slot — latin profile flags
+        # (han+kana)/total > 0.5.
+        self.assertTrue(is_wrong_language("これは翻訳されていない日本語の文章です", "en"))
+
+    def test_zh_target_english_reply_is_true(self):
+        # English reply for a Chinese slot — han profile: latin-dominant with
+        # almost no han.
+        self.assertTrue(is_wrong_language("This is the full summary of today's meeting.", "zh"))
+
+    def test_zh_target_kana_heavy_is_true(self):
+        # Japanese reply for a Chinese slot — han profile: kana/total > 0.3.
+        self.assertTrue(is_wrong_language("これは今日の会議のまとめです", "zh"))
+
+    def test_ja_target_english_reply_is_true(self):
+        # English reply for a Japanese slot — japanese profile: latin-dominant
+        # with < 0.1 han+kana.
+        self.assertTrue(is_wrong_language("This is the full English summary of the meeting.", "ja"))
+
+    def test_ja_target_mixed_latin_legit_is_false(self):
+        # Legit Japanese carrying English product names must survive — the
+        # < 0.1 han+kana clause protects it (here han+kana is ~0.23).
+        self.assertFalse(is_wrong_language("MeetingCastとGoogle Slidesを統合します", "ja"))
+
+    def test_ja_target_long_kana_free_han_is_true(self):
+        # 20+ chars, zero kana, han-dominant = a Chinese reply for a Japanese
+        # slot (a real Japanese sentence of this length always carries kana).
+        self.assertTrue(
+            is_wrong_language("我们今天在这个会议上讨论了下一季度的预算和市场营销问题", "ja")
+        )
+
+    def test_ja_target_short_all_kanji_is_false(self):
+        # Below the 20-char Chinese-reply threshold — a short kanji-only
+        # fragment is not killed.
+        self.assertFalse(is_wrong_language("会議予算議題確認事項報告", "ja"))
+
 
 class TestMetaMarkers(unittest.TestCase):
     def test_english_meta_hit(self):

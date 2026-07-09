@@ -23,3 +23,17 @@
 {"id": "ord_new_clients", "category": "ordinary", "zh": "這一季我們新增了 15 個客戶", "targets": ["en", "vi"], "expect": {"contains": {"en": ["15"], "vi": ["15"]}}}
 {"id": "ord_meeting_minutes", "category": "ordinary", "zh": "散會之前請大家再確認一次會議記錄", "targets": ["en"], "expect": {"contains": {"en": ["meeting"]}}}
 {"id": "ord_satisfaction", "category": "ordinary", "zh": "第一季我們的目標是把客戶滿意度做到 90 分", "targets": ["en", "vi"], "expect": {"contains": {"en": ["90"], "vi": ["90"]}}}
+{"id": "ja_zh_basic", "category": "ordinary", "source_lang": "ja", "source": "来期の予算について会議で話し合いました。", "targets": ["zh"], "expect": {"contains": {"zh": ["預算"]}}}
+{"id": "ja_zh_numbers", "category": "ordinary", "source_lang": "ja", "source": "2026年の売上は前年より20%増加する見込みです。", "targets": ["zh"], "expect": {"contains": {"zh": ["2026", "20"]}}}
+{"id": "ja_zh_polite", "category": "rule5_self_ref", "source_lang": "ja", "source": "お忙しいところ恐れ入りますが、ご確認いただけますと幸いです。", "targets": ["zh"], "expect": {"non_empty": true, "not_contains": {"zh": ["我無法翻譯", "請提供", "空字串"]}}}
+{"id": "ja_en_basic", "category": "ordinary", "source_lang": "ja", "source": "本日の会議では新しいマーケティング戦略について議論しました。", "targets": ["en"], "expect": {"contains": {"en": ["marketing"]}, "max_cjk_ratio": 0.3}}
+{"id": "ja_en_proper_noun", "category": "rule3_proper_noun", "source_lang": "ja", "source": "新しい会議アプリのMeetingCastを来月リリースする予定です。", "targets": ["en"], "expect": {"contains": {"en": ["MeetingCast"]}}}
+{"id": "ja_zh_glossary", "category": "glossary", "source_lang": "ja", "source": "今回のプロジェクトではリスクヘッジが最も重要な課題です。", "targets": ["zh"], "glossary": [{"term": "リスクヘッジ", "translations": {"zh": "風險對沖"}}], "expect": {"contains": {"zh": ["風險對沖"]}}}
+{"id": "ja_repeat_hallucination", "category": "rule6_repeat", "source_lang": "ja", "source": "ああああああああああああああああああああああああああああああ", "targets": ["zh", "en"], "expect": {"empty": true}}
+{"id": "ja_meta_avoidance", "category": "rule7_8_meta", "source_lang": "ja", "source": "えーと あの qwerty ？？ zxcv うーん なんか", "targets": ["en"], "expect": {"not_contains": {"en": ["Please provide", "I'd be happy", "Could you", "Vui lòng", "Tôi không thể", "無法翻譯"]}}}
+{"id": "zh_ja_basic", "category": "ordinary", "source_lang": "zh", "source": "下週的會議我們要討論明年的預算分配計畫", "targets": ["ja"], "expect": {"non_empty": true}}
+{"id": "zh_ja_glossary", "category": "glossary", "source_lang": "zh", "source": "老師今天要講解紫微斗數的命盤怎麼看", "targets": ["ja"], "glossary": [{"term": "紫微斗數", "translations": {"ja": "紫微斗数"}}], "expect": {"contains": {"ja": ["紫微斗数"]}}}
+{"id": "zh_ja_numbers", "category": "ordinary", "source_lang": "zh", "source": "第二季的銷售額成長了百分之二十", "targets": ["ja"], "expect": {"contains": {"ja": ["20"]}}}
+{"id": "en_ja_basic", "category": "ordinary", "source_lang": "en", "source": "Let's review the quarterly budget in tomorrow's meeting.", "targets": ["ja"], "expect": {"non_empty": true}}
+{"id": "en_ja_action_item", "category": "ordinary", "source_lang": "en", "source": "Action item: send the MeetingCast demo to the client before Friday.", "targets": ["ja"], "expect": {"contains": {"ja": ["MeetingCast"]}}}
+{"id": "ja_en_context", "category": "rule9_context", "source_lang": "ja", "source": "明日は引き続き予算の件について議論しましょう。", "targets": ["en"], "context": [{"source": "量子コンピュータの応用について話しました。", "translation": "We discussed the applications of quantum computers"}, {"source": "この分野は多くの研究開発資金が必要です。", "translation": "This direction needs a lot of R&D funding"}], "expect": {"not_contains": {"en": ["quantum"]}}}
