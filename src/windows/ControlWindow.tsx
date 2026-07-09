@@ -12,11 +12,11 @@ import PrewarmChecklist, {
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { friendly } from "@/lib/errors";
+import { LANGS, zhName } from "@/lib/languages";
 import type {
   ChunkPayload,
   Config,
   DonePayload,
-  Lang,
   Source,
   TranscriptPayload,
 } from "@/lib/types";
@@ -80,7 +80,10 @@ export default function ControlWindow() {
   const [useMic, setUseMic] = useState(true);
   const [selectedDevice, setSelectedDevice] = useState<string>("");
   const [micAvailable, setMicAvailable] = useState<boolean | null>(null);
-  const [latestZh, setLatestZh] = useState<string>("");
+  const [latestSrc, setLatestSrc] = useState<string>("");
+  // Source language mirrored into state so the transcript panel's badge
+  // re-renders on change; the ref below is the live copy handlers read.
+  const [sourceLang, setSourceLang] = useState("zh");
   const [history, setHistory] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -120,6 +123,44 @@ export default function ControlWindow() {
   const hasHistoryRef = useRef(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Live language selection (source + two target slots). Kept in a ref so
+  // event handlers read the current value without re-subscribing; the source
+  // is mirrored into `sourceLang` state for the badge.
+  const langCfgRef = useRef<{ source: string; slots: [string, string] }>({
+    source: "zh",
+    slots: ["en", "vi"],
+  });
+  const applyLangCfg = useCallback((cfg: Config) => {
+    const source = cfg.language?.source ?? "zh";
+    const slots = cfg.language?.target_slots ?? ["en", "vi"];
+    langCfgRef.current = { source, slots: [slots[0] ?? "", slots[1] ?? ""] };
+    setSourceLang(source);
+  }, []);
+  // Target languages we actually translate to: non-empty, not equal to the
+  // source, deduped (slot order preserved).
+  const enabledTargets = useCallback((): string[] => {
+    const { source, slots } = langCfgRef.current;
+    const out: string[] = [];
+    for (const s of slots) {
+      if (s && s !== source && !out.includes(s)) out.push(s);
+    }
+    return out;
+  }, []);
+  // Which window label carries a target language, or null if neither slot does.
+  const slotLabelFor = useCallback((lang: string): "t1" | "t2" | null => {
+    const { slots } = langCfgRef.current;
+    if (slots[0] === lang) return "t1";
+    if (slots[1] === lang) return "t2";
+    return null;
+  }, []);
+  const restartClearNotice = (): string => {
+    const src = zhName(langCfgRef.current.source);
+    const targets = enabledTargets();
+    return targets.length === 0
+      ? `繼續會清除目前的${src}逐字稿與譯文。`
+      : `繼續會清除目前的${src}逐字稿與${targets.map(zhName).join("／")}譯文。`;
+  };
+
   useEffect(() => {
     // First-run detection: show wizard until onboarding has been completed
     // (or skipped) once. Existing users who already have a key configured
@@ -130,6 +171,7 @@ export default function ControlWindow() {
           setNeedsWelcome(cfg);
         }
         setSelectedDevice(cfg.audio?.input_device ?? "");
+        applyLangCfg(cfg);
       })
       .catch(() => {
         // If config fetch fails, don't block the UI; user can still hit Settings.
@@ -147,7 +189,7 @@ export default function ControlWindow() {
         }
       })
       .catch(() => setSidecarReady(true));
-  }, []);
+  }, [applyLangCfg]);
 
   // Probe microphone permission / availability. getUserMedia triggers
   // macOS's privacy prompt for the .app bundle; once granted, the sidecar
@@ -229,21 +271,19 @@ export default function ControlWindow() {
   // Track translation windows the user has closed so we (a) skip the
   // translate API call (no point paying tokens for a destination nobody can
   // see) and (b) toast exactly once per language so the user knows why
-  // half the translations stopped.
-  const closedLangsNotifiedRef = useRef<Set<Lang>>(new Set());
+  // that language's translations stopped.
+  const closedLangsNotifiedRef = useRef<Set<string>>(new Set());
 
-  // Buffer for utterances waiting on their en/vi translations. Each entry is
-  // appended to the session's transcript.jsonl exactly once — when both langs
-  // finish (or are skipped because the window is closed / text is too short),
-  // or when the user stops recording (in which case the row gets incomplete=true).
+  // Buffer for utterances waiting on their translations. Each entry is
+  // appended to the session's transcript.jsonl exactly once — when every
+  // enabled target finishes (or is skipped because the window is closed), or
+  // when the user stops recording (in which case the row gets incomplete=true).
+  // `translations` is keyed by the enabled targets snapshotted at seat time.
   type PendingUtterance = {
-    zh: string;
-    en: string;
-    vi: string;
+    src: string;
     t_start: number;
     t_end: number;
-    enDone: boolean;
-    viDone: boolean;
+    translations: Record<string, { text: string; done: boolean }>;
   };
   const pendingUtterancesRef = useRef<Map<string, PendingUtterance>>(new Map());
   const finalizedThisSessionRef = useRef(0);
@@ -251,16 +291,19 @@ export default function ControlWindow() {
   const tryFinalize = useCallback((id: string) => {
     const map = pendingUtterancesRef.current;
     const u = map.get(id);
-    if (!u || !u.enDone || !u.viDone) return;
+    if (!u) return;
+    const langs = Object.keys(u.translations);
+    if (!langs.every((l) => u.translations[l].done)) return;
     map.delete(id);
+    const translations: Record<string, string> = {};
+    for (const l of langs) translations[l] = u.translations[l].text;
     invoke("session_append_utterance", {
       utterance: {
         id,
         t_start: u.t_start,
         t_end: u.t_end,
-        zh: u.zh,
-        en: u.en,
-        vi: u.vi,
+        src: u.src,
+        translations,
         incomplete: false,
       },
     })
@@ -274,16 +317,22 @@ export default function ControlWindow() {
     const entries = Array.from(pendingUtterancesRef.current.entries());
     pendingUtterancesRef.current.clear();
     for (const [id, u] of entries) {
+      const langs = Object.keys(u.translations);
+      const translations: Record<string, string> = {};
+      let anyNotDone = false;
+      for (const l of langs) {
+        translations[l] = u.translations[l].text;
+        if (!u.translations[l].done) anyNotDone = true;
+      }
       try {
         await invoke("session_append_utterance", {
           utterance: {
             id,
             t_start: u.t_start,
             t_end: u.t_end,
-            zh: u.zh,
-            en: u.en,
-            vi: u.vi,
-            incomplete: !u.enDone || !u.viDone,
+            src: u.src,
+            translations,
+            incomplete: anyNotDone,
           },
         });
         finalizedThisSessionRef.current += 1;
@@ -294,20 +343,19 @@ export default function ControlWindow() {
   }, []);
 
   const requestTranslate = useCallback(
-    async (id: string, text: string, target: Lang) => {
-      const win = await WebviewWindow.getByLabel(target);
+    async (id: string, text: string, target: string) => {
+      const slotLabel = slotLabelFor(target);
+      const win = slotLabel ? await WebviewWindow.getByLabel(slotLabel) : null;
       if (!win) {
         if (!closedLangsNotifiedRef.current.has(target)) {
           closedLangsNotifiedRef.current.add(target);
-          const label = target === "en" ? "英文" : "越南文";
-          showToast("warning", `${label}譯文視窗已關閉，將不再翻譯該語言`);
+          showToast("warning", `${zhName(target)}譯文視窗已關閉，將不再翻譯該語言`);
         }
         // Mark this lang as "done" in the pending entry so the finalizer
         // doesn't wait forever for a translation that will never arrive.
         const u = pendingUtterancesRef.current.get(id);
-        if (u) {
-          if (target === "en") u.enDone = true;
-          else u.viDone = true;
+        if (u && u.translations[target]) {
+          u.translations[target].done = true;
           tryFinalize(id);
         }
         return;
@@ -316,7 +364,7 @@ export default function ControlWindow() {
         setError(`translate ${target}: ${err}`),
       );
     },
-    [showToast, tryFinalize],
+    [showToast, tryFinalize, slotLabelFor],
   );
 
   const selectedDeviceRef = useRef(selectedDevice);
@@ -353,6 +401,9 @@ export default function ControlWindow() {
         setShowSettings(true);
         return;
       }
+      // Snapshot the freshest language selection right before recording so
+      // start_stt and the translate pipeline agree on source + targets.
+      applyLangCfg(cfg);
     } catch {
       // get_config really shouldn't fail here — if it does, fall through and
       // let the existing error path surface whatever happens.
@@ -361,7 +412,7 @@ export default function ControlWindow() {
     startInFlightRef.current = true;
     setError(null);
     setHistory([]);
-    setLatestZh("");
+    setLatestSrc("");
     try {
       let source: Source;
       if (useMicRef.current) {
@@ -381,13 +432,17 @@ export default function ControlWindow() {
         }
         source = { type: "wav", path };
       }
-      await invoke("start_stt", { backend: backendRef.current, source });
+      await invoke("start_stt", {
+        backend: backendRef.current,
+        source,
+        language: langCfgRef.current.source,
+      });
     } catch (err) {
       setError(`start: ${err}`);
     } finally {
       startInFlightRef.current = false;
     }
-  }, [showToast]);
+  }, [showToast, applyLangCfg]);
 
   const handleCloseSettings = useCallback(async () => {
     setShowSettings(false);
@@ -397,10 +452,11 @@ export default function ControlWindow() {
     try {
       const cfg = await invoke<Config>("get_config");
       setSelectedDevice(cfg.audio?.input_device ?? "");
+      applyLangCfg(cfg);
     } catch {
       // Ignore — keep prior value.
     }
-  }, []);
+  }, [applyLangCfg]);
 
   const requestStart = useCallback(() => {
     if (hasHistoryRef.current) {
@@ -469,22 +525,23 @@ export default function ControlWindow() {
         if (!text) return;
         if (is_final) {
           setHistory((h) => [...h, text]);
-          setLatestZh("");
+          setLatestSrc("");
           const id = String(t_start);
+          const targets = enabledTargets();
           // Skip the translate call for trivially short utterances —
           // single-char fragments like "嗯", "啊", "對" are usually noise
           // or filler, and translating each one bills an API call for no
-          // user value (and often produces meta-prefix-filtered junk).
-          // Still record it (zh-only) so the meeting transcript is faithful.
-          if (text.trim().length < 2) {
+          // user value (and often produces meta-prefix-filtered junk). Also
+          // covers the no-target case. Still record the source-only row so
+          // the meeting transcript is faithful.
+          if (text.trim().length < 2 || targets.length === 0) {
             invoke("session_append_utterance", {
               utterance: {
                 id,
                 t_start,
                 t_end,
-                zh: text,
-                en: "",
-                vi: "",
+                src: text,
+                translations: {},
                 incomplete: false,
               },
             })
@@ -496,52 +553,56 @@ export default function ControlWindow() {
           }
           // Seat the pending entry BEFORE invoking translate so requestTranslate's
           // closed-window short-circuit can mark its lang done immediately.
-          pendingUtterancesRef.current.set(id, {
-            zh: text,
-            en: "",
-            vi: "",
-            t_start,
-            t_end,
-            enDone: false,
-            viDone: false,
-          });
-          requestTranslate(id, text, "en");
-          requestTranslate(id, text, "vi");
+          const translations: Record<string, { text: string; done: boolean }> = {};
+          for (const lang of targets) translations[lang] = { text: "", done: false };
+          pendingUtterancesRef.current.set(id, { src: text, t_start, t_end, translations });
+          for (const lang of targets) requestTranslate(id, text, lang);
         } else {
-          setLatestZh(text);
+          setLatestSrc(text);
         }
       }),
-      listen<ChunkPayload>("translation:chunk:en", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) u.en += e.payload.text;
+      // Static subscriptions for every registry language (chunk/replace/done).
+      // Subscribing to all up front avoids a re-subscription race when the
+      // target selection changes; a handler simply ignores an id whose pending
+      // entry doesn't include this language.
+      ...LANGS.flatMap((l) => {
+        const code = l.code;
+        return [
+          listen<ChunkPayload>(`translation:chunk:${code}`, (e) => {
+            const t = pendingUtterancesRef.current.get(e.payload.id)?.translations[code];
+            if (t) t.text += e.payload.text;
+          }),
+          // Emitted when the streaming translate broke and a non-streaming
+          // retry produced the full text — REPLACE (not append) whatever
+          // partial the chunk handler accumulated. done follows and finalizes.
+          listen<ChunkPayload>(`translation:replace:${code}`, (e) => {
+            const t = pendingUtterancesRef.current.get(e.payload.id)?.translations[code];
+            if (t) t.text = e.payload.text;
+          }),
+          listen<DonePayload>(`translation:done:${code}`, (e) => {
+            const t = pendingUtterancesRef.current.get(e.payload.id)?.translations[code];
+            if (t) {
+              t.done = true;
+              tryFinalize(e.payload.id);
+            }
+          }),
+        ];
       }),
-      listen<ChunkPayload>("translation:chunk:vi", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) u.vi += e.payload.text;
-      }),
-      // Emitted when the streaming translate broke and a non-streaming retry
-      // produced the full text — REPLACE (not append) whatever partial the
-      // chunk handler accumulated. translation:done follows and finalizes.
-      listen<ChunkPayload>("translation:replace:en", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) u.en = e.payload.text;
-      }),
-      listen<ChunkPayload>("translation:replace:vi", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) u.vi = e.payload.text;
-      }),
-      listen<DonePayload>("translation:done:en", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) {
-          u.enDone = true;
-          tryFinalize(e.payload.id);
-        }
-      }),
-      listen<DonePayload>("translation:done:vi", (e) => {
-        const u = pendingUtterancesRef.current.get(e.payload.id);
-        if (u) {
-          u.viDone = true;
-          tryFinalize(e.payload.id);
+      // Config's language selection changed. Re-read config into the ref/badge;
+      // if the SOURCE changed while idle, the panel's transcript + latest line
+      // are stale under the new badge — clear them. Slots-only changes leave
+      // the panel alone.
+      listen("language:changed", async () => {
+        const prevSource = langCfgRef.current.source;
+        try {
+          const cfg = await invoke<Config>("get_config");
+          applyLangCfg(cfg);
+          if ((cfg.language?.source ?? "zh") !== prevSource && !runningRef.current) {
+            setHistory([]);
+            setLatestSrc("");
+          }
+        } catch {
+          // Leave the prior selection in place.
         }
       }),
       listen("session:reset", () => {
@@ -660,7 +721,15 @@ export default function ControlWindow() {
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       if (modelTimerRef.current) clearTimeout(modelTimerRef.current);
     };
-  }, [handleStop, requestStart, showToast, requestTranslate, tryFinalize]);
+  }, [
+    handleStop,
+    requestStart,
+    showToast,
+    requestTranslate,
+    tryFinalize,
+    enabledTargets,
+    applyLangCfg,
+  ]);
 
   useEffect(() => {
     if (historyRef.current) {
@@ -876,10 +945,13 @@ export default function ControlWindow() {
       <section className="mx-4 mb-4 mt-3 flex flex-1 flex-col overflow-hidden rounded-2xl border border-paper-200 bg-white shadow-sm">
         <div className="flex flex-shrink-0 items-center gap-2 border-b border-paper-200 px-5 py-3 text-[11px] font-medium uppercase tracking-wider text-paper-600">
           <span className="inline-block h-1.5 w-1.5 rounded-full bg-paper-500" />
-          中文逐字稿
+          原文逐字稿
+          <span className="rounded-full bg-paper-200 px-1.5 py-0.5 text-[10px] font-medium text-paper-700">
+            {zhName(sourceLang)}
+          </span>
         </div>
         <div ref={historyRef} className="flex-1 overflow-y-auto px-5 py-4">
-          {history.length === 0 && !latestZh ? (
+          {history.length === 0 && !latestSrc ? (
             running ? (
               <div className="flex h-full flex-col items-center justify-center gap-3 text-paper-600">
                 <span className="relative inline-flex h-3 w-3">
@@ -908,7 +980,7 @@ export default function ControlWindow() {
               {history.map((h, i) => (
                 <li key={i}>{h}</li>
               ))}
-              {latestZh && <li className="italic text-paper-500">{latestZh}</li>}
+              {latestSrc && <li className="italic text-paper-500">{latestSrc}</li>}
             </ul>
           )}
         </div>
@@ -989,9 +1061,7 @@ export default function ControlWindow() {
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-paper-900/30 p-4">
           <div className="w-full max-w-sm rounded-lg border border-paper-200 bg-white p-5 shadow-xl">
             <h2 className="text-base font-semibold text-paper-900">開始新的錄音？</h2>
-            <p className="mt-2 text-sm text-paper-600">
-              繼續會清除目前的中文逐字稿與英文／越南文譯文。
-            </p>
+            <p className="mt-2 text-sm text-paper-600">{restartClearNotice()}</p>
             <footer className="mt-5 flex justify-end gap-2">
               <button
                 className="rounded px-3 py-1.5 text-sm text-paper-600 hover:bg-paper-100"
