@@ -3,17 +3,6 @@
 // configurable; runtime validity is enforced against the registry.
 export type Lang = string;
 
-export type Utterance = {
-  id: string;
-  zh: string;
-  en: string;
-  vi: string;
-  // Transitional string index so TranslationWindow's `u[lang]` keeps
-  // typechecking now that `Lang` is `string`. Removed when TranslationWindow
-  // moves to a slot-based `{id, text}` row (commit 9).
-  [k: string]: string;
-};
-
 export type TranscriptPayload = {
   type: "transcript";
   text: string;

@@ -20,16 +20,16 @@
         "y": 80
       },
       {
-        "label": "en",
-        "title": "English",
+        "label": "t1",
+        "title": "譯文視窗",
         "width": 900,
         "height": 320,
         "x": 540,
         "y": 80
       },
       {
-        "label": "vi",
-        "title": "Tiếng Việt",
+        "label": "t2",
+        "title": "譯文視窗",
         "width": 900,
         "height": 320,
         "x": 540,

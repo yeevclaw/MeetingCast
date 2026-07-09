@@ -8,8 +8,10 @@ import "./App.css";
 const label = getCurrentWindow().label;
 
 function pickRoot() {
-  if (label === "en") return <TranslationWindow lang="en" />;
-  if (label === "vi") return <TranslationWindow lang="vi" />;
+  // t1 / t2 are the two configurable translation slots; the language each
+  // shows is resolved from config at runtime, not baked into the label.
+  if (label === "t1") return <TranslationWindow slotIndex={0} />;
+  if (label === "t2") return <TranslationWindow slotIndex={1} />;
   return <ControlWindow />;
 }
 
