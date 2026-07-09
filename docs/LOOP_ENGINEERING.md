@@ -53,6 +53,12 @@
 - **wrong-language 閾值 0.5 + 最短 8 非空白字**：plan 原本浮動 40%，最後定 `> 50%` 且加最短長度守門。理由：rule 3 要保留專有名詞原文（公司 / 產品 / 人名），一句合法的英文或越南文譯句本來就會夾幾個漢字；**誤殺一句真譯文比漏抓一句假中文更糟**，寧可漏抓不可誤殺。`checks.py` 的 `is_wrong_language` 與 `verify.rs` 的 `wrong_language` 保持同語意（同門檻、同 CJK 範圍）。
 - **`summary_model` 進 config**：主翻譯用 Haiku（延遲優先），總結用 Sonnet（結構化輸出品質高於 Haiku）。兩者都在 `config.toml [api]` 的 `model` / `summary_model` 可改，不寫死在程式裡（`config.rs` 有 `default_summary_model` fallback）。
 - **`WHISPER_MODEL_TOTAL_BYTES` 釘 revision**：下載進度百分比用一個實測的 total bytes（`mlx-community/whisper-large-v3-turbo` revision `a4aaeec…`，1,613,979,798 bytes）。這值綁定特定 revision，未來若重新量化上傳會漂掉；但它**只用來算進度條百分比**，漂了頂多讀數略偏、不影響功能——接受這個 tradeoff，不做動態量測。
+- **語言登錄表是單一事實來源**：多語化後 script profile、翻譯 prompt 名、deepgram/whisper code、術語 carrier 句、empty_state 全部集中在 `shared/languages.json` 一份，Rust `include_str!`、TS `import`、Python（`checks.py` / `run_eval.py`）各自讀同一份，避免三端各自寫死漂移。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`。
+- **script-profile wrong-language 規則集（registry 驅動）**：上一條的 0.5 門檻只涵蓋「源＝中文、目標＝英/越」。多語化後 `wrong_language` 不再假設語向，改依每語言在登錄表標的 `script_profile`（`latin` | `han` | `japanese`）分支判定，`verify.rs` 與 `checks.py` **逐字同義**。字元域：han = U+4E00–9FFF ∪ U+3400–4DBF、kana = U+3040–309F ∪ U+30A0–30FF、latin = ASCII 英文字母；全規則先過「最短 8 非空白字」守門：
+  - **latin（en/vi）**：`(han+kana)/total > 0.5` → 判錯（加 kana 才抓得到「停在日文沒翻成英/越」；純中文回覆無 kana，對舊 zh→en/vi 行為零變化）
+  - **japanese（ja）**：`latin/total > 0.5 且 (han+kana)/total < 0.1` → 判錯（英文回覆）。`< 0.1` 這條刻意寬鬆，保護「MeetingCastとGoogle Slidesを統合します」這類夾英文專名的合法日文。**再加** `total ≥ 20 且 kana == 0 且 han/total > 0.5` → 判錯（20+ 字零假名＝中文回覆，正常日文長句必含助詞假名）
+  - **han（zh）**：`latin/total > 0.5 且 han/total < 0.1` → 判錯（英/越回覆）；或 `kana/total > 0.3` → 判錯（日文回覆）
+  哲學不變：**寧可漏抓不可誤殺**（清空整段是管線唯一破壞性動作），每筆判錯都寫 `traces.jsonl` 供日後調閾值。
 
 ---
 
@@ -114,7 +120,7 @@
 
 - **成本 gate**：每次都先印 `n_calls`（cases × targets）、model、估算 token（~500 in / ~100 out per call）、估算 USD。`--dry-run` 印完就 `exit`，保證不碰網路；無 `--yes` 會 `input()` 問你，非 `y` 一律 abort。
 - **`--prompt-file` A/B 流程**：預設指向 `src-tauri/prompts/translate_system.txt`（唯一真相來源，與 Rust `include_str!` 同一檔）。改 prompt 時，複製一份成候選，`--prompt-file path/to/candidate.txt` 跑同一 golden set，比對兩次的 pass/fail 與失敗 category。
-- **golden set**：`prototype/eval/golden/translation_cases.jsonl`，25 條，涵蓋 9 條 prompt 規則 + 術語表 + 一般會議句（數字 / 日期 / action item）。
+- **golden set**：`prototype/eval/golden/translation_cases.jsonl`，39 條。schema 為 `source_lang`（省略＝`zh`）＋ `source`（源文；舊 case 沿用 `zh` 欄相容）＋ per-case `targets`，`glossary` 走 v2 `translations` map（舊 `en`/`vi` 欄 fallback）。前 25 條 zh→en/vi（9 條 prompt 規則 + 術語表 + 一般會議句），後 14 條為 ja↔zh/en、zh→ja、en→ja 煙霧案例（glossary / context / 專名 / rule6 重複 / rule7-8 meta 各覆蓋）。`run_eval.py --source <code>` 設定缺 `source_lang` 之 case 的預設源語言，per-case `source_lang` 覆蓋之。
 - **parity**：`checks.py` 的驗證與 `src-tauri/src/verify.rs`、`translator.rs` 的 `META_MARKERS` 保持同語意——**改任一邊要同步另一邊**。
 - **回歸 gate**：任何 case fail 會 non-zero exit。輸出寫 `results/<timestamp>.jsonl`（已 gitignore）。
 

@@ -1,8 +1,8 @@
 # MeetingCast
 
-> 即時會議翻譯助手 — 中文發言 → 英文 + 越南文 同步顯示
+> 即時會議翻譯助手 — 中／英／日／越任一語言發言 → 兩個可配置譯文視窗同步顯示
 
-當你用中文向外籍同仁簡報時，MeetingCast 即時將你的語音轉寫為中文逐字稿，並**並行**翻譯成英文與越南文，分別在兩個獨立視窗顯示。可拖到外接螢幕、字體可調，會議結束後可儲存逐字稿並用 AI 產生會議總結。
+當你向外籍同仁簡報時，MeetingCast 即時將你的語音轉寫為逐字稿，並**並行**翻譯到兩個可配置的譯文視窗，各自顯示一種目標語言。源語言與兩個目標語言皆可在設定選擇（中／英／日／越，可互選）。可拖到外接螢幕、字體可調，會議結束後可儲存逐字稿並用 AI 產生會議總結。
 
 **核心指標**：準確、低延遲。延遲 P50 ~2.3 秒、P95 ~3.1 秒（mlx-whisper local backend，詳見 [docs/LATENCY.md](docs/LATENCY.md)）。
 
@@ -11,10 +11,10 @@
 ## 功能
 
 - 🎙️ **即時 STT**：mlx-whisper（本地，Mac Metal GPU 加速）或 Deepgram nova-3（雲端，更低延遲、interim 預覽）
-- 🌐 **並行翻譯**：Claude Haiku 4.5 streaming，中→英、中→越同時送出
-- 🪟 **多視窗**：控制視窗 + 英文視窗 + 越南文視窗，可拖外接螢幕、釘最前、無邊框、字體 ±
+- 🌐 **並行翻譯**：Claude Haiku 4.5 streaming，兩個目標語言同時送出
+- 🪟 **多視窗**：控制視窗 + 兩個譯文視窗（各自選目標語言、可關其一），可拖外接螢幕、釘最前、無邊框、字體 ±
 - ⌨️ **全域快捷鍵**：`⌘ + Shift + M` 切換錄音
-- 📝 **會議紀錄**：自動儲存中文逐字稿與譯文，支援 6 種 AI 總結模板（執行摘要、會議紀要、討論重點、決策日誌、客戶通話、簡報大綱）
+- 📝 **會議紀錄**：自動儲存來源逐字稿與各語言譯文，支援 6 種 AI 總結模板（執行摘要、會議紀要、討論重點、決策日誌、客戶通話、簡報大綱）
 - 🛡️ **穩定性**：sidecar crash 自動重啟、Whisper 幻覺三層防禦、Anthropic API 自動重試
 - 🔒 **資料在地**：local backend 全部運算在你電腦上，逐字稿存 `~/Library/Application Support/MeetingCast/`
 
@@ -42,7 +42,7 @@
    xattr -cr /Applications/MeetingCast.app
    ```
    （透過 AirDrop / USB 傳的不需要）
-4. 雙擊開啟。首次啟動會開三個視窗（控制＋英文＋越南文），並在背景下載 ~1.6 GB 語音模型，進度顯示在啟動檢查清單
+4. 雙擊開啟。首次啟動會開三個視窗（控制＋兩個譯文視窗），並在背景下載 ~1.6 GB 語音模型，進度顯示在啟動檢查清單
 5. 第一次會跳麥克風授權對話框，按允許
    - 若不小心按到「不允許」：到 系統設定 → 隱私權與安全性 → 麥克風 開啟 MeetingCast，然後重新啟動 App
 6. 在 Welcome wizard 填入 Anthropic API key
@@ -50,8 +50,8 @@
 ### 二、使用
 
 1. 按「開始錄音」或快捷鍵 `⌘+Shift+M`
-2. 用中文發言，講完一句停頓 0.3 秒會自動切片送翻譯
-3. 英文 / 越南文視窗會同步顯示譯文
+2. 用設定的來源語言發言，講完一句停頓 0.3 秒會自動切片送翻譯
+3. 兩個譯文視窗會同步顯示各自目標語言的譯文
 4. 結束後按「停止錄音」，紀錄自動存檔
 5. 點右上角 history icon 查看歷史會議、產生 AI 總結、匯出 Markdown
 
@@ -134,7 +134,7 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    Tauri Main Process (Rust)                  │
-│  - 視窗管理（控制 + en + vi）                                  │
+│  - 視窗管理（控制 + t1 + t2）                                  │
 │  - Sidecar 生命週期 + crash watchdog                           │
 │  - Anthropic API call（SSE streaming）                         │
 │  - 全域 hotkey、config.toml、errors.log                        │
@@ -148,8 +148,8 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
                  │ Tauri event "transcript"
         ┌────────▼─────────────────────┐
         │  Anthropic API (並行 2 路)    │
-        │  - 中→英 Haiku streaming      │
-        │  - 中→越 Haiku streaming      │
+        │  - 源→t1 Haiku streaming      │
+        │  - 源→t2 Haiku streaming      │
         └──────────────────────────────┘
 ```
 
@@ -166,7 +166,7 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
 | STT (local) | mlx-whisper | Mac Metal GPU 加速（ctranslate2 沒 Metal 支援，CPU 太慢） |
 | STT (cloud) | Deepgram nova-3 | 低延遲 interim 預覽 |
 | VAD | silero-vad | 偵測句子邊界，降低 Whisper 呼叫次數 |
-| 翻譯 | Claude Haiku 4.5 (streaming) | 低延遲 + 三語品質 + prompt caching |
+| 翻譯 | Claude Haiku 4.5 (streaming) | 低延遲 + 多語品質 + prompt caching |
 | 總結 | Claude Sonnet 4.6 | 結構化輸出品質高於 Haiku |
 | Python ↔ Rust | Tauri sidecar + line-delimited JSON over stdio | 簡單可靠 |
 
@@ -181,7 +181,7 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
 - [x] 會議紀錄 + AI 總結（6 模板）
 - [x] Whisper hallucination 機制面防禦
 - [x] First-run coach mark
-- [ ] 對方發言反向翻譯（en/vi → zh）
+- [ ] 單場雙向翻譯（同時處理對方發言）— 現版本源語言可選，但一場會議仍為單向
 - [ ] 術語表 GUI
 - [ ] Apple Developer ID notarization（目前是 ad-hoc 簽章）
 

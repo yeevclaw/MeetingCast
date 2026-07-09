@@ -1,6 +1,6 @@
 # MeetingCast - 即時會議翻譯助手
 
-中文會議報告即時轉寫 + 並行翻譯成英文 / 越南文，分顯示於兩個獨立視窗供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。MVP 範圍單向（中→英+越），不處理對方發言。
+中／英／日／越任一語言會議即時轉寫 + 並行翻譯到兩個可配置譯文槽位視窗（各自選目標語言）供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。源語言與兩個目標語言皆可在設定選擇（zh/en/ja/vi 互選）；單場單向，不同時處理對方發言。
 
 目前 ship 0.1.14 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
 
@@ -8,6 +8,8 @@
 
 - **STT 引擎用 mlx-whisper**（不是 faster-whisper）— ctranslate2 在 macOS 沒 Metal，CPU 4.3s vs mlx Metal 0.9s
 - **雙 backend**：`MLXWhisperSTT`（local 預設）+ `DeepgramSTT`（cloud），同一 `Transcript` stream 介面，UI 可切。Cloud 用 Deepgram nova-3、`utterance_end_ms` 不能低於 1000
+- **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source / target 皆可選 zh/en/ja/vi，script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
+- **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
 - **翻譯在 Rust 不在 sidecar**：Anthropic API 由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT
 - **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start` / `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
@@ -117,6 +119,10 @@ model = "claude-haiku-4-5"
 
 [audio]                  # ✅ Settings UI 可改
 input_device = ""        # 空 = 系統預設
+
+[language]               # ✅ Settings UI 可改（語言設定區）
+source = "zh"            # 源語言，zh/en/ja/vi 任選
+target_slots = ["en", "vi"]  # 恆長度 2，各槽位一個目標語言；"" = 關閉該槽位
 
 [[glossaries]]           # ✅ Settings UI 可改（術語表 modal）
 name = "預設"

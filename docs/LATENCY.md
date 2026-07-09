@@ -1,5 +1,7 @@
 # Phase 1 延遲基準報告
 
+>（此為 **zh 源語言**基準：中→英+越。多語化後其他源語言／目標語言組合未另行量測，因走同一管線，數量級預期相近。）
+
 - 樣本數：9 段（來自 VAD 切句）
 - 資料來源：weather_90s.wav, zh_short.wav
 - Pipeline：mlx-whisper large-v3-turbo (Metal) + Claude Haiku 4.5 streaming

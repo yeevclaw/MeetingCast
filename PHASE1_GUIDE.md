@@ -1,5 +1,7 @@
 # Phase 1：CLI 原型開發指引
 
+>（歷史文件：以下描述 Phase 1 的 zh→en+vi 固定管線；現版本已多語化，見 docs/ADD_LANGUAGE.md）
+
 **目標**：在投入桌面版開發前，先用最少程式碼驗證整條 pipeline 的延遲與翻譯品質。
 
 ## 驗收標準

@@ -1,6 +1,6 @@
 # MeetingCast 系統架構與資料流程
 
-> 即時將中文會議報告轉寫並並行翻譯成英文與越南文，分顯示於三個獨立視窗（主控 / 英文 / 越南文）。MVP 範圍為單向（中→英+越），不處理對方發言。
+> 即時將會議報告轉寫並並行翻譯到兩個可配置的譯文槽位視窗，分顯示於三個獨立視窗（主控 + 譯文槽位 t1 / t2）。源語言與兩個目標語言皆可選（zh/en/ja/vi 互選），由 `shared/languages.json` 登錄表驅動。單場單向，不處理對方發言。
 
 ---
 
@@ -31,7 +31,7 @@ flowchart LR
 
 三個進程：
 - **Tauri Main (Rust)**：視窗管理、sidecar 生命週期 + crash watchdog、Anthropic API 呼叫、全域 hotkey、設定 / 錯誤 log 讀寫
-- **React Frontend**：單一 bundle 依 `getCurrentWindow().label` 決定 render 控制 / 英文 / 越南文視窗
+- **React Frontend**：單一 bundle 依 `getCurrentWindow().label`（`control` / `t1` / `t2`）決定 render 控制或譯文視窗；譯文視窗顯示的語言由 config runtime 解析（不綁 label）
 - **Python Sidecar**：常駐 daemon，從 stdin 收命令、stdout 吐 line-delimited JSON 事件，內含 VAD + STT 雙 backend
 
 ---
@@ -48,31 +48,31 @@ sequenceDiagram
     participant Rust as Rust 主程序
     participant Ctrl as 控制視窗
     participant API as Anthropic API
-    participant En as 英文視窗
-    participant Vi as 越南文視窗
+    participant En as 譯文視窗 t1
+    participant Vi as 譯文視窗 t2
 
-    User->>Mic: 講中文
+    User->>Mic: 講來源語言
     Mic->>VAD: PCM 16kHz mono 流
     VAD->>VAD: 偵測語音 + 尾端 300ms 靜音
     VAD->>STT: 切片送出（句子或 8s 強制）
-    STT->>Sidecar: 中文逐字稿 (is_final=true)
+    STT->>Sidecar: 來源逐字稿 (is_final=true)
     Sidecar->>Rust: stdout JSON {type: "transcript", ...}
     Rust->>Ctrl: emit("transcript")
     Rust->>En: emit("transcript")
     Rust->>Vi: emit("transcript")
-    Ctrl->>Rust: invoke("translate", id, text, "en")
-    Ctrl->>Rust: invoke("translate", id, text, "vi")
+    Ctrl->>Rust: invoke("translate", id, text, t1_lang)
+    Ctrl->>Rust: invoke("translate", id, text, t2_lang)
     par 並行翻譯
-        Rust->>API: POST messages (zh→en, streaming)
+        Rust->>API: POST messages (源→t1, streaming)
         API-->>Rust: SSE chunk
-        Rust->>En: emit("translation:chunk:en", {id, text})
+        Rust->>En: emit("translation:chunk:{t1}", {id, text})
     and
-        Rust->>API: POST messages (zh→vi, streaming)
+        Rust->>API: POST messages (源→t2, streaming)
         API-->>Rust: SSE chunk
-        Rust->>Vi: emit("translation:chunk:vi", {id, text})
+        Rust->>Vi: emit("translation:chunk:{t2}", {id, text})
     end
-    En->>User: 邊收邊顯示英文
-    Vi->>User: 邊收邊顯示越南文
+    En->>User: 邊收邊顯示 t1 譯文
+    Vi->>User: 邊收邊顯示 t2 譯文
 ```
 
 ---
@@ -133,7 +133,7 @@ System + user 結構，system 部分用 **prompt caching** 鎖住術語表與風
 
 ```
 System (cached):
-  你是專業即時會議口譯員。將使用者輸入的中文翻譯為 {English|Vietnamese}。
+  你是專業即時會議口譯員。將使用者輸入的{source_lang}翻譯為 {lang}。（{source_lang}/{lang} 由 registry 依 config 替換）
   規則：
   1. 只輸出譯文，不要任何解釋、引號、標點修飾
   2. 保留專有名詞原文（公司名、產品名、人名）
@@ -143,7 +143,7 @@ System (cached):
   術語表：
   - {使用者自訂}（Phase 5）
 
-User: {中文逐字稿}
+User: {來源逐字稿}
 ```
 
 省 token：system 約 ~150 token、cache 命中時省下整段，只計 user 端的中文逐字稿（通常 < 50 token）。
@@ -216,15 +216,15 @@ flowchart TD
 graph TB
     subgraph "Mac 螢幕"
         Ctrl[控制視窗<br/>Start/Stop · backend 切換<br/>逐字稿 · 音量條 · toast<br/>設定 · 版本號]
-        En[英文譯文視窗<br/>大字 · 暖紙底 · 自動捲動<br/>釘最前 · 無邊框可選]
-        Vi[越南文譯文視窗<br/>大字 · 暖紙底 · 自動捲動<br/>釘最前 · 無邊框可選]
+        En[譯文視窗 t1（槽位一）<br/>語言由 config 解析<br/>大字 · 暖紙底 · 自動捲動<br/>釘最前 · 無邊框可選]
+        Vi[譯文視窗 t2（槽位二）<br/>語言由 config 解析<br/>大字 · 暖紙底 · 自動捲動<br/>釘最前 · 無邊框可選]
     end
     Ctrl -.可拖外接螢幕.-> En
     Ctrl -.可拖外接螢幕.-> Vi
 ```
 
 - **控制視窗**：講者主操作，逐字稿即時顯示、MicMeter 10 段 VU 音量條、重新錄音時警告會清除舊紀錄
-- **譯文視窗**（英 / 越各一）：可獨立拖到外接螢幕／投影給外籍同仁看；最近 5 句由亮到暗漸層、再往前 30% 透明度但仍可讀；可釘最前、無邊框（投影機友善）
+- **譯文視窗**（槽位 t1 / t2 各一，各自顯示所選目標語言，slot 可設「不使用」關閉）：可獨立拖到外接螢幕／投影給外籍同仁看；最近 5 句由亮到暗漸層、再往前 30% 透明度但仍可讀；可釘最前、無邊框（投影機友善）
 
 ---
 
