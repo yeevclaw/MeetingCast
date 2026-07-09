@@ -120,7 +120,7 @@ export default function WelcomeWizard({
             <p className="mt-2 text-sm text-paper-600">即時會議翻譯助手</p>
 
             <div className="mt-5 space-y-3 text-sm text-paper-700">
-              <p>會議中你說中文，MeetingCast 會：</p>
+              <p>會議中你發言，MeetingCast 會：</p>
               <ul className="ml-1 space-y-1.5">
                 <li>🎙 即時辨識成逐字稿（預設中文）</li>
                 <li>🌐 並行翻譯成兩種語言（預設英文＋越南文，可在「設定 → 語言」變更）</li>
