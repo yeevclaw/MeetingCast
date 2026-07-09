@@ -14,6 +14,9 @@ use serde::Deserialize;
 
 /// Per-language empty-state copy shown in a translation window before any
 /// text arrives, written in that language's own script.
+// Read by the TS frontend (TranslationWindow), not the Rust backend — allow
+// the schema mirror to carry fields the backend doesn't consume.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmptyState {
     pub waiting: String,
@@ -23,6 +26,10 @@ pub struct EmptyState {
 /// One language's registry entry. Deserialized from `shared/languages.json`
 /// with NO serde defaults — a missing field fails the parse loudly at first
 /// access rather than silently degrading to an empty string.
+// This struct mirrors the shared JSON schema; several fields are consumed by
+// the Python eval harness / TS frontend / summary layer rather than read here,
+// so allow the unread ones instead of dropping them from the mirror.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LanguageDef {
     /// Canonical code (zh/en/ja/vi). Used everywhere as the language key.

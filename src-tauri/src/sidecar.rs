@@ -17,8 +17,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::SharedConfig;
 use crate::errors;
+use crate::languages;
 use crate::session::{self, SharedRecorder};
 use crate::traces;
+use crate::translator::TranslationContext;
 
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
@@ -505,10 +507,27 @@ pub async fn start_stt(
     state: tauri::State<'_, SharedManager>,
     config: tauri::State<'_, SharedConfig>,
     recorder: tauri::State<'_, SharedRecorder>,
+    ctx: tauri::State<'_, TranslationContext>,
     backend: String,
     mut source: Value,
     language: Option<String>,
 ) -> Result<(), String> {
+    // Resolve + validate the source language before spawning anything: default
+    // to the configured source, an explicit override wins, and an
+    // out-of-registry code fails fast rather than reaching the sidecar.
+    let language_str = match language {
+        Some(l) => l,
+        None => config.lock().await.language.source.clone(),
+    };
+    if !languages::is_valid(&language_str) {
+        return Err(format!("unsupported source language: {language_str}"));
+    }
+    // Per-language Deepgram code from the registry — an additive protocol
+    // field the cloud backend prefers; local/openai backends ignore it.
+    let deepgram_language = languages::get(&language_str)
+        .map(|l| l.deepgram_code.clone())
+        .unwrap_or_else(|| language_str.clone());
+
     // If source.type == "mic" and the caller didn't specify a device,
     // backfill from config so the user's persisted preference is honored
     // even when the frontend forgets to pass it.
@@ -556,12 +575,13 @@ pub async fn start_stt(
             cfg.idle_auto_stop_minutes,
         )
     };
-    let language_str = language.unwrap_or_else(|| "zh".into());
     let cmd = serde_json::json!({
         "type": "start",
         "backend": backend,
         "source": source,
         "language": language_str,
+        "deepgram_language": deepgram_language,
+        "detect_language": false,
         "initial_prompt": initial_prompt,
         "api": {
             "deepgram_api_key": deepgram_api_key,
@@ -581,6 +601,9 @@ pub async fn start_stt(
                 .await
                 .map_err(|e| format!("flush stdin: {e}"))?;
             m.last_start = Some(cmd.clone());
+            // Clear the rolling translation context so a source-language switch
+            // (or any fresh start) doesn't carry stale prior-utterance pairs.
+            ctx.lock().await.clear();
             let _ = app.emit("session:reset", ());
             // Reset the idle clock and (re)start the per-session watcher. If
             // a previous watcher is somehow still alive (shouldn't happen
