@@ -32,22 +32,22 @@ export type AudioDevice = {
 export type GlossaryEntry = {
   term: string;
   aliases: string[];
-  // v2: per-language translations keyed by registry code. Optional during the
-  // multi-language migration — GlossaryModal still writes the legacy en/vi
-  // mirrors below; Batch 4 wires the map in the UI and can tighten this.
-  translations?: Record<string, string>;
-  // Legacy target mirrors (kept for the current GlossaryModal + downgrade
-  // compatibility). Derived from `translations` server-side on save.
+  // v2: per-language translations keyed by registry code. Always present from
+  // the backend (empty map when the term has no translations); GlossaryModal
+  // is the sole construction site and always emits it.
+  translations: Record<string, string>;
+  // Legacy target mirrors, still read when folding a pre-v2 entry into the map
+  // (and kept for 0.1.x downgrade compatibility). Derived from `translations`
+  // server-side on save, so the UI no longer writes them.
   en?: string;
   vi?: string;
 };
 
 export type GlossaryBook = {
   name: string;
-  // Source language the book's `term`s are authored in (defaults to zh
-  // server-side). Optional so existing GlossaryModal literals stay valid;
-  // Batch 4 surfaces it in the UI.
-  source_lang?: string;
+  // Source language the book's `term`s are authored in. Always present from
+  // the backend (serde default zh); GlossaryModal fills it on every save.
+  source_lang: string;
   entries: GlossaryEntry[];
 };
 

@@ -1,31 +1,35 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Config, GlossaryBook, GlossaryEntry } from "@/lib/types";
+import { LANGS, selectLabel, zhName } from "@/lib/languages";
 
 const EXAMPLE_ENTRY: GlossaryEntry = {
   term: "紫微斗數",
   aliases: ["紫薇斗數", "子位斗數"],
-  en: "Zi Wei Dou Shu",
-  vi: "Tử Vi Đẩu Số",
+  translations: { en: "Zi Wei Dou Shu", vi: "Tử Vi Đẩu Số", ja: "紫微斗数" },
 };
 
-// Editable form for one entry. `aliasesText` is the comma-joined view —
-// proper string[] split happens at save time.
+// Editable form for one entry. `aliasesText` is the comma-joined view (split to
+// string[] at save time); `translations` maps a registry language code to that
+// term's translation.
 type RowForm = {
   rowId: string;
   term: string;
   aliasesText: string;
-  en: string;
-  vi: string;
+  translations: Record<string, string>;
 };
 
 function entryToRow(entry: GlossaryEntry, idx: number): RowForm {
+  // Fold the legacy en/vi mirror fields into the map so a pre-v2 entry (map
+  // empty, mirrors set) still surfaces its translations.
+  const translations: Record<string, string> = { ...entry.translations };
+  if (entry.en && translations.en === undefined) translations.en = entry.en;
+  if (entry.vi && translations.vi === undefined) translations.vi = entry.vi;
   return {
     rowId: `r${idx}-${entry.term}`,
     term: entry.term,
     aliasesText: (entry.aliases ?? []).join(", "),
-    en: entry.en ?? "",
-    vi: entry.vi ?? "",
+    translations,
   };
 }
 
@@ -34,14 +38,20 @@ function rowsToEntries(rows: RowForm[]): GlossaryEntry[] {
   for (const r of rows) {
     const term = r.term.trim();
     if (!term) continue;
+    // Trim each translation and drop empty ones; the backend re-derives the
+    // legacy en/vi mirrors from this map on save.
+    const translations: Record<string, string> = {};
+    for (const [code, val] of Object.entries(r.translations)) {
+      const v = val.trim();
+      if (v) translations[code] = v;
+    }
     out.push({
       term,
       aliases: r.aliasesText
         .split(/[,，]/)
         .map((s) => s.trim())
         .filter((s) => s.length > 0),
-      en: r.en.trim(),
-      vi: r.vi.trim(),
+      translations,
     });
   }
   return out;
@@ -64,6 +74,8 @@ export default function GlossaryModal({
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [rows, setRows] = useState<RowForm[]>([]);
   const [bookName, setBookName] = useState("");
+  // Language the book being edited authors its `term`s in (defaults zh).
+  const [bookSourceLang, setBookSourceLang] = useState<string>("zh");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -83,17 +95,17 @@ export default function GlossaryModal({
     const book = cfg.glossaries[idx];
     setEditingIdx(idx);
     setBookName(book.name);
+    setBookSourceLang(book.source_lang ?? "zh");
     const initialRows = book.entries.map(entryToRow);
     if (prefillAlias) {
       // Selections from the transcript come from Whisper's output — i.e. the
       // wrong characters the user wants substituted away from. So they go
-      // into aliases; the user fills in the canonical 正確中文 themselves.
+      // into aliases; the user fills in the canonical term themselves.
       initialRows.push({
         rowId: `prefill-${Date.now()}`,
         term: "",
         aliasesText: prefillAlias,
-        en: "",
-        vi: "",
+        translations: {},
       });
     }
     setRows(initialRows);
@@ -115,7 +127,7 @@ export default function GlossaryModal({
     if (idx === -1) {
       // No books exist — auto-create "預設" and persist, then let the next
       // cfg-update tick of this effect actually open it.
-      const seeded: GlossaryBook = { name: "預設", entries: [] };
+      const seeded: GlossaryBook = { name: "預設", source_lang: "zh", entries: [] };
       const next: Config = {
         ...cfg,
         glossaries: [seeded],
@@ -159,7 +171,7 @@ export default function GlossaryModal({
       name = `${base} ${i}`;
       i += 1;
     }
-    const newBook: GlossaryBook = { name, entries: [] };
+    const newBook: GlossaryBook = { name, source_lang: "zh", entries: [] };
     const next: Config = { ...cfg, glossaries: [...cfg.glossaries, newBook] };
     setCfg(next);
     await persist(next);
@@ -189,6 +201,7 @@ export default function GlossaryModal({
     const oldName = cfg.glossaries[editingIdx].name;
     const updatedBook: GlossaryBook = {
       name: trimmedName,
+      source_lang: bookSourceLang,
       entries: rowsToEntries(rows),
     };
     const nextBooks = cfg.glossaries.map((b, i) => (i === editingIdx ? updatedBook : b));
@@ -227,8 +240,7 @@ export default function GlossaryModal({
         rowId: `new-${Date.now()}-${rs.length}`,
         term: "",
         aliasesText: "",
-        en: "",
-        vi: "",
+        translations: {},
       },
     ]);
   }
@@ -275,6 +287,7 @@ export default function GlossaryModal({
           <ListView
             books={cfg.glossaries}
             activeName={cfg.active_glossary}
+            configSource={cfg.language.source}
             onEdit={openEdit}
             onToggleActive={handleSetActive}
             onCreate={handleCreate}
@@ -283,6 +296,8 @@ export default function GlossaryModal({
           <EditView
             bookName={bookName}
             setBookName={setBookName}
+            bookSourceLang={bookSourceLang}
+            setBookSourceLang={setBookSourceLang}
             rows={rows}
             updateRow={updateRow}
             removeRow={removeRow}
@@ -308,12 +323,14 @@ export default function GlossaryModal({
 function ListView({
   books,
   activeName,
+  configSource,
   onEdit,
   onToggleActive,
   onCreate,
 }: {
   books: GlossaryBook[];
   activeName: string | null;
+  configSource: string;
   onEdit: (idx: number) => void;
   onToggleActive: (idx: number) => void;
   onCreate: () => void;
@@ -333,6 +350,7 @@ function ListView({
       ) : (
         books.map((book, idx) => {
           const isActive = book.name === activeName;
+          const bookSource = book.source_lang ?? "zh";
           return (
             <div
               key={book.name}
@@ -347,9 +365,17 @@ function ListView({
                   <p className="truncate text-sm font-medium text-paper-900">{book.name}</p>
                   <p className="text-xs text-paper-500">
                     {book.entries.length} 條術語
+                    <span className="ml-2 rounded-full border border-paper-300 px-1.5 py-0.5 text-[10px] text-paper-600">
+                      {zhName(bookSource)}
+                    </span>
                     {isActive && (
                       <span className="ml-2 rounded-full bg-paper-900 px-1.5 py-0.5 text-[10px] font-medium text-white">
                         使用中
+                      </span>
+                    )}
+                    {isActive && bookSource !== configSource && (
+                      <span className="ml-2 rounded-full border border-warn-300 bg-warn-50 px-1.5 py-0.5 text-[10px] font-medium text-warn-900">
+                        與目前來源語言不同
                       </span>
                     )}
                   </p>
@@ -392,6 +418,8 @@ function ListView({
 function EditView({
   bookName,
   setBookName,
+  bookSourceLang,
+  setBookSourceLang,
   rows,
   updateRow,
   removeRow,
@@ -404,6 +432,8 @@ function EditView({
 }: {
   bookName: string;
   setBookName: (s: string) => void;
+  bookSourceLang: string;
+  setBookSourceLang: (s: string) => void;
   rows: RowForm[];
   updateRow: (rowId: string, patch: Partial<RowForm>) => void;
   removeRow: (rowId: string) => void;
@@ -429,6 +459,24 @@ function EditView({
         </div>
 
         <div>
+          <label className="mb-1 block text-xs font-medium text-paper-700">術語語言</label>
+          <select
+            className="w-full rounded border border-paper-300 px-2 py-1 text-sm"
+            value={bookSourceLang}
+            onChange={(e) => setBookSourceLang(e.target.value)}
+          >
+            {LANGS.map((l) => (
+              <option key={l.code} value={l.code}>
+                {selectLabel(l.code)}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-paper-500">
+            這本術語表詞條使用的語言（通常與來源語言相同）
+          </p>
+        </div>
+
+        <div>
           <div className="mb-2 flex items-center justify-between">
             <label className="text-xs font-medium text-paper-700">
               術語列表（{rows.length}）
@@ -448,6 +496,7 @@ function EditView({
                 <RowEditor
                   key={row.rowId}
                   row={row}
+                  bookSourceLang={bookSourceLang}
                   onChange={(patch) => updateRow(row.rowId, patch)}
                   onRemove={() => removeRow(row.rowId)}
                 />
@@ -508,18 +557,25 @@ function EditView({
 
 function RowEditor({
   row,
+  bookSourceLang,
   onChange,
   onRemove,
 }: {
   row: RowForm;
+  bookSourceLang: string;
   onChange: (patch: Partial<RowForm>) => void;
   onRemove: () => void;
 }) {
+  // A translation input per registry language except the book's own source —
+  // there is nothing to translate a term into its own language.
+  const targetLangs = LANGS.filter((l) => l.code !== bookSourceLang);
   return (
     <div className="rounded border border-paper-200 bg-white p-2 text-xs">
       <div className="mb-1.5 flex items-start gap-1.5">
         <div className="flex-1">
-          <p className="mb-0.5 text-[10px] font-medium text-paper-700">正確的中文</p>
+          <p className="mb-0.5 text-[10px] font-medium text-paper-700">
+            {`正確的${zhName(bookSourceLang)}`}
+          </p>
           <input
             type="text"
             placeholder="例：紫微斗數"
@@ -548,34 +604,33 @@ function RowEditor({
         value={row.aliasesText}
         onChange={(e) => onChange({ aliasesText: e.target.value })}
       />
-      <div className="flex gap-1.5">
-        <input
-          type="text"
-          placeholder="英文譯名"
-          className="flex-1 rounded border border-paper-300 px-2 py-1"
-          value={row.en}
-          onChange={(e) => onChange({ en: e.target.value })}
-        />
-        <input
-          type="text"
-          placeholder="越南文譯名"
-          className="flex-1 rounded border border-paper-300 px-2 py-1"
-          value={row.vi}
-          onChange={(e) => onChange({ vi: e.target.value })}
-        />
+      <div className="grid grid-cols-2 gap-1.5">
+        {targetLangs.map((l) => (
+          <input
+            key={l.code}
+            type="text"
+            placeholder={`${zhName(l.code)}譯名`}
+            className="rounded border border-paper-300 px-2 py-1"
+            value={row.translations[l.code] ?? ""}
+            onChange={(e) =>
+              onChange({ translations: { ...row.translations, [l.code]: e.target.value } })
+            }
+          />
+        ))}
       </div>
     </div>
   );
 }
 
 function ExampleCard({ entry }: { entry: GlossaryEntry }) {
+  const parts = Object.entries(entry.translations).map(
+    ([code, text]) => `${code.toUpperCase()}：${text}`,
+  );
   return (
     <div className="rounded border border-paper-200 bg-white p-2 opacity-70">
       <p className="font-medium text-paper-900">{entry.term}</p>
       <p className="text-paper-500">常見錯字：{entry.aliases.join(", ")}</p>
-      <p className="text-paper-500">
-        EN：{entry.en} ／ VI：{entry.vi}
-      </p>
+      <p className="text-paper-500">{parts.join(" ／ ")}</p>
     </div>
   );
 }
