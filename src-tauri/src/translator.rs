@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::config::SharedConfig;
 use crate::errors;
+use crate::languages;
 use crate::session;
 use crate::traces::{self, TraceRecord};
 use crate::verify;
@@ -261,17 +262,25 @@ async fn post_anthropic_with_retry(
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/translate_system.txt");
 
 
-/// Wrap the source text with the most recent (zh, translated) pairs for this
-/// target, so Claude has pronoun + term continuity. Empty context returns
-/// the text unchanged so we don't pay tokens for a useless wrapper.
-fn build_user_message(text: &str, lang_label: &str, history: &VecDeque<(f64, String, String)>) -> String {
+/// Wrap the source text with the most recent (source, translated) pairs for
+/// this target, so Claude has pronoun + term continuity. The context source
+/// line is labeled with the source language code (`zh:` / `ja:` …). Empty
+/// context returns the text unchanged so we don't pay tokens for a useless
+/// wrapper.
+fn build_user_message(
+    text: &str,
+    source_label: &str,
+    lang_label: &str,
+    history: &VecDeque<(f64, String, String)>,
+) -> String {
     if history.is_empty() {
         return text.to_string();
     }
     let mut s = String::from("<context>\n");
-    for (_, zh, tgt) in history {
-        s.push_str("zh: ");
-        s.push_str(zh);
+    for (_, src, tgt) in history {
+        s.push_str(source_label);
+        s.push_str(": ");
+        s.push_str(src);
         s.push('\n');
         s.push_str(lang_label);
         s.push_str(": ");
@@ -283,11 +292,11 @@ fn build_user_message(text: &str, lang_label: &str, history: &VecDeque<(f64, Str
     s
 }
 
-fn target_lang_name(target: &str) -> &str {
-    match target {
-        "vi" => "Vietnamese (Tiếng Việt)",
-        _ => "English",
-    }
+/// Full target-language name for the system prompt's `{lang}` slot, from the
+/// registry. `None` for an unknown target — the caller turns that into a hard
+/// error before any API call rather than silently defaulting to English.
+fn target_lang_name(target: &str) -> Option<&'static str> {
+    languages::get(target).map(|l| l.prompt_name.as_str())
 }
 
 // Buffer this many chars before deciding whether the response is a meta-leak
@@ -298,9 +307,10 @@ fn target_lang_name(target: &str) -> &str {
 // "please provide the chinese" = 26 chars) with a small safety margin and
 // cuts ~50 chars / ~200ms of perceived latency vs. the old 80.
 const META_SCAN_CHARS: usize = 32;
-/// Substrings that almost never appear in legit Chinese-meeting translations
-/// but do appear when Claude breaks character to comment on the input.
-/// Match anywhere in the first META_SCAN_CHARS characters (case-insensitive).
+/// Substrings that almost never appear in legit meeting translations but do
+/// appear when Claude breaks character to comment on the input. Match anywhere
+/// in the first META_SCAN_CHARS characters (case-insensitive).
+/// 與 prototype/eval/checks.py META_MARKERS 同步；改任一邊要同步另一邊。
 const META_MARKERS: &[&str] = &[
     // English meta
     "per the rules",
@@ -345,6 +355,23 @@ const META_MARKERS: &[&str] = &[
     "我没法翻译",
     "空字串",
     "空字符串",
+    // Japanese meta (Claude breaking character for a ja target). Deliberately
+    // NO bare 「申し訳ありません」 — a Chinese source often opens with an apology
+    // that legitimately translates to that phrase, so matching it would drop
+    // real translations.
+    "翻訳できません",
+    "翻訳することができません",
+    "翻訳いたしかねます",
+    "翻訳者として",
+    "通訳者として",
+    "テキストを提供してください",
+    "テキストをご提供",
+    "有効なテキストを提供",
+    "空の文字列を出力",
+    "入力が不完全",
+    "この入力は不完全",
+    "文字化けして",
+    "意味を成していない",
 ];
 
 /// Detect when Claude breaks character and meta-comments instead of translating.
@@ -545,27 +572,46 @@ pub async fn translate(
     text: String,
     target: String,
 ) -> Result<(), String> {
-    let (api_key, model, glossary_block, glossary_entries) = {
+    let (api_key, model, source_code, glossary_block, glossary_entries) = {
         let cfg = config.lock().await;
+        // Only feed glossary entries into the observe-only check when the active
+        // book applies to the current source language (empty otherwise).
+        let glossary_entries = if cfg.glossary_applies() {
+            cfg.active_entries().to_vec()
+        } else {
+            Vec::new()
+        };
         (
             cfg.api.anthropic_api_key.clone(),
             cfg.api.model.clone(),
+            cfg.language.source.clone(),
             cfg.render_glossary_section(&target),
-            cfg.active_entries().to_vec(),
+            glossary_entries,
         )
     };
     if api_key.is_empty() {
         return Err("Anthropic API key not configured (open Settings)".into());
     }
+    // Reject an unknown target before spending a single token — this replaces
+    // the old silent English fallback.
+    let Some(target_name) = target_lang_name(&target) else {
+        return Err(format!("invalid target: {target}"));
+    };
+    // Source-language name for the prompt's {source_lang} slot. The config
+    // source is registry-valid post-sanitize; "中文" is a defensive fallback.
+    let source_name = languages::get(&source_code)
+        .map(|l| l.zh_ui_name.as_str())
+        .unwrap_or("中文");
 
     let history_snapshot: VecDeque<(f64, String, String)> = {
         let map = ctx.lock().await;
         map.get(&target).cloned().unwrap_or_default()
     };
-    let user_message = build_user_message(&text, &target, &history_snapshot);
+    let user_message = build_user_message(&text, &source_code, &target, &history_snapshot);
 
     let system = SYSTEM_TEMPLATE
-        .replace("{lang}", target_lang_name(&target))
+        .replace("{source_lang}", source_name)
+        .replace("{lang}", target_name)
         .replace("{glossary_section}", &glossary_block);
     let body = json!({
         "model": model,
@@ -1212,4 +1258,40 @@ pub async fn read_summary(session_id: String, target: String) -> Result<Option<S
     std::fs::read_to_string(&path)
         .map(Some)
         .map_err(|e| format!("read summary: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn is_meta_prefix_flags_japanese_markers() {
+        assert!(is_meta_prefix("翻訳できません。入力が不完全です。"));
+        assert!(is_meta_prefix("通訳者として、この内容は"));
+    }
+
+    #[test]
+    fn is_meta_prefix_allows_apology_opening() {
+        // A Chinese source often opens with an apology that legitimately
+        // translates to this — must NOT be dropped (there is deliberately no
+        // bare 申し訳ありません marker).
+        assert!(!is_meta_prefix("申し訳ありません、遅れました"));
+    }
+
+    #[test]
+    fn build_user_message_labels_source_with_code() {
+        let mut history: VecDeque<(f64, String, String)> = VecDeque::new();
+        history.push_back((0.0, "日本語のソース".into(), "the translation".into()));
+        let msg = build_user_message("次の文", "ja", "en", &history);
+        assert!(msg.contains("ja: 日本語のソース"), "{msg}");
+        assert!(msg.contains("en: the translation"), "{msg}");
+        assert!(msg.trim_end().ends_with("次の文"), "{msg}");
+    }
+
+    #[test]
+    fn build_user_message_empty_history_returns_text() {
+        let history: VecDeque<(f64, String, String)> = VecDeque::new();
+        assert_eq!(build_user_message("原文", "zh", "en", &history), "原文");
+    }
 }

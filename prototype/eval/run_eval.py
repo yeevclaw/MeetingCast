@@ -30,11 +30,22 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from checks import run_expectations  # noqa: E402
+from checks import _entry_translation, run_expectations  # noqa: E402
 
-# Full target-language labels substituted for {lang} in the system prompt —
-# identical to translator.rs `target_lang_name`.
-LANG_LABELS = {"en": "English", "vi": "Vietnamese (Tiếng Việt)"}
+
+def _load_registry() -> list[dict]:
+    """Load shared/languages.json — the same registry Rust `include_str!`s and
+    the TS frontend imports. Fatal if missing: the eval must render prompts
+    exactly like the shipped path, so a silent fallback could mask drift."""
+    path = SCRIPT_DIR.parents[1] / "shared" / "languages.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+_REGISTRY = _load_registry()
+# {lang} target names (== translator.rs prompt_name) and {source_lang} names
+# (== zh_ui_name), both keyed by language code.
+LANG_LABELS = {e["code"]: e["prompt_name"] for e in _REGISTRY}
+SOURCE_LABELS = {e["code"]: e["zh_ui_name"] for e in _REGISTRY}
 
 # Cost model. USD per 1M tokens (input, output). Assumed per-call token volume
 # is deliberately generous so the printed estimate is an upper-ish bound.
@@ -55,7 +66,9 @@ def resolve(p: str) -> Path:
 
 def render_glossary_section(entries: list[dict], target: str) -> str:
     """Mirror config.rs `render_glossary_section`: only entries with a non-empty
-    term and non-empty target rendering; empty string when nothing applies."""
+    term and a non-empty target rendering (translations map, legacy en/vi
+    fallback via checks._entry_translation); empty string when nothing applies.
+    Source-neutral header, matching the shipped path."""
     if not entries:
         return ""
     lines: list[str] = []
@@ -63,32 +76,37 @@ def render_glossary_section(entries: list[dict], target: str) -> str:
         term = e.get("term", "")
         if not term:
             continue
-        translated = e.get("vi", "") if target == "vi" else e.get("en", "")
+        translated = _entry_translation(e, target)
         if not translated:
             continue
         lines.append(f"- {term} → {translated}")
     if not lines:
         return ""
-    return "\n\n術語表（以下中文一律使用對應譯法，不要意譯）：\n" + "\n".join(lines)
+    return "\n\n術語表（以下原文術語一律使用對應譯法，不要意譯）：\n" + "\n".join(lines)
 
 
-def build_system(template: str, target: str, glossary: list[dict]) -> str:
-    """Substitute {lang} and {glossary_section} exactly like translator.rs."""
-    return template.replace("{lang}", LANG_LABELS[target]).replace(
-        "{glossary_section}", render_glossary_section(glossary, target)
+def build_system(template: str, source: str, target: str, glossary: list[dict]) -> str:
+    """Substitute {source_lang}, {lang}, {glossary_section} exactly like
+    translator.rs. An old prompt lacking the {source_lang} placeholder just
+    leaves that replace a no-op (see the A/B warning in main)."""
+    return (
+        template.replace("{source_lang}", SOURCE_LABELS.get(source, "中文"))
+        .replace("{lang}", LANG_LABELS[target])
+        .replace("{glossary_section}", render_glossary_section(glossary, target))
     )
 
 
-def build_user_message(text: str, target: str, context: list[dict]) -> str:
-    """Wrap prior (zh, translation) pairs in the <context> block, matching
-    translator.rs `build_user_message`. The pair label is the raw target code
-    ("en"/"vi") — that's the second argument the Rust caller passes. Empty
-    context returns the text unchanged."""
+def build_user_message(text: str, source: str, target: str, context: list[dict]) -> str:
+    """Wrap prior (source, translation) pairs in the <context> block, matching
+    translator.rs `build_user_message`. The source line is labeled with the
+    source language code, the target line with the target code. Empty context
+    returns the text unchanged."""
     if not context:
         return text
     parts = ["<context>\n"]
     for pair in context:
-        parts.append("zh: " + pair["zh"] + "\n")
+        src_text = pair.get("source", pair.get("zh", ""))
+        parts.append(source + ": " + src_text + "\n")
         parts.append(target + ": " + pair["translation"] + "\n\n")
     parts.append("</context>\n\n")
     parts.append(text)
@@ -122,11 +140,12 @@ def load_cases(path: Path) -> list[dict]:
     return cases
 
 
-def effective_targets(case: dict, requested: list[str]) -> list[str]:
+def effective_targets(case: dict, requested: list[str], source: str) -> list[str]:
     """Intersection of a case's declared targets with the CLI --targets,
-    order-preserving on the requested list."""
+    order-preserving on the requested list, excluding any target equal to the
+    source language (a language is never translated into itself)."""
     case_targets = case.get("targets", ["en", "vi"])
-    return [t for t in requested if t in case_targets]
+    return [t for t in requested if t in case_targets and t != source]
 
 
 def main() -> int:
@@ -136,6 +155,11 @@ def main() -> int:
     )
     parser.add_argument("--cases", default="golden/translation_cases.jsonl")
     parser.add_argument("--targets", default="en,vi")
+    parser.add_argument(
+        "--source",
+        default="zh",
+        help="Default source language for cases without a source_lang field.",
+    )
     parser.add_argument("--model", default="claude-haiku-4-5")
     parser.add_argument(
         "--prompt-file",
@@ -163,17 +187,28 @@ def main() -> int:
     for t in requested_targets:
         if t not in LANG_LABELS:
             sys.exit(f"unsupported target {t!r} (supported: {', '.join(LANG_LABELS)})")
+    if args.source not in SOURCE_LABELS:
+        sys.exit(
+            f"unsupported --source {args.source!r} (supported: {', '.join(SOURCE_LABELS)})"
+        )
 
     if not prompt_path.exists():
         sys.exit(f"prompt file not found: {prompt_path}")
     template = prompt_path.read_text(encoding="utf-8")
+    if "{source_lang}" not in template:
+        print(
+            "warning: prompt file has no {source_lang} placeholder — source "
+            "substitution is a no-op (A/B'ing a pre-multi-language prompt?)."
+        )
     cases = load_cases(cases_path)
 
-    # Build the ordered work list: one (case, target) per API call.
-    work: list[tuple[dict, str]] = []
+    # Build the ordered work list: one (case, source, target) per API call.
+    # A per-case source_lang wins; otherwise the CLI --source default applies.
+    work: list[tuple[dict, str, str]] = []
     for case in cases:
-        for target in effective_targets(case, requested_targets):
-            work.append((case, target))
+        source = case.get("source_lang", args.source)
+        for target in effective_targets(case, requested_targets, source):
+            work.append((case, source, target))
 
     n_calls = len(work)
     price_in, price_out = PRICES.get(args.model, (1.0, 5.0))
@@ -196,13 +231,14 @@ def main() -> int:
 
     if args.dry_run:
         print("\n--dry-run: sample rendered request bodies (first 2), no API call:\n")
-        for case, target in work[:2]:
-            system = build_system(template, target, case.get("glossary", []))
+        for case, source, target in work[:2]:
+            system = build_system(template, source, target, case.get("glossary", []))
+            case_text = case.get("source", case.get("zh", ""))
             user_message = build_user_message(
-                case["zh"], target, case.get("context", [])
+                case_text, source, target, case.get("context", [])
             )
             body = build_body(args.model, system, user_message)
-            print(f"--- id={case['id']} target={target} ---")
+            print(f"--- id={case['id']} source={source} target={target} ---")
             print(json.dumps(body, ensure_ascii=False, indent=2))
             print()
         print("dry-run complete — exited before any network call.")
@@ -236,10 +272,11 @@ def main() -> int:
     tally: dict[str, dict[str, int]] = {}
     total_in = total_out = 0
 
-    for case, target in work:
+    for case, source, target in work:
         category = case.get("category", "uncategorized")
-        system = build_system(template, target, case.get("glossary", []))
-        user_message = build_user_message(case["zh"], target, case.get("context", []))
+        system = build_system(template, source, target, case.get("glossary", []))
+        case_text = case.get("source", case.get("zh", ""))
+        user_message = build_user_message(case_text, source, target, case.get("context", []))
         body = build_body(args.model, system, user_message)
         try:
             resp = client.messages.create(**body)
@@ -270,8 +307,9 @@ def main() -> int:
         rec = {
             "id": case["id"],
             "category": category,
+            "source": source,
             "target": target,
-            "zh": case["zh"],
+            "zh": case_text,
             "translation": translation,
             "pass": passed,
             "failures": failures,

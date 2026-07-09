@@ -5,7 +5,9 @@ Pure functions that mirror the runtime guards in
 filter in `src-tauri/src/translator.rs`. The point is parity: an eval
 failure here should correspond to something the shipped Rust code would
 also flag. Any drift between these functions and their Rust originals is a
-bug — keep them in sync.
+bug — keep them in sync. In particular the META_MARKERS list (per-language
+meta-leak groups) and the script-profile thresholds must match
+translator.rs / verify.rs verbatim.
 """
 from __future__ import annotations
 
@@ -63,6 +65,23 @@ META_MARKERS = (
     "我没法翻译",
     "空字串",
     "空字符串",
+    # Japanese meta (Claude breaking character for a ja target). Deliberately
+    # NO bare 「申し訳ありません」 — a Chinese source often opens with an apology
+    # that legitimately translates to that phrase, so matching it would drop
+    # real translations.
+    "翻訳できません",
+    "翻訳することができません",
+    "翻訳いたしかねます",
+    "翻訳者として",
+    "通訳者として",
+    "テキストを提供してください",
+    "テキストをご提供",
+    "有効なテキストを提供",
+    "空の文字列を出力",
+    "入力が不完全",
+    "この入力は不完全",
+    "文字化けして",
+    "意味を成していない",
 )
 
 
