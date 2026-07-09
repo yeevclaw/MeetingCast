@@ -259,7 +259,10 @@ def run_expectations(case: dict, target: str, translation: str) -> list[str]:
     if is_wrong_language(translation, target):
         failures.append(f"wrong language (CJK-dominant) for target {target}")
     for term in glossary_violations(
-        case.get("zh", ""), translation, case.get("glossary", []), target
+        case.get("source", case.get("zh", "")),
+        translation,
+        case.get("glossary", []),
+        target,
     ):
         failures.append(f"glossary miss: {term}")
 
