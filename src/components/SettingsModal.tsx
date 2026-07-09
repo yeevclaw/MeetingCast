@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { AudioDevice, Config } from "@/lib/types";
+import { LANGS, selectLabel, zhName } from "@/lib/languages";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 const SUMMARY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
@@ -17,13 +19,41 @@ const SUMMARY_TEMPLATES: Array<{ id: string; label: string }> = [
   { id: "slide_outline", label: "簡報重點" },
 ];
 
-const SUMMARY_TARGETS: Array<{ id: string; label: string }> = [
-  { id: "zh", label: "中文" },
-  { id: "en", label: "English" },
-  { id: "vi", label: "Tiếng Việt" },
-];
+// Summary target languages, derived from the shared registry so adding a
+// language surfaces it here automatically. Labels are the 繁中 UI names
+// (中文 / 英文 / 日文 / 越南文).
+const SUMMARY_TARGETS: Array<{ id: string; label: string }> = LANGS.map((l) => ({
+  id: l.code,
+  label: zhName(l.code),
+}));
 
 type Backend = "local" | "cloud" | "openai";
+
+// Language <option>s for a translation-slot select. A code is disabled (with
+// an explanatory title) when it equals the source language or is already used
+// by the other slot, so the same language can't drive both windows.
+function slotOptions(source: string, otherSlot: string, otherName: "一" | "二") {
+  return LANGS.map((l) => {
+    const sameAsSource = l.code === source;
+    const usedByOther = otherSlot !== "" && l.code === otherSlot;
+    return (
+      <option
+        key={l.code}
+        value={l.code}
+        disabled={sameAsSource || usedByOther}
+        title={
+          sameAsSource
+            ? "與來源語言相同"
+            : usedByOther
+              ? `已用於譯文視窗${otherName}`
+              : undefined
+        }
+      >
+        {selectLabel(l.code)}
+      </option>
+    );
+  });
+}
 
 export default function SettingsModal({
   onClose,
@@ -50,6 +80,17 @@ export default function SettingsModal({
   const [devices, setDevices] = useState<AudioDevice[] | null>(null);
   const [devicesError, setDevicesError] = useState<string | null>(null);
   const [refreshingDevices, setRefreshingDevices] = useState(false);
+  // Transient note shown when picking a new source language collides with a
+  // translation slot and we auto-swap that slot to the old source. Cleared on
+  // the next language change or on save.
+  const [swapNote, setSwapNote] = useState<string | null>(null);
+  // Which translation-slot windows the user has manually closed (null on
+  // getByLabel). An enabled slot with a closed window can't show translations
+  // until the app restarts — surfaced as a warning under that field.
+  const [closedSlots, setClosedSlots] = useState<{ t1: boolean; t2: boolean }>({
+    t1: false,
+    t2: false,
+  });
   // Dedup concurrent refreshes — without this, React StrictMode's double-
   // mount fires two list_audio_devices in flight simultaneously, the second
   // overwrites the first's oneshot in the Rust side, and the first call
@@ -82,10 +123,27 @@ export default function SettingsModal({
     refreshDevices();
   }, [refreshDevices]);
 
+  // Detect translation windows the user has closed by hand. StrictMode double-
+  // mounts this effect; the cancelled flag drops the stale run's setState.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [w1, w2] = await Promise.all([
+        WebviewWindow.getByLabel("t1"),
+        WebviewWindow.getByLabel("t2"),
+      ]);
+      if (!cancelled) setClosedSlots({ t1: w1 === null, t2: w2 === null });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function handleSave() {
     if (!cfg) return;
     setSaving(true);
     setError(null);
+    setSwapNote(null);
     try {
       await invoke("set_config", { config: cfg });
       onClose();
@@ -114,6 +172,33 @@ export default function SettingsModal({
   function updateSummary(patch: Partial<Config["summary"]>) {
     if (!cfg) return;
     setCfg({ ...cfg, summary: { ...cfg.summary, ...patch } });
+  }
+
+  // Pick a new source language. If it collides with an existing translation
+  // slot, auto-swap that slot to the OLD source (the slots are always distinct
+  // and never equal the source, so this can't produce a duplicate) and leave a
+  // transient note explaining the swap.
+  function handleSourceChange(newSource: string) {
+    if (!cfg || newSource === cfg.language.source) return;
+    const oldSource = cfg.language.source;
+    const slots = [...cfg.language.target_slots];
+    let note: string | null = null;
+    for (let i = 0; i < slots.length; i++) {
+      if (slots[i] === newSource) {
+        slots[i] = oldSource;
+        note = `已自動將譯文視窗${i === 0 ? "一" : "二"}改為${zhName(oldSource)}（原設定與來源語言相同）`;
+      }
+    }
+    setSwapNote(note);
+    setCfg({ ...cfg, language: { source: newSource, target_slots: slots } });
+  }
+
+  function handleSlotChange(idx: number, value: string) {
+    if (!cfg) return;
+    setSwapNote(null);
+    const slots = [...cfg.language.target_slots];
+    slots[idx] = value;
+    setCfg({ ...cfg, language: { ...cfg.language, target_slots: slots } });
   }
 
   return (
@@ -226,6 +311,66 @@ export default function SettingsModal({
             </Field>
 
             <Field
+              label="來源語言"
+              hint={
+                running
+                  ? "錄音中無法變更語言，請先停止"
+                  : "你在會議中說的語言；變更後於下次開始錄音生效"
+              }
+            >
+              <select
+                className="w-full rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
+                value={cfg.language.source}
+                onChange={(e) => handleSourceChange(e.target.value)}
+                disabled={running}
+              >
+                {LANGS.map((l) => (
+                  <option key={l.code} value={l.code}>
+                    {selectLabel(l.code)}
+                  </option>
+                ))}
+              </select>
+              {swapNote && (
+                <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
+                  {swapNote}
+                </p>
+              )}
+            </Field>
+
+            <Field label="譯文視窗一">
+              <select
+                className="w-full rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
+                value={cfg.language.target_slots[0]}
+                onChange={(e) => handleSlotChange(0, e.target.value)}
+                disabled={running}
+              >
+                {slotOptions(cfg.language.source, cfg.language.target_slots[1], "二")}
+              </select>
+              {cfg.language.target_slots[0] !== "" && closedSlots.t1 && (
+                <p className="mt-1 text-xs text-warn-700">
+                  譯文視窗已被手動關閉，重新啟動 App 後才會重新出現
+                </p>
+              )}
+            </Field>
+
+            <Field label="譯文視窗二" hint="設為「不使用」可只留一個譯文視窗">
+              <select
+                className="w-full rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
+                value={cfg.language.target_slots[1]}
+                onChange={(e) => handleSlotChange(1, e.target.value)}
+                disabled={running}
+              >
+                <option value="">不使用</option>
+                {slotOptions(cfg.language.source, cfg.language.target_slots[0], "一")}
+              </select>
+              {cfg.language.target_slots[1] !== "" && closedSlots.t2 && (
+                <p className="mt-1 text-xs text-warn-700">
+                  譯文視窗已被手動關閉，重新啟動 App 後才會重新出現
+                </p>
+              )}
+            </Field>
+
+            <Field
               label="辨識引擎"
               hint={
                 running
@@ -245,7 +390,7 @@ export default function SettingsModal({
               </select>
               {backend === "openai" && (
                 <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
-                  ⚠ OpenAI Realtime Whisper 僅輸出簡體中文，且不支援術語表注入。
+                  ⚠ OpenAI Realtime Whisper 不支援術語表注入；來源語言為中文時只會輸出簡體字。
                   優點：邊講邊出字（live captioning）、技術詞彙準確度較佳。
                 </p>
               )}

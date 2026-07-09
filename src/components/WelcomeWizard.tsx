@@ -122,14 +122,14 @@ export default function WelcomeWizard({
             <div className="mt-5 space-y-3 text-sm text-paper-700">
               <p>會議中你說中文，MeetingCast 會：</p>
               <ul className="ml-1 space-y-1.5">
-                <li>🎙 即時辨識成中文逐字稿</li>
-                <li>🌐 並行翻譯成英文與越南文，分別顯示在兩個獨立視窗</li>
+                <li>🎙 即時辨識成逐字稿（預設中文）</li>
+                <li>🌐 並行翻譯成兩種語言（預設英文＋越南文，可在「設定 → 語言」變更）</li>
                 <li>📺 譯文視窗可拖到外接螢幕，給外籍同仁閱讀</li>
               </ul>
               <div className="rounded-lg border border-paper-200 bg-paper-100 px-3 py-2.5">
                 <p className="text-xs font-medium text-paper-700">接下來會發生什麼</p>
                 <ul className="mt-1.5 space-y-1 text-xs text-paper-600">
-                  <li>🪟 App 會開啟三個視窗：控制視窗＋英文、越南文譯文視窗（可拖到外接螢幕）</li>
+                  <li>🪟 App 會開啟三個視窗：控制視窗＋兩個譯文視窗（可拖到外接螢幕）</li>
                   <li>🎤 macOS 會跳出麥克風授權對話框，請按「允許」</li>
                   <li>⬇️ 首次啟動會在背景下載語音模型（約 1.6 GB），下載期間可先完成設定</li>
                 </ul>
