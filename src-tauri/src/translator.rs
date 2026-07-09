@@ -1041,8 +1041,8 @@ pub async fn generate_summary(
 
     let transcript_lines: Vec<String> = utterances
         .iter()
-        .filter(|u| !u.zh.trim().is_empty())
-        .map(|u| u.zh.trim().to_string())
+        .filter(|u| !u.src.trim().is_empty())
+        .map(|u| u.src.trim().to_string())
         .collect();
     if transcript_lines.is_empty() {
         return Err("這場會議沒有可總結的逐字稿".into());
@@ -1248,7 +1248,7 @@ pub async fn generate_summary(
 
 #[tauri::command]
 pub async fn read_summary(session_id: String, target: String) -> Result<Option<String>, String> {
-    if !matches!(target.as_str(), "zh" | "en" | "vi") {
+    if !languages::is_valid(&target) {
         return Err(format!("invalid target: {target}"));
     }
     let path = session::session_dir(&session_id).join(format!("summary.{target}.md"));
