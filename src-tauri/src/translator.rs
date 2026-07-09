@@ -768,15 +768,6 @@ struct SummaryDone {
     path: String,
 }
 
-fn target_lang_label(target: &str) -> Option<&'static str> {
-    match target {
-        "zh" => Some("繁體中文"),
-        "en" => Some("English"),
-        "vi" => Some("Tiếng Việt"),
-        _ => None,
-    }
-}
-
 /// Per (template, target) section heading list. Section count varies by
 /// template (4–6) so we return a Vec rather than a fixed-size array. The
 /// headings show up verbatim as `## {heading}` in the model's output.
@@ -784,22 +775,27 @@ fn template_headings(template: &str, target: &str) -> Option<Vec<&'static str>> 
     match (template, target) {
         ("exec_brief", "zh") => Some(vec!["摘要", "決議事項", "Action items", "待澄清議題"]),
         ("exec_brief", "en") => Some(vec!["Summary", "Decisions", "Action Items", "Open Questions"]),
+        ("exec_brief", "ja") => Some(vec!["概要", "決定事項", "アクションアイテム", "未解決の課題"]),
         ("exec_brief", "vi") => Some(vec!["Tóm tắt", "Quyết định", "Hành động", "Vấn đề chưa rõ"]),
 
         ("minutes", "zh") => Some(vec!["與會者", "議題清單", "討論摘要", "決議事項", "行動方案", "後續事項"]),
         ("minutes", "en") => Some(vec!["Attendees", "Agenda", "Discussion", "Decisions", "Action Items", "Follow-up"]),
+        ("minutes", "ja") => Some(vec!["出席者", "アジェンダ", "討議内容", "決定事項", "アクションアイテム", "フォローアップ"]),
         ("minutes", "vi") => Some(vec!["Người tham dự", "Chương trình", "Thảo luận", "Quyết định", "Hành động", "Theo dõi"]),
 
         ("discussion", "zh") => Some(vec!["議題背景", "主題與觀點", "共識點", "分歧點", "待驗證假設", "Parking Lot"]),
         ("discussion", "en") => Some(vec!["Topic Background", "Themes and Perspectives", "Points of Agreement", "Points of Divergence", "Open Hypotheses", "Parking Lot"]),
+        ("discussion", "ja") => Some(vec!["背景", "テーマと見解", "合意点", "相違点", "検証すべき仮説", "Parking Lot"]),
         ("discussion", "vi") => Some(vec!["Bối cảnh", "Chủ đề và quan điểm", "Đồng thuận", "Khác biệt", "Giả định cần xác nhận", "Để dành sau"]),
 
         ("decision_log", "zh") => Some(vec!["待決策問題", "候選方案", "論點與反論", "最終決定", "未採納方案的理由", "風險與假設"]),
         ("decision_log", "en") => Some(vec!["Decision Question", "Options Considered", "Arguments For and Against", "Decision", "Why Other Options Were Rejected", "Risks and Assumptions"]),
+        ("decision_log", "ja") => Some(vec!["決定すべき課題", "選択肢", "賛成論と反対論", "最終決定", "不採用の理由", "リスクと前提"]),
         ("decision_log", "vi") => Some(vec!["Vấn đề cần quyết định", "Phương án", "Lập luận ủng hộ và phản đối", "Quyết định cuối cùng", "Lý do từ chối phương án khác", "Rủi ro và giả định"]),
 
         ("client_call", "zh") => Some(vec!["客戶情境", "需求與反對意見", "我方承諾", "Champion / Blocker", "Next Steps", "BANT 訊號"]),
         ("client_call", "en") => Some(vec!["Client Context", "Needs and Objections", "Our Commitments", "Champion / Blocker", "Next Steps", "BANT Signals"]),
+        ("client_call", "ja") => Some(vec!["顧客の状況", "ニーズと懸念", "当方のコミットメント", "Champion / Blocker", "Next Steps", "BANTシグナル"]),
         ("client_call", "vi") => Some(vec!["Bối cảnh khách hàng", "Nhu cầu và phản đối", "Cam kết của chúng tôi", "Champion / Blocker", "Bước tiếp theo", "Tín hiệu BANT"]),
 
         _ => None,
@@ -816,9 +812,9 @@ fn template_section_rules(template: &str) -> Option<&'static str> {
         "exec_brief" => Some(
             "\n各段落要求：\n\
             - 第 1 段（摘要）：3–5 句陳述會議要點，連續散文不要列點\n\
-            - 第 2 段（決議事項）：bullet list；沒有則寫「（無）」/「(none)」/「(không có)」\n\
+            - 第 2 段（決議事項）：bullet list；沒有則寫「（無）」/「(none)」/「(không có)」/「（なし）」\n\
             - 第 3 段（Action items）：`- [ ] 任務 — 負責人（期限）`；資訊缺漏寫「未明」\n\
-            - 第 4 段（待澄清議題）：bullet list；沒有則寫「（無）」"
+            - 第 4 段（待澄清議題）：bullet list；沒有則寫「（無）」/「（なし）」"
         ),
         "minutes" => Some(
             "\n各段落要求：\n\
@@ -866,6 +862,7 @@ fn template_section_rules(template: &str) -> Option<&'static str> {
 
 fn build_summary_system(
     target_label: &str,
+    source_label: &str,
     headings: &[&str],
     section_rules: &str,
     glossary_block: &str,
@@ -877,7 +874,7 @@ fn build_summary_system(
         .join("\n");
     let n = headings.len();
     format!(
-        "你是專業會議分析師。根據使用者提供的中文會議逐字稿，輸出結構化會議總結。\n\
+        "你是專業會議分析師。根據使用者提供的{source_label}會議逐字稿，輸出結構化會議總結。\n\
 \n\
 共通規則：\n\
 1. 整份輸出以 {target_label} 撰寫（除人名、公司名、產品名等專有名詞保留原文）\n\
@@ -893,14 +890,20 @@ fn build_summary_system(
 /// (one per slide, 6–10 total) instead of a fixed list — so it bypasses
 /// the heading-list scaffolding in `build_summary_system` and gets its
 /// own prompt.
-fn build_slide_outline_system(target_label: &str, target: &str, glossary_block: &str) -> String {
+fn build_slide_outline_system(
+    target_label: &str,
+    source_label: &str,
+    target: &str,
+    glossary_block: &str,
+) -> String {
     let (cover, agenda, decisions, next_steps) = match target {
         "en" => ("Cover", "Agenda", "Decisions & Action Items", "Next Steps"),
+        "ja" => ("表紙", "アジェンダ", "決定事項・アクションアイテム", "次のステップ"),
         "vi" => ("Trang bìa", "Chương trình", "Quyết định & Hành động", "Bước tiếp theo"),
         _ => ("封面", "議程", "決議與 Action Items", "Next Steps"),
     };
     format!(
-        "你是專業會議分析師。將中文會議逐字稿轉成投影片大綱，輸出格式可直接餵給 AI 簡報生成工具（ChatGPT / Gemini Slides / Claude 等）一鍵產生 PowerPoint / Google Slides。\n\
+        "你是專業會議分析師。將{source_label}會議逐字稿轉成投影片大綱，輸出格式可直接餵給 AI 簡報生成工具（ChatGPT / Gemini Slides / Claude 等）一鍵產生 PowerPoint / Google Slides。\n\
 \n\
 規則：\n\
 1. 整份輸出以 {target_label} 撰寫（除人名、公司名、產品名等專有名詞保留原文）\n\
@@ -1004,28 +1007,43 @@ pub async fn generate_summary(
     template: Option<String>,
 ) -> Result<(), String> {
     let template = template.unwrap_or_else(|| "exec_brief".into());
-    let Some(target_label) = target_lang_label(&target) else {
+    // Target-language label = registry native_name (日本語 / English / …).
+    // Byte-compatible with the old target_lang_label for zh/en/vi; unknown
+    // targets still hit the invalid-target error path below.
+    let Some(target_label) = languages::get(&target).map(|l| l.native_name.as_str()) else {
         return Err(format!("invalid target: {target}"));
     };
 
-    // Glossary block is injected for non-zh targets only — zh→zh mapping is
-    // identity and adds nothing. For en/vi, the block forces Sonnet to render
-    // proper nouns the same way the live-translation path does, so summary
-    // and chunked translation stay in sync.
-    let glossary_block = {
+    // Glossary block + the meeting's source language, read under one lock. The
+    // glossary maps a source term to its target translation, so a source→source
+    // "translation" is the identity and adds nothing — skip injection whenever
+    // the target equals the meeting source (the common zh-meeting→zh-summary
+    // case). For a differing target the block forces the model to render proper
+    // nouns the same way the live-translation path does, keeping summary and
+    // chunked translation in sync. render_glossary_section itself returns ""
+    // when the active book doesn't apply to the current source language.
+    let (glossary_block, source_code) = {
         let cfg = config.lock().await;
-        if target == "zh" {
+        let source_code = cfg.language.source.clone();
+        let block = if !cfg.glossary_applies() || target == source_code {
             String::new()
         } else {
             cfg.render_glossary_section(&target)
-        }
+        };
+        (block, source_code)
     };
+    // Source-language label = registry zh_ui_name (中文 / 英文 / 日文 / 越南文);
+    // the config source is registry-valid post-sanitize, "中文" is a defensive
+    // fallback (and keeps the zh-source prompt byte-identical to the old one).
+    let source_label = languages::get(&source_code)
+        .map(|l| l.zh_ui_name.as_str())
+        .unwrap_or("中文");
 
     // Slide outline has a variable number of slides — bypass the fixed-
     // heading scaffolding entirely. All other templates fall through to
     // the headings/section_rules path.
     let system = if template == "slide_outline" {
-        build_slide_outline_system(target_label, &target, &glossary_block)
+        build_slide_outline_system(target_label, source_label, &target, &glossary_block)
     } else {
         let Some(headings) = template_headings(&template, &target) else {
             return Err(format!("invalid template: {template}"));
@@ -1033,7 +1051,7 @@ pub async fn generate_summary(
         let Some(section_rules) = template_section_rules(&template) else {
             return Err(format!("invalid template: {template}"));
         };
-        build_summary_system(target_label, &headings, section_rules, &glossary_block)
+        build_summary_system(target_label, source_label, &headings, section_rules, &glossary_block)
     };
 
     let utterances = session::read_transcript(&session_id)?;
@@ -1070,7 +1088,7 @@ pub async fn generate_summary(
     }
 
     let user_text = format!(
-        "以下是 {duration_min} 分鐘的會議逐字稿（中文）：\n\n---\n{transcript_body}\n---\n\n請輸出 {target_label} 的會議總結。"
+        "以下是 {duration_min} 分鐘的會議逐字稿（{source_label}）：\n\n---\n{transcript_body}\n---\n\n請輸出 {target_label} 的會議總結。"
     );
 
     let body = json!({
@@ -1293,5 +1311,86 @@ mod tests {
     fn build_user_message_empty_history_returns_text() {
         let history: VecDeque<(f64, String, String)> = VecDeque::new();
         assert_eq!(build_user_message("原文", "zh", "en", &history), "原文");
+    }
+
+    // ---- summary heading templates + source/target parameterization ----
+
+    #[test]
+    fn template_headings_every_arm_present_with_expected_count() {
+        // Every (heading template × registry language) arm must resolve, with
+        // the documented section count (exec_brief 4, the rest 6).
+        let expected: &[(&str, usize)] = &[
+            ("exec_brief", 4),
+            ("minutes", 6),
+            ("discussion", 6),
+            ("decision_log", 6),
+            ("client_call", 6),
+        ];
+        for (template, count) in expected {
+            for lang in ["zh", "en", "ja", "vi"] {
+                let headings = template_headings(template, lang)
+                    .unwrap_or_else(|| panic!("missing arm for ({template}, {lang})"));
+                assert_eq!(headings.len(), *count, "({template}, {lang}) heading count");
+            }
+        }
+    }
+
+    #[test]
+    fn template_headings_ja_exec_brief_exact_vector() {
+        assert_eq!(
+            template_headings("exec_brief", "ja").unwrap(),
+            vec!["概要", "決定事項", "アクションアイテム", "未解決の課題"]
+        );
+    }
+
+    #[test]
+    fn template_headings_unknown_returns_none() {
+        assert!(template_headings("exec_brief", "fr").is_none());
+        assert!(template_headings("nope", "ja").is_none());
+    }
+
+    #[test]
+    fn build_summary_system_parameterizes_source_and_target() {
+        // ja target (native_name 日本語) summarizing an en meeting (zh_ui_name 英文).
+        let target_label = crate::languages::get("ja").unwrap().native_name.as_str();
+        let source_label = crate::languages::get("en").unwrap().zh_ui_name.as_str();
+        let headings = template_headings("exec_brief", "ja").unwrap();
+        let sys = build_summary_system(target_label, source_label, &headings, "", "");
+        assert!(sys.contains("英文會議逐字稿"), "source label: {sys}");
+        assert!(sys.contains("日本語"), "target label: {sys}");
+        for h in ["概要", "決定事項", "アクションアイテム", "未解決の課題"] {
+            assert!(sys.contains(&format!("## {h}")), "missing ## {h}: {sys}");
+        }
+    }
+
+    #[test]
+    fn build_summary_system_zh_source_is_byte_compatible() {
+        // zh source (zh_ui_name 中文) must reproduce the pre-multi-language
+        // literal 「中文會議逐字稿」 so the shipped zh-source prompt is unchanged.
+        let target_label = crate::languages::get("zh").unwrap().native_name.as_str();
+        let source_label = crate::languages::get("zh").unwrap().zh_ui_name.as_str();
+        let headings = template_headings("exec_brief", "zh").unwrap();
+        let sys = build_summary_system(target_label, source_label, &headings, "", "");
+        assert!(sys.contains("中文會議逐字稿"), "{sys}");
+    }
+
+    #[test]
+    fn slide_outline_system_has_ja_headings_and_source_label() {
+        let target_label = crate::languages::get("ja").unwrap().native_name.as_str();
+        let source_label = crate::languages::get("zh").unwrap().zh_ui_name.as_str();
+        let sys = build_slide_outline_system(target_label, source_label, "ja", "");
+        for h in ["表紙", "アジェンダ", "決定事項・アクションアイテム", "次のステップ"] {
+            assert!(sys.contains(h), "missing ja slide heading {h}: {sys}");
+        }
+        assert!(sys.contains("中文會議逐字稿"), "source label: {sys}");
+    }
+
+    #[test]
+    fn slide_outline_system_zh_source_is_byte_compatible() {
+        let target_label = crate::languages::get("zh").unwrap().native_name.as_str();
+        let source_label = crate::languages::get("zh").unwrap().zh_ui_name.as_str();
+        let sys = build_slide_outline_system(target_label, source_label, "zh", "");
+        assert!(sys.contains("將中文會議逐字稿轉成投影片大綱"), "{sys}");
+        assert!(sys.contains("封面"), "{sys}");
     }
 }
