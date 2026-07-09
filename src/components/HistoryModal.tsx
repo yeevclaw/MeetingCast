@@ -1,14 +1,49 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { LANG_CODES, LANGS, zhName } from "@/lib/languages";
 import type { SessionMeta, StoredUtterance } from "@/lib/types";
 
-type SummaryLang = "zh" | "en" | "vi";
-const SUMMARY_LANGS: Array<{ id: SummaryLang; label: string }> = [
-  { id: "zh", label: "中文" },
-  { id: "en", label: "English" },
-  { id: "vi", label: "Tiếng Việt" },
-];
+// A summary target is any registry language code; "transcript" is the extra
+// non-summary tab, handled separately from the language tabs.
+type SummaryLang = string;
+
+// A transcript row folded into one render shape. New sessions arrive in v2
+// form (src + translations map); a legacy {zh,en,vi} row is folded the same
+// way so old sessions render pixel-identically.
+type NormalizedRow = {
+  id?: string;
+  t_start: number;
+  t_end: number;
+  src: string;
+  translations: [string, string][];
+  incomplete?: boolean;
+};
+
+function normalizeStored(u: StoredUtterance): NormalizedRow {
+  const base = {
+    id: u.id,
+    t_start: u.t_start,
+    t_end: u.t_end,
+    incomplete: u.incomplete,
+  };
+  // Legacy v1 row: flat zh/en/vi, no v2 src. Fold zh -> src, en/vi -> entries.
+  if (!u.src && (u.zh || u.en || u.vi)) {
+    const entries: [string, string][] = [];
+    if (u.en) entries.push(["en", u.en]);
+    if (u.vi) entries.push(["vi", u.vi]);
+    return { ...base, src: u.zh ?? "", translations: entries };
+  }
+  // v2 row: translations map in registry (BTreeMap) order.
+  return { ...base, src: u.src, translations: Object.entries(u.translations ?? {}) };
+}
+
+// Fresh per-language summary caches, keyed by every registry code so a newly
+// opened session starts each language tab empty.
+const emptySummaries = (): Record<string, string | null> =>
+  Object.fromEntries(LANG_CODES.map((c): [string, string | null] => [c, null]));
+const emptyIssues = (): Record<string, string[] | null> =>
+  Object.fromEntries(LANG_CODES.map((c): [string, string[] | null] => [c, null]));
 
 type SummaryTemplate =
   | "exec_brief"
@@ -82,16 +117,16 @@ export default function HistoryModal({
   // Reset whenever the user navigates to a different session.
   type ViewMode = "transcript" | SummaryLang;
   const [viewMode, setViewMode] = useState<ViewMode>("transcript");
-  const [summaries, setSummaries] = useState<Record<SummaryLang, string | null>>(
-    { zh: null, en: null, vi: null },
+  const [summaries, setSummaries] = useState<Record<string, string | null>>(
+    emptySummaries,
   );
   const [streamingTarget, setStreamingTarget] = useState<SummaryLang | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   // Deterministic structure-check findings from `summary:verify`, keyed by
   // lang. Rendered as a non-blocking warning above the summary content.
   const [summaryIssues, setSummaryIssues] = useState<
-    Record<SummaryLang, string[] | null>
-  >({ zh: null, en: null, vi: null });
+    Record<string, string[] | null>
+  >(emptyIssues);
   // Single template selection shared across the three lang tabs — most users
   // pick a style for the whole meeting, not per-lang.
   const [summaryTemplate, setSummaryTemplate] =
@@ -130,8 +165,8 @@ export default function HistoryModal({
     setDetailLoading(true);
     setConfirmDelete(false);
     setSummaryError(null);
-    setSummaries({ zh: null, en: null, vi: null });
-    setSummaryIssues({ zh: null, en: null, vi: null });
+    setSummaries(emptySummaries());
+    setSummaryIssues(emptyIssues());
     setViewMode("transcript");
     setPendingRegenerate(null);
     try {
@@ -147,15 +182,15 @@ export default function HistoryModal({
     }
     // Pre-load any existing summary files in parallel — we want them ready
     // when the user clicks a tab without making them wait for a re-fetch.
-    for (const lang of SUMMARY_LANGS) {
+    for (const code of LANG_CODES) {
       invoke<string | null>("read_summary", {
         sessionId: meta.session_id,
-        target: lang.id,
+        target: code,
       })
         .then((content) => {
           // Discard if user already navigated away.
           if (selectedIdRef.current !== meta.session_id) return;
-          setSummaries((s) => ({ ...s, [lang.id]: content }));
+          setSummaries((s) => ({ ...s, [code]: content }));
         })
         .catch(() => {});
     }
@@ -196,6 +231,11 @@ export default function HistoryModal({
           m && m.session_id === e.payload.session_id
             ? {
                 ...m,
+                // v2: push the target into has_summaries (dedup); keep the
+                // legacy bools in sync for downgrade / old code paths.
+                has_summaries: m.has_summaries?.includes(e.payload.target)
+                  ? m.has_summaries
+                  : [...(m.has_summaries ?? []), e.payload.target],
                 has_summary_zh: e.payload.target === "zh" || m.has_summary_zh,
                 has_summary_en: e.payload.target === "en" || m.has_summary_en,
                 has_summary_vi: e.payload.target === "vi" || m.has_summary_vi,
@@ -315,6 +355,15 @@ export default function HistoryModal({
 
   const isActive = selectedId !== null && selectedId === activeSessionId;
 
+  // A language tab shows the ● marker when its summary is loaded/streamed, or
+  // when meta says one exists on disk (v2 list, or a legacy per-lang bool).
+  const hasSummary = (code: string): boolean =>
+    summaries[code] != null ||
+    (selectedMeta?.has_summaries?.includes(code) ?? false) ||
+    (code === "zh" && (selectedMeta?.has_summary_zh ?? false)) ||
+    (code === "en" && (selectedMeta?.has_summary_en ?? false)) ||
+    (code === "vi" && (selectedMeta?.has_summary_vi ?? false));
+
   return (
     <div className="absolute inset-0 z-10 flex items-stretch justify-center bg-paper-900/30 p-4">
       <div className="flex max-h-full w-full max-w-md flex-col overflow-hidden rounded-lg border border-paper-200 bg-white shadow-xl">
@@ -382,6 +431,11 @@ export default function HistoryModal({
                           <p className="text-sm font-medium text-paper-900">
                             {formatStarted(s.started_at)}
                           </p>
+                          {s.language && s.language !== "zh" && (
+                            <span className="rounded-full bg-paper-200 px-1.5 py-0.5 text-[9px] font-medium text-paper-700">
+                              {zhName(s.language)}
+                            </span>
+                          )}
                           {s.session_id === activeSessionId && (
                             <span className="rounded-full bg-recording/10 px-1.5 py-0.5 text-[9px] font-medium text-recording">
                               錄音中
@@ -398,7 +452,10 @@ export default function HistoryModal({
                           </span>
                         )}
                       </p>
-                      {(s.has_summary_zh || s.has_summary_en || s.has_summary_vi) && (
+                      {((s.has_summaries?.length ?? 0) > 0 ||
+                        s.has_summary_zh ||
+                        s.has_summary_en ||
+                        s.has_summary_vi) && (
                         <p className="mt-0.5 text-[10px] uppercase tracking-wider text-paper-500">
                           已產生總結
                         </p>
@@ -417,6 +474,7 @@ export default function HistoryModal({
                 {" "}
                 {selectedMeta.backend === "cloud" ? "雲端辨識" : "本地辨識"}
                 {selectedMeta.device && ` · ${selectedMeta.device}`}
+                {selectedMeta.language && ` · 來源：${zhName(selectedMeta.language)}`}
               </div>
             )}
             <nav className="flex flex-shrink-0 gap-1 border-b border-paper-200 px-3 py-1.5 text-xs">
@@ -426,27 +484,21 @@ export default function HistoryModal({
               >
                 逐字稿
               </TabButton>
-              {SUMMARY_LANGS.map((lang) => {
-                const has =
-                  summaries[lang.id] != null ||
-                  (selectedMeta &&
-                    ((lang.id === "zh" && selectedMeta.has_summary_zh) ||
-                      (lang.id === "en" && selectedMeta.has_summary_en) ||
-                      (lang.id === "vi" && selectedMeta.has_summary_vi)));
-                return (
-                  <TabButton
-                    key={lang.id}
-                    active={viewMode === lang.id}
-                    onClick={() => switchView(lang.id)}
-                  >
-                    {lang.label}
-                    {has && <span className="ml-1 text-paper-400">●</span>}
-                    {streamingTarget === lang.id && (
-                      <span className="ml-1 inline-block h-2 w-2 animate-pulse rounded-full bg-paper-700" />
-                    )}
-                  </TabButton>
-                );
-              })}
+              {LANGS.map((lang) => (
+                <TabButton
+                  key={lang.code}
+                  active={viewMode === lang.code}
+                  onClick={() => switchView(lang.code)}
+                >
+                  {zhName(lang.code)}
+                  {hasSummary(lang.code) && (
+                    <span className="ml-1 text-paper-400">●</span>
+                  )}
+                  {streamingTarget === lang.code && (
+                    <span className="ml-1 inline-block h-2 w-2 animate-pulse rounded-full bg-paper-700" />
+                  )}
+                </TabButton>
+              ))}
             </nav>
             <div className="flex-1 overflow-y-auto px-5 py-3">
               {viewMode === "transcript" ? (
@@ -468,23 +520,31 @@ export default function HistoryModal({
                       </button>
                     </div>
                     <ul className="space-y-3">
-                      {utterances.map((u) => (
-                        <li key={u.id} className="border-l-2 border-paper-200 pl-3">
-                          <p className="font-mono text-[10px] uppercase tracking-wider text-paper-400">
-                            {formatRelativeTime(u.t_start)}
-                            {u.incomplete && (
-                              <span className="ml-2 text-warn-700">未完成</span>
-                            )}
-                          </p>
-                          <p className="mt-0.5 text-sm text-paper-900">{u.zh}</p>
-                          {u.en && (
-                            <p className="mt-0.5 text-xs text-paper-600">EN｜{u.en}</p>
-                          )}
-                          {u.vi && (
-                            <p className="text-xs text-paper-600">VI｜{u.vi}</p>
-                          )}
-                        </li>
-                      ))}
+                      {utterances.map((raw, ri) => {
+                        const u = normalizeStored(raw);
+                        return (
+                          <li
+                            key={u.id ?? ri}
+                            className="border-l-2 border-paper-200 pl-3"
+                          >
+                            <p className="font-mono text-[10px] uppercase tracking-wider text-paper-400">
+                              {formatRelativeTime(u.t_start)}
+                              {u.incomplete && (
+                                <span className="ml-2 text-warn-700">未完成</span>
+                              )}
+                            </p>
+                            <p className="mt-0.5 text-sm text-paper-900">{u.src}</p>
+                            {u.translations.map(([code, text], i) => (
+                              <p
+                                key={code}
+                                className={`text-xs text-paper-600${i === 0 ? " mt-0.5" : ""}`}
+                              >
+                                {code.toUpperCase()}｜{text}
+                              </p>
+                            ))}
+                          </li>
+                        );
+                      })}
                     </ul>
                   </>
                 )
