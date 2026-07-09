@@ -1,10 +1,17 @@
-export type Lang = "en" | "vi";
+// A language code from the shared registry (zh / en / ja / vi / …). Widened
+// from the old "en" | "vi" union now that source + target languages are
+// configurable; runtime validity is enforced against the registry.
+export type Lang = string;
 
 export type Utterance = {
   id: string;
   zh: string;
   en: string;
   vi: string;
+  // Transitional string index so TranslationWindow's `u[lang]` keeps
+  // typechecking now that `Lang` is `string`. Removed when TranslationWindow
+  // moves to a slot-based `{id, text}` row (commit 9).
+  [k: string]: string;
 };
 
 export type TranscriptPayload = {
@@ -36,12 +43,22 @@ export type AudioDevice = {
 export type GlossaryEntry = {
   term: string;
   aliases: string[];
-  en: string;
-  vi: string;
+  // v2: per-language translations keyed by registry code. Optional during the
+  // multi-language migration — GlossaryModal still writes the legacy en/vi
+  // mirrors below; Batch 4 wires the map in the UI and can tighten this.
+  translations?: Record<string, string>;
+  // Legacy target mirrors (kept for the current GlossaryModal + downgrade
+  // compatibility). Derived from `translations` server-side on save.
+  en?: string;
+  vi?: string;
 };
 
 export type GlossaryBook = {
   name: string;
+  // Source language the book's `term`s are authored in (defaults to zh
+  // server-side). Optional so existing GlossaryModal literals stay valid;
+  // Batch 4 surfaces it in the UI.
+  source_lang?: string;
   entries: GlossaryEntry[];
 };
 
@@ -56,6 +73,11 @@ export type Config = {
   audio: {
     input_device: string;
   };
+  language: {
+    source: string;
+    // Always length 2 — one per translation window slot; "" = slot disabled.
+    target_slots: string[];
+  };
   glossaries: GlossaryBook[];
   active_glossary: string | null;
   idle_auto_stop_minutes: number;
@@ -67,14 +89,23 @@ export type Config = {
   };
 };
 
+// transcript.jsonl row (schema v2) as delivered by get_session_transcript.
+// Rust folds legacy {zh,en,vi} rows into src/translations on read, but the
+// optional legacy mirrors are kept so a component mid-migration can still read
+// them — normalizeStored() (HistoryModal) accepts either shape.
 export type StoredUtterance = {
-  id: string;
+  id?: string;
   t_start: number;
   t_end: number;
-  zh: string;
-  en: string;
-  vi: string;
-  incomplete: boolean;
+  src: string;
+  translations: Record<string, string>;
+  incomplete?: boolean;
+  // Reserved for auto-detect mode (Whisper-detected language); omitted today.
+  lang?: string;
+  // ---- Legacy v1 mirrors: present only when reading a pre-v2 row. ----
+  zh?: string;
+  en?: string;
+  vi?: string;
 };
 
 export type SessionMeta = {
@@ -87,6 +118,9 @@ export type SessionMeta = {
   device: string;
   count: number;
   incomplete_count: number;
+  // Registry codes of every summary.{code}.md on disk (v2). Optional so pre-v2
+  // meta.json (which lacks the field) still parses; Rust backfills it on read.
+  has_summaries?: string[];
   has_summary_zh: boolean;
   has_summary_en: boolean;
   has_summary_vi: boolean;
