@@ -115,6 +115,10 @@ def list_input_devices() -> list[dict]:
 async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     backend_name = cmd.get("backend", "local")
     language = cmd.get("language", "zh")
+    # Cloud (Deepgram) may need a different language code than the canonical
+    # one (e.g. a regional variant); the Rust side supplies it from the
+    # registry. Absent → fall back to canonical below.
+    deepgram_language = cmd.get("deepgram_language")
     source_cfg = cmd.get("source", {"type": "mic"})
     api_cfg = cmd.get("api") or {}
     initial_prompt = cmd.get("initial_prompt") or None
@@ -152,8 +156,11 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     try:
         # Cloud backend ignores initial_prompt — Deepgram has its own keyword
         # boost mechanism that we can wire later. Avoid passing the kwarg so
-        # we don't break DeepgramSTT's __init__ signature.
-        backend_kwargs = {"language": language}
+        # we don't break DeepgramSTT's __init__ signature. Cloud also takes the
+        # registry-supplied deepgram_language when present; local/openai use
+        # the canonical code.
+        cloud_lang = deepgram_language or language
+        backend_kwargs = {"language": cloud_lang if backend_name == "cloud" else language}
         if backend_name == "local":
             # Only the local backend has hallucination gates — route their
             # skip diagnostics out as `diag` events. Cloud backends ignore it.

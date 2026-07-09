@@ -9,6 +9,7 @@ import mlx_whisper
 from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
+from .lang_resources import hallucination_blocklist
 
 
 # Cap MLX's idle Metal allocator cache. Without this, every transcribe call
@@ -83,47 +84,34 @@ NOISE_RING_SIZE = 60
 NOISE_RING_MIN = 30  # only adapt once we have ~1 s of silence sampled
 NOISE_MARGIN = 3.0
 
-# Phrases Whisper emits when fed silence/noise — these are training-data
-# leaks (audiobook outros, YouTube subscribe asks, hymns/scripture). They
-# are NOT in the user's audio. Match case-insensitive substrings against
-# the transcript output. Keep this list short and high-signal to avoid
-# eating legit translations of similar phrases.
-KNOWN_HALLUCINATIONS = (
-    "exodus",
-    "thanks for watching",
-    "thank you for watching",
-    "please subscribe",
-    "subscribe to my channel",
-    "like and subscribe",
-    "see you in the next video",
-    "see you next time",
-    "♪",
-    "(music)",
-    "[music]",
-    "[silence]",
-    # Chinese training-data leaks (audiobook / video outro)
-    "感谢观看",
-    "謝謝觀看",
-    "请订阅",
-    "請訂閱",
-)
+# Phrases Whisper emits when fed silence/noise — training-data leaks
+# (audiobook outros, YouTube subscribe asks, subtitle credits). They are NOT
+# in the user's audio; matched as case-insensitive substrings. The full
+# per-language tables live in lang_resources.py; this module-level alias is
+# the zh blocklist, kept as the default for the callers below and for CLI /
+# test call sites that import the name.
+KNOWN_HALLUCINATIONS = hallucination_blocklist("zh")
 
 
-def _is_known_hallucination(text: str) -> bool:
+def _is_known_hallucination(
+    text: str, blocklist: tuple[str, ...] = KNOWN_HALLUCINATIONS
+) -> bool:
     """Whisper sometimes outputs known training-data phrases on silence."""
     head = text.strip().lower()
     if not head:
         return False
-    return any(marker in head for marker in KNOWN_HALLUCINATIONS)
+    return any(marker in head for marker in blocklist)
 
 
-def _is_hallucination(text: str) -> bool:
+def _is_hallucination(
+    text: str, blocklist: tuple[str, ...] = KNOWN_HALLUCINATIONS
+) -> bool:
     """Detect the two structural signatures of Whisper-on-silence:
     (1) a single non-whitespace character occupying more than
     HALLUCINATION_DOMINANCE of a long output, e.g. '示示示...';
-    (2) any of the well-known training-data phrases listed in
-    KNOWN_HALLUCINATIONS, e.g. 'Exodus', 'Thanks for watching'."""
-    if _is_known_hallucination(text):
+    (2) any of the well-known training-data phrases in the blocklist,
+    e.g. 'Exodus', 'Thanks for watching', 'ご視聴ありがとう'."""
+    if _is_known_hallucination(text, blocklist):
         return True
     chars = [c for c in text if not c.isspace()]
     if len(chars) < HALLUCINATION_MIN_CHARS:
@@ -151,6 +139,9 @@ class MLXWhisperSTT:
         on_diag: Callable[[str, float | None, dict], None] | None = None,
     ):
         self.language = language
+        # Whisper leaks language-specific outro phrases on silence — pick the
+        # blocklist for the pinned decoding language (COMMON + EN always).
+        self._blocklist = hallucination_blocklist(language)
         self.model_repo = model_repo or self.MODEL_REPO
         self.max_speech_sec = max_speech_sec
         self.initial_prompt = initial_prompt
@@ -258,6 +249,7 @@ class MLXWhisperSTT:
         # holds the working set of every past transcribe call indefinitely;
         # over a meeting that's tens of GB resident for no good reason.
         _mlx_clear_cache()
+        # result["language"] (Whisper auto-detect) intentionally unread — reserved for future auto-detect mode.
 
         # Gate 3: per-segment confidence filtering. Whisper retries low-
         # confidence segments at higher temperature internally, but if all
@@ -305,9 +297,9 @@ class MLXWhisperSTT:
         # Gate 4: known training-data phrases + single-char dominance. Catches
         # the long-form '謝謝觀看' / '示示示...' shapes the Whisper-internal
         # gates miss. Kept as the final safety net, not the primary defense.
-        if _is_hallucination(text):
+        if _is_hallucination(text, self._blocklist):
             head = text[:40]
-            if _is_known_hallucination(text):
+            if _is_known_hallucination(text, self._blocklist):
                 gate, detail = "hallucination_phrase", {"text_head": head}
             else:
                 # Not a known phrase, so _is_hallucination fired on single-char

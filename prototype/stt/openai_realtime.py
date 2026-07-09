@@ -9,8 +9,9 @@ Tradeoffs vs mlx-whisper:
   * pros: ~1s post-utterance final latency (better than mlx on long
     segments), correct technical vocab (陣雨/鋒面/備雨具 vs mlx's
     真雨/封面/被雨拒), and the streaming UX bonus
-  * cons: simplified Chinese output (model rejects the `prompt` field
-    that flips simp→繁), no glossary/term injection (same reason)
+  * cons: simplified-Chinese output when language=zh (model rejects the
+    `prompt` field that flips simp→繁; other languages unaffected), no
+    glossary/term injection (same reason)
 
 The model also rejects `turn_detection`, so we run silero VAD
 client-side and send `input_audio_buffer.commit` ourselves when an

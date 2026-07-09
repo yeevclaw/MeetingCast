@@ -37,6 +37,11 @@ from stt.local import (  # noqa: E402
     _is_known_hallucination,
 )
 import stt.local as local  # noqa: E402
+from stt.lang_resources import (  # noqa: E402
+    HALLUCINATIONS_COMMON,
+    HALLUCINATIONS_EN,
+    hallucination_blocklist,
+)
 
 import checks  # noqa: E402
 from checks import (  # noqa: E402
@@ -91,6 +96,60 @@ class TestSingleCharDominance(unittest.TestCase):
     def test_whitespace_is_ignored_in_dominance(self):
         # Spaces don't count toward the dominance denominator.
         self.assertTrue(_is_hallucination(" ".join("示" * 25)))
+
+
+class TestHallucinationBlocklists(unittest.TestCase):
+    """Per-language blocklist partitioning (prototype/stt/lang_resources.py)."""
+
+    # The exact KNOWN_HALLUCINATIONS tuple as it stood before the per-language
+    # split. The zh effective blocklist must stay item-identical to this set,
+    # plus the newly-added "amara.org".
+    LEGACY = (
+        "exodus",
+        "thanks for watching",
+        "thank you for watching",
+        "please subscribe",
+        "subscribe to my channel",
+        "like and subscribe",
+        "see you in the next video",
+        "see you next time",
+        "♪",
+        "(music)",
+        "[music]",
+        "[silence]",
+        "感谢观看",
+        "謝謝觀看",
+        "请订阅",
+        "請訂閱",
+    )
+
+    def test_zh_is_legacy_plus_amara(self):
+        # Order changed (COMMON now leads), so compare as sets: item-identical.
+        self.assertEqual(
+            set(hallucination_blocklist("zh")),
+            set(self.LEGACY) | {"amara.org"},
+        )
+
+    def test_en_is_common_plus_en_only(self):
+        self.assertEqual(
+            hallucination_blocklist("en"),
+            HALLUCINATIONS_COMMON + HALLUCINATIONS_EN,
+        )
+
+    def test_ja_contains_outro_and_english_set(self):
+        ja = hallucination_blocklist("ja")
+        self.assertIn("ご視聴ありがとう", ja)
+        for marker in HALLUCINATIONS_EN:
+            self.assertIn(marker, ja)
+
+    def test_ja_blocklist_flags_outro_but_not_normal_sentence(self):
+        ja = hallucination_blocklist("ja")
+        self.assertTrue(
+            _is_known_hallucination("ご視聴ありがとうございました", blocklist=ja)
+        )
+        self.assertFalse(
+            _is_known_hallucination("本日の会議では来期の予算について話し合いました", blocklist=ja)
+        )
 
 
 def _fake_transcribe(segments, text):

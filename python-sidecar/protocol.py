@@ -5,7 +5,11 @@ Each direction is line-delimited JSON over stdin/stdout. One JSON object per lin
 Rust → Python (commands):
     {"type": "start", "backend": "local"|"cloud",
      "source": {"type": "mic"} | {"type": "wav", "path": "..."},
-     "language": "zh"}
+     "language": "zh",                 -- canonical code (session/meta/local/openai)
+     "deepgram_language": "zh"?,       -- optional, cloud backend only; registry-
+                                       --   supplied Deepgram code, falls back to
+                                       --   `language` when absent
+     "detect_language": false?}        -- reserved for future auto-detect; ignored
     {"type": "stop"}
     {"type": "shutdown"}
 

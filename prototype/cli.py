@@ -1,3 +1,7 @@
+"""Phase 1 pipeline runner.
+
+（legacy Phase 1 工具：翻譯固定 zh→en+vi，正式多語走 Tauri app / eval CLI）
+"""
 import argparse
 import asyncio
 import sys
@@ -95,8 +99,10 @@ async def run_vad_demo(wav_path: str, translate: bool, initial_prompt: str | Non
         os.unlink(tmp_path)
 
 
-async def run_streaming(chunks, backend_name: str, translate: bool, label: str, initial_prompt: str | None = None):
-    kwargs = {"initial_prompt": initial_prompt} if backend_name in ("local", "openai") else {}
+async def run_streaming(chunks, backend_name: str, translate: bool, label: str, initial_prompt: str | None = None, language: str = "zh"):
+    kwargs: dict = {"language": language}
+    if backend_name in ("local", "openai"):
+        kwargs["initial_prompt"] = initial_prompt
     stt = get_backend(backend_name, **kwargs)
     translator = Translator() if translate else None
 
@@ -157,7 +163,11 @@ def main():
     )
     parser.add_argument("--language", default="zh")
     parser.add_argument("--warmup", action="store_true", help="local only")
-    parser.add_argument("--translate", action="store_true", help="translate to en + vi")
+    parser.add_argument(
+        "--translate",
+        action="store_true",
+        help="translate to en + vi（legacy Phase 1 工具：翻譯固定 zh→en+vi，正式多語走 Tauri app / eval CLI）",
+    )
     parser.add_argument("--text", help="skip STT, translate this text")
     parser.add_argument(
         "--mic",
@@ -199,14 +209,14 @@ def main():
         if not Path(args.mic_sim).exists():
             sys.exit(f"file not found: {args.mic_sim}")
         chunks = wav_chunks(args.mic_sim, chunk_ms=100, realtime=True)
-        asyncio.run(run_streaming(chunks, args.backend, args.translate, args.mic_sim, initial_prompt))
+        asyncio.run(run_streaming(chunks, args.backend, args.translate, args.mic_sim, initial_prompt, language=args.language))
         return
 
     if args.mic:
         print("[ 麥克風錄音中，Ctrl+C 停止 ]\n")
         chunks = mic_chunks(sample_rate=16000, chunk_ms=100)
         try:
-            asyncio.run(run_streaming(chunks, args.backend, args.translate, "microphone", initial_prompt))
+            asyncio.run(run_streaming(chunks, args.backend, args.translate, "microphone", initial_prompt, language=args.language))
         except KeyboardInterrupt:
             print("\nstopped.")
         return
