@@ -9,20 +9,21 @@
 //! trip.
 
 use crate::config::GlossaryEntry;
+use crate::languages;
 
-/// For each active glossary entry whose canonical `term` appears in the Chinese
-/// source, require the target-language translation (`en` for any non-`vi`
-/// target, `vi` for `vi`) to appear — case-insensitively — somewhere in the
-/// produced translation. Entries with an empty `term` or an empty
-/// target-language field are skipped (no override requested). Returns the list
-/// of violated entries in `"紫微斗數 → Zi Wei Dou Shu"` form.
+/// For each active glossary entry whose canonical `term` appears in the
+/// source text, require the target-language translation (from the entry's
+/// `translations` map, keyed by target code) to appear — case-insensitively —
+/// somewhere in the produced translation. Entries with an empty `term` or no
+/// (non-empty) translation for `target` are skipped (no override requested).
+/// Returns the list of violated entries in `"紫微斗數 → Zi Wei Dou Shu"` form.
 ///
 /// Case-insensitivity uses ASCII lowercasing on both sides: `AI` matches `ai`,
 /// while Vietnamese diacritics must match exactly apart from ASCII case (ASCII
 /// lowercasing leaves accented codepoints untouched, so `Tử` still requires a
 /// `Tử`/`tử`).
 pub fn check_glossary(
-    zh: &str,
+    source: &str,
     translation: &str,
     entries: &[GlossaryEntry],
     target: &str,
@@ -30,16 +31,13 @@ pub fn check_glossary(
     let translation_lc = translation.to_ascii_lowercase();
     let mut violations = Vec::new();
     for entry in entries {
-        if entry.term.is_empty() || !zh.contains(&entry.term) {
+        if entry.term.is_empty() || !source.contains(&entry.term) {
             continue;
         }
-        let expected = match target {
-            "vi" => &entry.vi,
-            _ => &entry.en,
+        let expected = match entry.translations.get(target) {
+            Some(t) if !t.is_empty() => t,
+            _ => continue,
         };
-        if expected.is_empty() {
-            continue;
-        }
         if !translation_lc.contains(&expected.to_ascii_lowercase()) {
             violations.push(format!("{} → {}", entry.term, expected));
         }
@@ -47,38 +45,81 @@ pub fn check_glossary(
     violations
 }
 
-/// Heuristic: did the model answer in Chinese when we asked for `en`/`vi`?
-///
-/// Counts CJK ideographs (U+4E00–U+9FFF main block + U+3400–U+4DBF ext-A)
-/// against total non-whitespace chars. Returns true only for `en`/`vi` targets
-/// when the reply is long enough to be real (≥ 8 non-whitespace chars) AND more
-/// than half of it is CJK.
-///
-/// Threshold rationale: the plan floated ~40%, but raising it to > 50% plus a
-/// min-length guard is deliberate. Rule 3 of the translation prompt keeps proper
-/// nouns (company / product / person names) in Chinese, so a legitimate English
-/// or Vietnamese sentence can legitimately carry a few Han characters. Falsely
-/// dropping a real translation is worse than missing a detection, and the length
-/// guard stops one stray char in a short fragment from skewing the ratio.
-pub fn wrong_language(text: &str, target: &str) -> bool {
-    if !matches!(target, "en" | "vi") {
-        return false;
-    }
-    let mut cjk = 0usize;
-    let mut total = 0usize;
+/// Count `(han, kana, latin, total_non_whitespace)` over `text`. Character
+/// domains (canonical — mirrored verbatim by checks.py `_script_counts`):
+///   han   = U+4E00–9FFF (CJK Unified) ∪ U+3400–4DBF (ext-A)
+///   kana  = U+3040–309F (hiragana) ∪ U+30A0–30FF (katakana)
+///   latin = ASCII alphabetic (A–Z / a–z)
+fn script_counts(text: &str) -> (usize, usize, usize, usize) {
+    let (mut han, mut kana, mut latin, mut total) = (0usize, 0usize, 0usize, 0usize);
     for c in text.chars() {
         if c.is_whitespace() {
             continue;
         }
         total += 1;
         if ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c) {
-            cjk += 1;
+            han += 1;
+        } else if ('\u{3040}'..='\u{309F}').contains(&c) || ('\u{30A0}'..='\u{30FF}').contains(&c) {
+            kana += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
         }
     }
+    (han, kana, latin, total)
+}
+
+/// Heuristic: did the model reply in the wrong script for `target`?
+///
+/// The only destructive action in the pipeline is *clearing* a translation, so
+/// the guiding philosophy is "never kill a real translation": every threshold
+/// below is deliberately loose, biased to miss a bad reply rather than drop a
+/// good one (`translation_wrong_language` in errors.log gives us the data to
+/// tighten later). Unknown targets (not in the registry) never flag; the reply
+/// must clear a min 8 non-whitespace-char floor before any ratio is trusted, as
+/// a one- or two-word fragment can't be classified reliably.
+///
+/// Dispatch is by the target's registry `script_profile`:
+///
+/// * **latin** (en/vi): `(han+kana)/total > 0.5` → wrong. A Latin-script reply
+///   that is majority Han/kana stayed in the source language. Rule 3 of the
+///   translation prompt keeps proper nouns in their original script, so a
+///   legitimate en/vi sentence carries a few Han chars — the > 0.5 bar tolerates
+///   them (adding kana over the old CJK-only count is a superset that is
+///   behavior-identical for zh→en/vi, since zh replies carry no kana).
+///
+/// * **japanese** (ja): flag an *English* reply —
+///   `latin/total > 0.5 && (han+kana)/total < 0.1`; the `< 0.1` clause protects a
+///   legitimately mixed sentence like 「MeetingCastとGoogle Slidesを統合します」,
+///   whose kana particles keep it above the floor. Also flag a *Chinese* reply —
+///   `total >= 20 && kana == 0 && han/total > 0.5`: a genuine Japanese sentence
+///   of that length always carries kana (particles / okurigana), so all-kanji
+///   with zero kana at length reads as Chinese. Short all-kanji headings stay
+///   safe — the length gate keeps them below the bar.
+///
+/// * **han** (zh): flag an English/Vietnamese reply —
+///   `latin/total > 0.5 && han/total < 0.1`; or a Japanese reply —
+///   `kana/total > 0.3`.
+pub fn wrong_language(text: &str, target: &str) -> bool {
+    let Some(profile) = languages::get(target).map(|l| l.script_profile.as_str()) else {
+        return false;
+    };
+    let (han, kana, latin, total) = script_counts(text);
     if total < 8 {
         return false;
     }
-    (cjk as f64) / (total as f64) > 0.5
+    let total_f = total as f64;
+    let han_f = han as f64;
+    let kana_f = kana as f64;
+    let latin_f = latin as f64;
+    match profile {
+        "latin" => (han_f + kana_f) / total_f > 0.5,
+        "japanese" => {
+            (latin_f / total_f > 0.5 && (han_f + kana_f) / total_f < 0.1)
+                || (total >= 20 && kana == 0 && han_f / total_f > 0.5)
+        }
+        "han" => (latin_f / total_f > 0.5 && han_f / total_f < 0.1) || kana_f / total_f > 0.3,
+        _ => false,
+    }
 }
 
 /// Extract H2 headings (`## ...`) from markdown in document order, trimmed.
@@ -152,10 +193,32 @@ mod tests {
     use super::*;
 
     fn entry(term: &str, en: &str, vi: &str) -> GlossaryEntry {
+        let mut translations = std::collections::BTreeMap::new();
+        if !en.is_empty() {
+            translations.insert("en".to_string(), en.to_string());
+        }
+        if !vi.is_empty() {
+            translations.insert("vi".to_string(), vi.to_string());
+        }
         GlossaryEntry {
             term: term.into(),
             en: en.into(),
             vi: vi.into(),
+            translations,
+            ..Default::default()
+        }
+    }
+
+    /// Build an entry from an explicit `(target, translation)` list — lets a
+    /// test exercise ja (or any non-en/vi) glossary translations.
+    fn entry_map(term: &str, pairs: &[(&str, &str)]) -> GlossaryEntry {
+        let mut translations = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            translations.insert((*k).to_string(), (*v).to_string());
+        }
+        GlossaryEntry {
+            term: term.into(),
+            translations,
             ..Default::default()
         }
     }
@@ -236,6 +299,90 @@ mod tests {
     fn wrong_language_zh_target_never_flags() {
         // zh target isn't meaningful for this check.
         assert!(!wrong_language("整段都是中文的內容不會被判定", "zh"));
+    }
+
+    // ---- script-profile wrong_language: ja target (japanese profile) ----
+
+    #[test]
+    fn wrong_language_ja_english_reply_is_true() {
+        // Latin-dominant, almost no han/kana → English reply for a ja target.
+        assert!(wrong_language(
+            "This is the summary of today's project meeting discussion.",
+            "ja"
+        ));
+    }
+
+    #[test]
+    fn wrong_language_ja_mixed_latin_and_kana_is_false() {
+        // Legit ja sentence embedding Latin product names — the kana particles
+        // push (han+kana)/total above 0.1 so the English clause never fires.
+        assert!(!wrong_language("MeetingCastとGoogle Slidesを統合します", "ja"));
+    }
+
+    #[test]
+    fn wrong_language_ja_chinese_reply_zero_kana_is_true() {
+        // 20+ chars, zero kana, majority han → reads as Chinese, not Japanese.
+        assert!(wrong_language(
+            "這是今天會議的總結內容包含了所有討論事項與決議結果的說明",
+            "ja"
+        ));
+    }
+
+    #[test]
+    fn wrong_language_ja_medium_all_kanji_heading_is_false() {
+        // 8+ chars (clears the min-length guard) but under the 20-char Chinese
+        // clause, no Latin → a kanji-only Japanese heading must survive.
+        assert!(!wrong_language("会議決定事項報告書一覧", "ja"));
+    }
+
+    // ---- script-profile wrong_language: zh target (han profile) ----
+
+    #[test]
+    fn wrong_language_zh_english_reply_is_true() {
+        assert!(wrong_language(
+            "The meeting covered budget, marketing and hiring topics today.",
+            "zh"
+        ));
+    }
+
+    #[test]
+    fn wrong_language_zh_chinese_reply_is_false() {
+        // A real zh reply for a zh target — the han backstop must not flag it.
+        assert!(!wrong_language("這是今天會議的完整總結與決議內容", "zh"));
+    }
+
+    #[test]
+    fn wrong_language_zh_japanese_reply_is_true() {
+        // Kana-heavy Japanese reply for a zh target → kana/total > 0.3.
+        assert!(wrong_language("これは今日の会議のまとめです", "zh"));
+    }
+
+    // ---- script-profile wrong_language: en target catches ja ----
+
+    #[test]
+    fn wrong_language_en_kana_dominant_ja_reply_is_true() {
+        assert!(wrong_language("これはとても重要な会議のまとめです", "en"));
+    }
+
+    // ---- glossary check via translations map (incl. ja) ----
+
+    #[test]
+    fn glossary_uses_ja_translation_for_ja_target() {
+        let entries = vec![entry_map(
+            "紫微斗數",
+            &[("en", "Zi Wei Dou Shu"), ("ja", "紫微斗数")],
+        )];
+        let miss = check_glossary("我們談到紫微斗數", "占星術について話しました", &entries, "ja");
+        assert_eq!(miss, vec!["紫微斗數 → 紫微斗数"]);
+        let ok = check_glossary("我們談到紫微斗數", "紫微斗数について話しました", &entries, "ja");
+        assert!(ok.is_empty());
+    }
+
+    #[test]
+    fn glossary_skips_target_absent_from_translations() {
+        // Entry has en only; a ja target has no mandated rendering → skipped.
+        let entries = vec![entry("紫微斗數", "Zi Wei Dou Shu", "")];
+        assert!(check_glossary("我們談到紫微斗數", "占星術", &entries, "ja").is_empty());
     }
 
     fn headings(hs: &[&str]) -> Vec<String> {
