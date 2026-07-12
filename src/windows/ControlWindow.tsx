@@ -6,6 +6,7 @@ import GlossaryModal from "@/components/GlossaryModal";
 import HistoryModal from "@/components/HistoryModal";
 import MicMeter from "@/components/MicMeter";
 import PrewarmChecklist, {
+  type ModelProgress,
   type StepId,
   type StepStatus,
 } from "@/components/PrewarmChecklist";
@@ -35,6 +36,9 @@ type PrewarmPayload = {
   message?: string | null;
   downloaded_bytes?: number | null;
   total_bytes?: number | null;
+  // Set on the model step's "progress" when weights were already cached (no
+  // download) — the checklist shows a "已在本機" hint instead of a bar.
+  cached?: boolean | null;
 };
 
 function SettingsIcon({ className = "h-5 w-5" }: { className?: string }) {
@@ -108,14 +112,21 @@ export default function ControlWindow() {
     mic: "pending",
   });
   const [stepError, setStepError] = useState<Partial<Record<StepId, string>>>({});
-  const [modelProgress, setModelProgress] = useState<{
-    downloaded: number;
-    total: number;
-  } | null>(null);
+  const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
+  // True while a cache-hit model load is in flight (weights already local, no
+  // download). Mutually exclusive with modelProgress, which only gets set on a
+  // real download.
+  const [modelCached, setModelCached] = useState(false);
   const [retryingPrewarm, setRetryingPrewarm] = useState(false);
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const modelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Download-speed derivation for the model step. The sidecar only emits raw
+  // byte counters every ~2s; speed (EMA-smoothed), ETA and stall detection
+  // are computed here from consecutive samples.
+  const dlSampleRef = useRef<{ bytes: number; t: number } | null>(null);
+  const dlSpeedEmaRef = useRef<number | null>(null);
+  const dlLastIncreaseRef = useRef<{ bytes: number; t: number } | null>(null);
   const historyRef = useRef<HTMLDivElement>(null);
   const runningRef = useRef(false);
   const backendRef = useRef(backend);
@@ -283,7 +294,7 @@ export default function ControlWindow() {
     src: string;
     t_start: number;
     t_end: number;
-    translations: Record<string, { text: string; done: boolean }>;
+    translations: Record<string, { text: string; done: boolean; failed: boolean }>;
   };
   const pendingUtterancesRef = useRef<Map<string, PendingUtterance>>(new Map());
   const finalizedThisSessionRef = useRef(0);
@@ -296,7 +307,11 @@ export default function ControlWindow() {
     if (!langs.every((l) => u.translations[l].done)) return;
     map.delete(id);
     const translations: Record<string, string> = {};
-    for (const l of langs) translations[l] = u.translations[l].text;
+    let anyFailed = false;
+    for (const l of langs) {
+      translations[l] = u.translations[l].text;
+      if (u.translations[l].failed) anyFailed = true;
+    }
     invoke("session_append_utterance", {
       utterance: {
         id,
@@ -304,7 +319,7 @@ export default function ControlWindow() {
         t_end: u.t_end,
         src: u.src,
         translations,
-        incomplete: false,
+        incomplete: anyFailed,
       },
     })
       .then(() => {
@@ -319,10 +334,10 @@ export default function ControlWindow() {
     for (const [id, u] of entries) {
       const langs = Object.keys(u.translations);
       const translations: Record<string, string> = {};
-      let anyNotDone = false;
+      let incomplete = false;
       for (const l of langs) {
         translations[l] = u.translations[l].text;
-        if (!u.translations[l].done) anyNotDone = true;
+        if (!u.translations[l].done || u.translations[l].failed) incomplete = true;
       }
       try {
         await invoke("session_append_utterance", {
@@ -332,7 +347,7 @@ export default function ControlWindow() {
             t_end: u.t_end,
             src: u.src,
             translations,
-            incomplete: anyNotDone,
+            incomplete,
           },
         });
         finalizedThisSessionRef.current += 1;
@@ -360,9 +375,19 @@ export default function ControlWindow() {
         }
         return;
       }
-      invoke("translate", { id, text, target }).catch((err) =>
-        setError(`translate ${target}: ${err}`),
-      );
+      invoke("translate", { id, text, target }).catch((err) => {
+        setError(`translate ${target}: ${err}`);
+        // A terminal API failure must still close this pending branch. Without
+        // this, the utterance remains in memory until Stop and disappears from
+        // live History. Persist it immediately as incomplete instead.
+        const u = pendingUtterancesRef.current.get(id);
+        const translation = u?.translations[target];
+        if (translation) {
+          translation.failed = true;
+          translation.done = true;
+          tryFinalize(id);
+        }
+      });
     },
     [showToast, tryFinalize, slotLabelFor],
   );
@@ -553,8 +578,13 @@ export default function ControlWindow() {
           }
           // Seat the pending entry BEFORE invoking translate so requestTranslate's
           // closed-window short-circuit can mark its lang done immediately.
-          const translations: Record<string, { text: string; done: boolean }> = {};
-          for (const lang of targets) translations[lang] = { text: "", done: false };
+          const translations: Record<
+            string,
+            { text: string; done: boolean; failed: boolean }
+          > = {};
+          for (const lang of targets) {
+            translations[lang] = { text: "", done: false, failed: false };
+          }
           pendingUtterancesRef.current.set(id, { src: text, t_start, t_end, translations });
           for (const lang of targets) requestTranslate(id, text, lang);
         } else {
@@ -622,7 +652,8 @@ export default function ControlWindow() {
         setStepStatus((s) => ({ ...s, spawn: "done" }));
       }),
       listen<PrewarmPayload>("stt:prewarm", (e) => {
-        const { step, state, message, downloaded_bytes, total_bytes } = e.payload;
+        const { step, state, message, downloaded_bytes, total_bytes, cached } =
+          e.payload;
         const id = step as StepId;
         // First sidecar event of any kind also confirms the spawn step. The
         // child has reached our Python entry; the bootstrapper is past.
@@ -639,18 +670,61 @@ export default function ControlWindow() {
         if (state === "error" && message) {
           setStepError((m) => ({ ...m, [id]: message }));
         }
-        // Model-download progress: stash the counters for the checklist and
-        // clear them once the step resolves (done or error) so a stale bar
-        // never lingers on the model row.
+        // Model-download progress: derive speed/ETA/stall from consecutive
+        // byte samples, stash for the checklist, and clear everything once
+        // the step resolves (done or error) so a stale bar never lingers.
         if (step === "model") {
           if (
             state === "progress" &&
             downloaded_bytes != null &&
             total_bytes != null
           ) {
-            setModelProgress({ downloaded: downloaded_bytes, total: total_bytes });
+            const now = Date.now();
+            const prev = dlSampleRef.current;
+            if (prev && now > prev.t) {
+              const instant =
+                (downloaded_bytes - prev.bytes) / ((now - prev.t) / 1000);
+              // Negative deltas (cache file replaced/reset) don't feed the
+              // average; the next positive sample resumes it.
+              if (instant >= 0) {
+                const prevEma = dlSpeedEmaRef.current;
+                dlSpeedEmaRef.current =
+                  prevEma == null ? instant : 0.4 * instant + 0.6 * prevEma;
+              }
+            }
+            dlSampleRef.current = { bytes: downloaded_bytes, t: now };
+            const last = dlLastIncreaseRef.current;
+            if (last == null || downloaded_bytes > last.bytes) {
+              dlLastIncreaseRef.current = { bytes: downloaded_bytes, t: now };
+            }
+            // The sidecar polls every ~2s even when no bytes land, so a hung
+            // download keeps producing samples with frozen counters — 12s
+            // without growth flips the row into the stalled presentation.
+            const stalled =
+              dlLastIncreaseRef.current != null &&
+              now - dlLastIncreaseRef.current.t > 12_000;
+            const ema = dlSpeedEmaRef.current;
+            const etaSec =
+              ema != null && ema > 0
+                ? (total_bytes - downloaded_bytes) / ema
+                : null;
+            setModelProgress({
+              downloaded: downloaded_bytes,
+              total: total_bytes,
+              speedBps: ema,
+              etaSec,
+              stalled,
+            });
+          } else if (state === "progress" && cached) {
+            // Cache hit: weights already local, no download. Flag the load so
+            // the checklist shows "已在本機" rather than a silent spinner.
+            setModelCached(true);
           } else if (state === "done" || state === "error") {
             setModelProgress(null);
+            setModelCached(false);
+            dlSampleRef.current = null;
+            dlSpeedEmaRef.current = null;
+            dlLastIncreaseRef.current = null;
           }
         }
       }),
@@ -765,6 +839,10 @@ export default function ControlWindow() {
     setStepStatus({ spawn: "in_progress", model: "pending", mic: "pending" });
     setStepError({});
     setModelProgress(null);
+    setModelCached(false);
+    dlSampleRef.current = null;
+    dlSpeedEmaRef.current = null;
+    dlLastIncreaseRef.current = null;
     setSidecarReady(false);
     try {
       await invoke("restart_sidecar");
@@ -1052,6 +1130,7 @@ export default function ControlWindow() {
           stepStatus={stepStatus}
           stepError={stepError}
           modelProgress={modelProgress}
+          modelCached={modelCached}
           retryPrewarm={retryPrewarm}
           micAvailable={micAvailable}
         />
@@ -1120,6 +1199,7 @@ export default function ControlWindow() {
               stepStatus={stepStatus}
               stepError={stepError}
               modelProgress={modelProgress}
+              modelCached={modelCached}
             />
             {hasPrewarmError ? (
               <div className="mt-4 flex flex-col items-center gap-2">

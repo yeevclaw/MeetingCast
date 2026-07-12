@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import PrewarmChecklist, {
+  type ModelProgress,
   type StepId,
   type StepStatus,
 } from "@/components/PrewarmChecklist";
@@ -36,6 +37,7 @@ export default function WelcomeWizard({
   stepStatus,
   stepError,
   modelProgress,
+  modelCached,
   retryPrewarm,
   micAvailable,
 }: {
@@ -43,7 +45,8 @@ export default function WelcomeWizard({
   onDone: () => void;
   stepStatus: Record<StepId, StepStatus>;
   stepError: Partial<Record<StepId, string>>;
-  modelProgress?: { downloaded: number; total: number } | null;
+  modelProgress?: ModelProgress | null;
+  modelCached?: boolean;
   retryPrewarm: () => void;
   micAvailable: boolean | null;
 }) {
@@ -278,6 +281,7 @@ export default function WelcomeWizard({
                 stepStatus={stepStatus}
                 stepError={stepError}
                 modelProgress={modelProgress}
+                modelCached={modelCached}
               />
             </div>
 

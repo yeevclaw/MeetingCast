@@ -181,17 +181,33 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
         return
 
     emit({"type": "started"})
+    session_clock = asyncio.get_running_loop().time
+    session_started_at = session_clock()
+    last_synthetic_start = 0.0
 
     async def stream_with_cancel():
+        nonlocal last_synthetic_start
         async for transcript in stt.stream(chunks):
             if cancel_event.is_set():
                 return
+            t_start = transcript.t_start
+            t_end = transcript.t_end
+            # Some streaming backends (currently OpenAI Realtime) do not
+            # expose audio timestamps. The frontend uses stringified t_start as
+            # the utterance id, so leaving every final at 0 would deduplicate
+            # all but the first sentence. Generate a monotonic session-relative
+            # fallback while preserving real backend timestamps when present.
+            if transcript.is_final and t_start == 0.0 and t_end == 0.0:
+                elapsed = session_clock() - session_started_at
+                t_start = max(elapsed, last_synthetic_start + 0.000001)
+                t_end = t_start
+                last_synthetic_start = t_start
             emit({
                 "type": "transcript",
                 "text": transcript.text,
                 "is_final": transcript.is_final,
-                "t_start": transcript.t_start,
-                "t_end": transcript.t_end,
+                "t_start": t_start,
+                "t_end": t_end,
             })
 
     try:
@@ -234,24 +250,16 @@ def _prewarm_mic():
     def _no_op(indata, frames, time_info, status):
         pass
 
-    stream = sd.InputStream(
+    with sd.InputStream(
         samplerate=16000,
         channels=1,
         dtype="float32",
         blocksize=1600,
         callback=_no_op,
-    )
-    stream.start()
-    # Hold the stream open just long enough for macOS to probe CoreAudio
-    # and either show its permission prompt or succeed silently.
-    time.sleep(0.1)
-    # Teardown errors are harmless — the probe has already exercised the mic
-    # by this point — so keep the narrow swallow only here.
-    try:
-        stream.stop()
-        stream.close()
-    except Exception:  # noqa: BLE001
-        pass
+    ):
+        # Hold the stream open just long enough for macOS to probe CoreAudio
+        # and either show its permission prompt or succeed silently.
+        time.sleep(0.1)
 
 
 # Total on-disk size of the whisper-large-v3-turbo snapshot, measured on a
@@ -337,7 +345,7 @@ def _prewarm_local_model():
         import mlx_whisper  # type: ignore
         import huggingface_hub  # type: ignore
 
-        from stt.local import MLXWhisperSTT
+        from stt.local import MLXWhisperSTT, MLX_INFERENCE_LOCK
         engine = MLXWhisperSTT(language="zh")
 
         # Cache-hit fast path: if every file is already local, report nothing
@@ -354,25 +362,36 @@ def _prewarm_local_model():
                 target=_poll_model_download, args=(stop_event,), daemon=True
             )
             poller.start()
+        else:
+            # Cache hit: nothing to download, but loading the weights into GPU
+            # memory (the warm-up transcribe below) still takes a few seconds.
+            # Emit a one-shot marker so the checklist can say "已在本機,載入中"
+            # rather than sit on a silent spinner — a returning user otherwise
+            # can't tell the model step from a hang.
+            emit({
+                "type": "prewarm",
+                "step": "model",
+                "state": "progress",
+                "cached": True,
+            })
 
         # Bypass _transcribe_audio's RMS gate (which would skip silent input
         # and never actually load the model) — call mlx_whisper directly.
-        mlx_whisper.transcribe(
-            np.zeros(16000, dtype=np.float32),
-            path_or_hf_repo=engine.model_repo,
-            language="zh",
-            condition_on_previous_text=False,
-            no_speech_threshold=0.5,
-        )
-        # Drop the prewarm's intermediate buffers. The model weights remain
-        # in mlx's per-path cache (the whole point of prewarming) but the
-        # 1 s of silent audio's activations and decoder KV are released.
-        try:
-            (mx.clear_cache if hasattr(mx, "clear_cache") else mx.metal.clear_cache)()
-        except Exception:  # noqa: BLE001
-            pass
-    except Exception as e:  # noqa: BLE001
-        print(f"[model prewarm] {e}", file=sys.stderr, flush=True)
+        with MLX_INFERENCE_LOCK:
+            mlx_whisper.transcribe(
+                np.zeros(16000, dtype=np.float32),
+                path_or_hf_repo=engine.model_repo,
+                language="zh",
+                condition_on_previous_text=False,
+                no_speech_threshold=0.5,
+            )
+            # Drop the prewarm's intermediate buffers. The model weights remain
+            # in mlx's per-path cache (the whole point of prewarming) but the
+            # 1 s of silent audio's activations and decoder KV are released.
+            try:
+                (mx.clear_cache if hasattr(mx, "clear_cache") else mx.metal.clear_cache)()
+            except Exception:  # noqa: BLE001
+                pass
     finally:
         # Stop the poller before _run_prewarm_step emits `done`, so the last
         # progress event can't arrive after completion and re-open the row.

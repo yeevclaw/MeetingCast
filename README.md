@@ -111,8 +111,8 @@ cd prototype && .venv/bin/python -m unittest discover -s ../tests/python   # Pyt
 # 2. Build sidecar（Python 改過才需要）
 ./scripts/build-sidecar.sh
 
-# 3. Build .app + .dmg
-pnpm tauri build
+# 3. Build .app + .dmg, then restore the stable sidecar signing identifier
+pnpm bundle:mac
 
 # 4. 驗證簽章
 APP=src-tauri/target/release/bundle/macos/MeetingCast.app

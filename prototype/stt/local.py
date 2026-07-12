@@ -1,4 +1,6 @@
+import asyncio
 import sys
+import threading
 from collections import Counter, deque
 from collections.abc import Callable
 
@@ -10,6 +12,12 @@ from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
 from .lang_resources import hallucination_blocklist
+
+
+# asyncio cancellation cannot stop a function already running in `to_thread`.
+# Serialize every MLX/Metal inference so an old, cancelled session cannot race
+# a quick restart (or startup prewarm) on the same global Metal runtime.
+MLX_INFERENCE_LOCK = threading.Lock()
 
 
 # Cap MLX's idle Metal allocator cache. Without this, every transcribe call
@@ -237,18 +245,19 @@ class MLXWhisperSTT:
         # hallucination from one segment poisoning the next. no_speech_threshold
         # at 0.5 (default 0.6) drops slightly more borderline non-speech
         # segments — a worthwhile trade given how aggressively VAD cuts already.
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=self.model_repo,
-            language=self.language,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.5,
-            initial_prompt=self.initial_prompt,
-        )
-        # Return idle Metal buffers to the OS. Without this, MLX's allocator
-        # holds the working set of every past transcribe call indefinitely;
-        # over a meeting that's tens of GB resident for no good reason.
-        _mlx_clear_cache()
+        with MLX_INFERENCE_LOCK:
+            result = mlx_whisper.transcribe(
+                audio,
+                path_or_hf_repo=self.model_repo,
+                language=self.language,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.5,
+                initial_prompt=self.initial_prompt,
+            )
+            # Return idle Metal buffers to the OS. Without this, MLX's allocator
+            # holds the working set of every past transcribe call indefinitely;
+            # over a meeting that's tens of GB resident for no good reason.
+            _mlx_clear_cache()
         # result["language"] (Whisper auto-detect) intentionally unread — reserved for future auto-detect mode.
 
         # Gate 3: per-segment confidence filtering. Whisper retries low-
@@ -325,6 +334,12 @@ class MLXWhisperSTT:
 
         Force-flushes after max_speech_sec to handle continuous speech
         (e.g. broadcasters, fast presenters) where VAD never sees a pause.
+
+        Each Whisper call runs via asyncio.to_thread so a slow inference
+        (notably the first one on a cold Mac, where Metal kernels compile on
+        demand and can take several seconds) never blocks the event loop. If
+        it did, the sidecar couldn't read the `stop` command off stdin until
+        the inference finished — which surfaced as a 5–10 s freeze on 停止錄音.
         """
         max_samples = int(self.max_speech_sec * sample_rate)
         vad_iter = VADIterator(
@@ -381,7 +396,7 @@ class MLXWhisperSTT:
                         speech_buffer = []
                         in_speech = False
                         continue
-                    text = self._transcribe_audio(full_audio)
+                    text = await asyncio.to_thread(self._transcribe_audio, full_audio)
                     if text:
                         yield Transcript(
                             text=text, is_final=True,
@@ -395,7 +410,7 @@ class MLXWhisperSTT:
                 if in_speech and len(speech_buffer) * WINDOW_SAMPLES >= max_samples:
                     full_audio = np.concatenate(speech_buffer)
                     cut_at = speech_start_sec + len(full_audio) / sample_rate
-                    text = self._transcribe_audio(full_audio)
+                    text = await asyncio.to_thread(self._transcribe_audio, full_audio)
                     if text:
                         yield Transcript(
                             text=text, is_final=True,
@@ -408,7 +423,7 @@ class MLXWhisperSTT:
             full_audio = np.concatenate(speech_buffer)
             if len(full_audio) / sample_rate < MIN_SPEECH_SEC:
                 return
-            text = self._transcribe_audio(full_audio)
+            text = await asyncio.to_thread(self._transcribe_audio, full_audio)
             if text:
                 yield Transcript(
                     text=text, is_final=True,

@@ -165,15 +165,47 @@ pub fn session_dir(id: &str) -> PathBuf {
     sessions_dir().join(id)
 }
 
+/// Validate an externally supplied session id before it is joined to the
+/// sessions directory. Tauri commands are an IPC boundary: even though the
+/// React UI only sends ids returned by `list_sessions`, a compromised webview
+/// must not be able to use `../` to read or delete arbitrary user files.
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 80
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err("invalid session id".into());
+    }
+    Ok(())
+}
+
 impl SessionRecorder {
     /// Create a new session directory and write its initial meta.json. Uses
     /// local time for the directory name so the user can recognize meetings
     /// at a glance in Finder.
     pub fn start(backend: String, language: String, device: String) -> Result<Self, String> {
         let started_at_wall = Utc::now();
-        let session_id = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-        let dir = session_dir(&session_id);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir session: {e}"))?;
+        let parent = sessions_dir();
+        std::fs::create_dir_all(&parent).map_err(|e| format!("mkdir sessions: {e}"))?;
+        let base = Local::now().format("%Y-%m-%d_%H-%M-%S-%6f").to_string();
+        let (session_id, dir) = (0..1000)
+            .find_map(|suffix| {
+                let id = if suffix == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}-{suffix}")
+                };
+                let dir = session_dir(&id);
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => Some(Ok((id, dir))),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(format!("mkdir session: {e}"))),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| "could not allocate a unique session id".to_string())?;
 
         // Touch transcript.jsonl so empty sessions still have an
         // identifiable file (rather than just a stray meta.json).
@@ -256,6 +288,7 @@ impl SessionRecorder {
 /// Read meta.json from disk for a given session. Used by list_sessions and
 /// the history modal — keeps file format authoritative even after a crash.
 pub fn read_meta(session_id: &str) -> Result<SessionMeta, String> {
+    validate_session_id(session_id)?;
     let path = session_dir(session_id).join("meta.json");
     let content = std::fs::read_to_string(&path).map_err(|e| format!("read meta: {e}"))?;
     let mut meta =
@@ -277,6 +310,7 @@ pub fn touch_meta_summary_flags(session_id: &str) -> Result<(), String> {
 }
 
 pub fn read_transcript(session_id: &str) -> Result<Vec<StoredUtterance>, String> {
+    validate_session_id(session_id)?;
     let path = session_dir(session_id).join("transcript.jsonl");
     let f = File::open(&path).map_err(|e| format!("open transcript: {e}"))?;
     let mut out = Vec::new();
@@ -374,6 +408,7 @@ pub async fn delete_session(
     state: tauri::State<'_, SharedRecorder>,
     session_id: String,
 ) -> Result<(), String> {
+    validate_session_id(&session_id)?;
     // Refuse to delete the currently-active session — would corrupt the
     // recorder's in-memory state and leave subsequent appends pointing at a
     // missing file.
@@ -391,6 +426,7 @@ pub async fn delete_session(
 
 #[tauri::command]
 pub async fn open_session_folder(session_id: String) -> Result<(), String> {
+    validate_session_id(&session_id)?;
     let dir = session_dir(&session_id);
     if !dir.exists() {
         return Err("session folder not found".into());
@@ -437,6 +473,7 @@ fn format_duration_min_sec(secs: u64) -> String {
 /// "在 Finder 開啟" or just shares the file.
 #[tauri::command]
 pub async fn export_session_markdown(session_id: String) -> Result<String, String> {
+    validate_session_id(&session_id)?;
     let meta = read_meta(&session_id)?;
     let utterances = read_transcript(&session_id)?;
 
@@ -505,6 +542,7 @@ pub async fn reveal_in_finder(path: String) -> Result<(), String> {
 /// `target` against the known set to refuse arbitrary file names.
 #[tauri::command]
 pub async fn reveal_session_summary(session_id: String, target: String) -> Result<(), String> {
+    validate_session_id(&session_id)?;
     if !languages::is_valid(&target) {
         return Err(format!("invalid target: {target}"));
     }
@@ -563,6 +601,19 @@ pub async fn stop_session(state: &SharedRecorder) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_id_validation_rejects_path_traversal() {
+        for bad in ["", "../config.toml", "a/b", "a\\b", ".", "會議"] {
+            assert!(validate_session_id(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn session_id_validation_accepts_generated_shape() {
+        assert!(validate_session_id("2026-07-12_14-30-45-123456").is_ok());
+        assert!(validate_session_id("2026-07-12_14-30-45-123456-2").is_ok());
+    }
 
     fn parse(line: &str) -> StoredUtterance {
         serde_json::from_str(line).expect("parse utterance")

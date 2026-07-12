@@ -115,4 +115,4 @@ echo '{"type":"shutdown"}' | "$OUT_DIR/$OUT_NAME" || {
   echo "Smoke test failed" >&2
   exit 1
 }
-echo "==> OK. Now run: pnpm tauri build"
+echo "==> OK. Now run: pnpm bundle:mac"

@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>MeetingCast 需要麥克風以即時辨識你的中文發言並翻譯為英文與越南文</string>
+  <string>MeetingCast 需要麥克風，以即時辨識會議發言並顯示逐字稿與所選語言譯文</string>
 </dict>
 </plist>

@@ -1266,6 +1266,7 @@ pub async fn generate_summary(
 
 #[tauri::command]
 pub async fn read_summary(session_id: String, target: String) -> Result<Option<String>, String> {
+    session::validate_session_id(&session_id)?;
     if !languages::is_valid(&target) {
         return Err(format!("invalid target: {target}"));
     }

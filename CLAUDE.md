@@ -27,7 +27,7 @@
 # Tauri 桌面版
 pnpm tauri dev
 ./scripts/build-sidecar.sh         # PyInstaller，~5 min，Python 改才需要
-pnpm tauri build                   # .app + .dmg，~1 min
+pnpm bundle:mac                    # .app + 重簽 sidecar + .dmg，~1 min
 cd src-tauri && cargo test
 ```
 
@@ -40,7 +40,7 @@ cd src-tauri && cargo test
 1. 三處版本同步 — `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json`
 2. `cd src-tauri && cargo update -p meetingcast --offline`
 3. `./scripts/build-sidecar.sh`（Python / requirements.txt 改過才需要）
-4. `pnpm tauri build`
+4. `pnpm bundle:mac`（不要只跑 `pnpm tauri build`；後者會覆蓋 sidecar identifier）
 5. **驗 `Entitlements.plist` 含 5 個 key**（少一個 fresh Mac 必炸）：
    - `com.apple.security.device.audio-input`
    - `com.apple.security.cs.disable-library-validation`

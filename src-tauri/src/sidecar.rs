@@ -55,6 +55,11 @@ pub enum SidecarEvent {
         downloaded_bytes: Option<u64>,
         #[serde(default)]
         total_bytes: Option<u64>,
+        /// Set on the model step's `progress` when the weights were already
+        /// cached locally (no download) — lets the UI show a "已在本機" hint
+        /// instead of a silent spinner. Additive/optional for compatibility.
+        #[serde(default)]
+        cached: Option<bool>,
     },
     Transcript {
         text: String,
@@ -163,44 +168,56 @@ const SIDECAR_BIN_NAME: &str = "stt_engine";
 
 /// Resolve which binary to spawn for the STT sidecar.
 ///
-/// Priority:
-///   1. Dev venv (`prototype/.venv/bin/python` + `python-sidecar/stt_engine.py`)
-///      — if both exist, prefer them. This means dev mode (`pnpm tauri dev` /
-///      `cargo run`) always picks up live Python edits and never gets shadowed
-///      by a stale PyInstaller copy that Tauri's externalBin re-staged into
-///      `target/debug/`. In a release `.app` bundle these paths don't resolve
-///      (there is no project tree next to the executable), so this branch is
-///      naturally inert in production.
-///   2. Bundled binary (`stt_engine` or `stt_engine-<triple>` next to the
-///      main executable) — production fallback.
+/// The discriminator is "are we running from inside a real `.app` bundle?",
+/// NOT "does a dev venv exist?". The old check keyed on venv existence, which
+/// is broken on a dev machine: an installed `.app` there would still find the
+/// repo's venv and spawn `prototype/.venv/bin/python`. That python lives
+/// OUTSIDE the app bundle, so macOS TCC never attributes the app's microphone
+/// grant to it (responsible-process mismatch) → sounddevice fails at device
+/// enumeration with the misleading "Error querying device -1". It also meant
+/// the bundled binary path could never be exercised on a machine that has the
+/// repo, so a shipped regression would go unnoticed until a friend's fresh Mac.
 ///
-/// Returns (program, leading_args). Leading args are arguments inserted
-/// before any caller-supplied args — used to pass the script path when
-/// running via the dev-mode Python interpreter.
-/// Resolve the sidecar program + leading args + working directory to use
-/// when spawning. The cwd has to come back from this function (rather than
-/// always being `project_root()` like before) because in a release `.app`
-/// installed on a remote user's Mac, `project_root()` is the developer's
-/// build-time path embedded by `env!("CARGO_MANIFEST_DIR")` — that path
-/// doesn't exist on the user's machine, and `Command::current_dir(<missing>)`
-/// makes posix_spawn fail with ENOENT after fork (surfaces as the misleading
-/// "spawn sidecar: No such file or directory"). Returning a real cwd in
-/// each branch fixes that.
+/// Priority:
+///   1. Release (`current_exe` is inside `*.app/Contents/MacOS/`): the bundled
+///      binary (`stt_engine` or `stt_engine-<triple>`) next to the main exe.
+///      Always — the dev venv is deliberately ignored here even if present.
+///   2. Dev (`pnpm tauri dev` / `cargo run`, exe under `target/`): the dev venv
+///      (`prototype/.venv/bin/python` + `python-sidecar/stt_engine.py`) so we
+///      pick up live Python edits and never get shadowed by the stale
+///      PyInstaller copy Tauri's externalBin re-stages into `target/debug/`.
+///
+/// Returns (program, leading_args, cwd). Leading args are inserted before any
+/// caller-supplied args — the script path when running via the dev-mode Python
+/// interpreter. The cwd comes back from here (rather than always being
+/// `project_root()`) because in a release `.app` installed on a remote user's
+/// Mac, `project_root()` is the developer's build-time path embedded by
+/// `env!("CARGO_MANIFEST_DIR")` — that path doesn't exist on the user's
+/// machine, and `Command::current_dir(<missing>)` makes posix_spawn fail with
+/// ENOENT after fork (surfaces as "spawn sidecar: No such file or directory").
 fn locate_sidecar() -> Result<(PathBuf, Vec<String>, PathBuf), String> {
-    let root = project_root();
-    let python = root.join("prototype/.venv/bin/python");
-    let script = root.join("python-sidecar/stt_engine.py");
-    if python.exists() && script.exists() {
-        // Dev mode: cwd = repo root so any relative `prototype/samples/...`
-        // path passed by the UI for WAV demo mode resolves correctly.
-        return Ok((
-            python,
-            vec![script.to_string_lossy().to_string()],
-            root,
-        ));
+    let exe = std::env::current_exe().ok();
+    let in_app_bundle = exe
+        .as_deref()
+        .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+        .unwrap_or(false);
+
+    if !in_app_bundle {
+        let root = project_root();
+        let python = root.join("prototype/.venv/bin/python");
+        let script = root.join("python-sidecar/stt_engine.py");
+        if python.exists() && script.exists() {
+            // Dev mode: cwd = repo root so any relative `prototype/samples/...`
+            // path passed by the UI for WAV demo mode resolves correctly.
+            return Ok((
+                python,
+                vec![script.to_string_lossy().to_string()],
+                root,
+            ));
+        }
     }
 
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = exe {
         if let Some(dir) = exe.parent() {
             // Tauri's externalBin places the binary in the same directory as
             // the main exe. The filename may or may not have the target-
@@ -229,8 +246,7 @@ fn locate_sidecar() -> Result<(PathBuf, Vec<String>, PathBuf), String> {
     }
 
     Err(format!(
-        "sidecar not found: neither dev venv ({}) nor a bundled binary alongside the main exe is present",
-        python.display()
+        "sidecar not found: in_app_bundle={in_app_bundle}, no bundled binary alongside the main exe and no dev venv at prototype/.venv"
     ))
 }
 
@@ -479,7 +495,7 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
-        SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes } => app.emit(
+        SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes, cached } => app.emit(
             "stt:prewarm",
             serde_json::json!({
                 "step": step,
@@ -487,6 +503,7 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
                 "message": message,
                 "downloaded_bytes": downloaded_bytes,
                 "total_bytes": total_bytes,
+                "cached": cached,
             }),
         ),
         SidecarEvent::Warning { message } => app.emit("stt:warning", message),
@@ -615,10 +632,12 @@ pub async fn start_stt(
             }
             if idle_minutes > 0 {
                 let mgr_w = state.inner().clone();
+                let recorder_w = recorder.inner().clone();
                 let app_w = app.clone();
                 m.idle_watcher = Some(tokio::spawn(idle_watch_loop(
                     app_w,
                     mgr_w,
+                    recorder_w,
                     idle_minutes,
                 )));
             }
@@ -744,10 +763,15 @@ pub async fn stop_stt(
 
 /// Per-session idle watcher: polls `last_activity_at` and emits the
 /// `stt:idle_timeout` event when the configured threshold elapses without
-/// any speech-bearing final transcripts. The frontend listens for the event
-/// and calls `stop_stt` — keeping the actual teardown in one place rather
-/// than duplicating session::stop_session + stdin commands here.
-async fn idle_watch_loop(app: AppHandle, mgr: SharedManager, idle_minutes: u32) {
+/// any speech-bearing final transcripts. The frontend gets first chance to
+/// flush pending translations and call `stop_stt`; a delayed Rust fallback
+/// enforces teardown when the control window or its listener is gone.
+async fn idle_watch_loop(
+    app: AppHandle,
+    mgr: SharedManager,
+    recorder: SharedRecorder,
+    idle_minutes: u32,
+) {
     let threshold = Duration::from_secs(60 * idle_minutes as u64);
     // Poll at 30s or 1/4 of the threshold, whichever is smaller. Cap at the
     // floor so very short thresholds (e.g. 1 min) still get a useful check
@@ -766,12 +790,40 @@ async fn idle_watch_loop(app: AppHandle, mgr: SharedManager, idle_minutes: u32) 
         };
         if elapsed >= threshold {
             let _ = app.emit("stt:idle_timeout", idle_minutes);
-            // Clear our own state so a late-arriving final can't re-arm
-            // the watcher before the frontend stop_stt lands. The frontend
-            // is responsible for the actual session teardown.
-            let mut m = mgr.lock().await;
-            m.last_activity_at = None;
-            m.idle_watcher = None;
+            {
+                // Clear our own clock so a late-arriving final can't re-arm
+                // the watcher before the frontend stop_stt lands.
+                mgr.lock().await.last_activity_at = None;
+            }
+
+            // Give the control window time to flush pending translations and
+            // call stop_stt. If that window was closed or its JS listener is
+            // gone, enforce the cost-safety guarantee in Rust instead of
+            // leaving a cloud/realtime session running indefinitely.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let fallback_stop = {
+                let mut m = mgr.lock().await;
+                if m.last_start.is_none() {
+                    false
+                } else {
+                    m.intentional_stop = true;
+                    m.last_start = None;
+                    if let Some(stdin) = m.stdin.as_mut() {
+                        let _ = stdin.write_all(b"{\"type\":\"stop\"}\n").await;
+                        let _ = stdin.flush().await;
+                    }
+                    true
+                }
+            };
+            if fallback_stop {
+                let _ = session::stop_session(&recorder).await;
+                errors::record(
+                    "idle_timeout_fallback",
+                    "frontend did not stop the session within 5 seconds; Rust forced stop",
+                    Some(serde_json::json!({ "idle_minutes": idle_minutes })),
+                );
+            }
+            mgr.lock().await.idle_watcher = None;
             return;
         }
     }
