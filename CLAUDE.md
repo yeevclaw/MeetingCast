@@ -7,7 +7,7 @@
 ## 關鍵架構決策（不要重新討論）
 
 - **STT 引擎用 mlx-whisper**（不是 faster-whisper）— ctranslate2 在 macOS 沒 Metal，CPU 4.3s vs mlx Metal 0.9s
-- **雙 backend**：`MLXWhisperSTT`（local 預設）+ `DeepgramSTT`（cloud），同一 `Transcript` stream 介面，UI 可切。Cloud 用 Deepgram nova-3、`utterance_end_ms` 不能低於 1000
+- **雙 backend**：`MLXWhisperSTT`（local 預設）+ `OpenAIRealtimeWhisperSTT`（openai cloud），同一 `Transcript` stream 介面，UI 可切。Deepgram backend 已於 0.1.20 後移除
 - **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source / target 皆可選 zh/en/ja/vi，script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
 - **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
 - **翻譯在 Rust 不在 sidecar**：Anthropic API 由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT
@@ -65,7 +65,7 @@ cd src-tauri && cargo test
 - **Plan before action**：新功能 / 重構先提計畫等使用者確認
 - **One task at a time**：做完驗證再進下一步
 - **延遲第一優先**：架構決策以「降低使用者感知延遲」為標準
-- **STT 預設 local，cloud 為使用者選項**：成本與隱私考量
+- **STT 預設 local，openai cloud 為使用者選項**：成本與隱私考量
 
 ## 技術棧
 
@@ -74,7 +74,7 @@ cd src-tauri && cargo test
 | 桌面框架 | Tauri 2.x + React 19 + TypeScript |
 | UI | Tailwind v4 + 自訂 `@theme paper-*` token |
 | STT (local) | mlx-whisper（pin `<0.21`，Sequoia 相容） |
-| STT (cloud) | Deepgram nova-3 |
+| STT (cloud) | OpenAI Realtime Whisper |
 | VAD | silero-vad |
 | 翻譯 / 總結 | Anthropic Claude Haiku 4.5 streaming（總結用 Sonnet 4.6） |
 | Python ↔ Rust | Tauri sidecar + line-delimited JSON over stdio |
@@ -114,7 +114,7 @@ macOS 13+（Apple Silicon 強烈推薦） / Python 3.13+ / Node.js 20+ / Rust 1.
 ```toml
 [api]                    # ✅ Settings UI 可改
 anthropic_api_key = "sk-ant-..."
-deepgram_api_key = ""    # cloud backend 才需要
+openai_api_key = ""      # openai backend 才需要
 model = "claude-haiku-4-5"
 
 [audio]                  # ✅ Settings UI 可改
@@ -145,5 +145,4 @@ active_glossary = "預設"
 
 - [Tauri 2.0](https://v2.tauri.app/) / [global-shortcut plugin](https://v2.tauri.app/plugin/global-shortcut/)
 - [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) / [silero-vad](https://github.com/snakers4/silero-vad)
-- [Deepgram streaming](https://developers.deepgram.com/docs/live-streaming-audio) / [utterance_end](https://developers.deepgram.com/docs/utterance-end)
 - [Anthropic streaming](https://docs.claude.com/en/docs/build-with-claude/streaming) / [prompt caching](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)

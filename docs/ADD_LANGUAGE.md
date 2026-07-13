@@ -29,15 +29,15 @@
 
 ### 1. `shared/languages.json` 補一筆
 
-在陣列**依 UI 顯示順序**插入該語言一筆，下列 9 個字串欄位全部非空 + `empty_state` 物件：
+在陣列**依 UI 顯示順序**插入該語言一筆，下列 8 個字串欄位全部非空 + `empty_state` 物件：
 
 | 欄位 | 說明 |
 |---|---|
-| `code` | 語言代碼（與 whisper/deepgram 慣例一致） |
+| `code` | 語言代碼（與 whisper 慣例一致） |
 | `native_name` | 原生名（譯文視窗標題用） |
 | `zh_ui_name` | 繁中 UI 名（設定/歷史下拉、chip 用） |
 | `prompt_name` | 翻譯 system prompt 的目標語言名（如 `Japanese (日本語)`） |
-| `deepgram_code` / `whisper_code` | 各 backend 的語言 code |
+| `whisper_code` | Whisper 的語言 code（pin mlx-whisper / OpenAI Realtime 解碼） |
 | `script_profile` | `latin` \| `han` \| `japanese`（或前置步驟新增的 profile） |
 | `carrier` | Whisper `initial_prompt` 術語載句，**必含 `{terms}` 佔位** |
 | `term_join` | carrier 內術語串接分隔字（拉丁語系 `", "`、CJK `、`） |
@@ -124,6 +124,5 @@ Rust 端同理：`languages.rs`（`all()` / `get()` / `is_valid()`）、`config.
 
 ## 已知限制
 
-- **無 auto-detect**：源語言為手動選。Whisper 回傳的 `result["language"]`（偵測語言）已存在但刻意不讀（協定 `detect_language` 欄位預留 `false`）；Deepgram `multi` 混語模式僅涵蓋 10 語，**不含 zh / vi**，故未來 auto-detect 只能走 local Whisper。
+- **無 auto-detect**：源語言為手動選。Whisper 回傳的 `result["language"]`（偵測語言）已存在但刻意不讀（協定 `detect_language` 欄位預留 `false`）；未來 auto-detect 走 local Whisper。
 - **手動關閉的譯文視窗需重啟 App 才恢復**：slot 設「不使用」會顯示佔位（不隱藏視窗——隱藏後不可發現且無法恢復）；但使用者手動關掉 t1/t2 視窗後，目前需重啟才會重開。
-- **Deepgram ja / vi 串流未在 production 實測**：nova-3 文件宣稱支援 zh（含 zh-TW）/ ja / vi / en 全部四語（每語言 pin 一個 language code），但 ja / vi 串流品質尚未實測。失敗的 fallback 是在 `cloud.py` 做 per-language model 表。local（mlx-whisper large-v3-turbo）天然多語，無此疑慮。

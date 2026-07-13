@@ -27,7 +27,7 @@ const SUMMARY_TARGETS: Array<{ id: string; label: string }> = LANGS.map((l) => (
   label: zhName(l.code),
 }));
 
-type Backend = "local" | "cloud" | "openai";
+type Backend = "local" | "openai";
 
 // Language <option>s for a translation-slot select. A code is disabled (with
 // an explanatory title) when it equals the source language or is already used
@@ -72,7 +72,6 @@ export default function SettingsModal({
 }) {
   const [cfg, setCfg] = useState<Config | null>(null);
   const [showAnthropic, setShowAnthropic] = useState(false);
-  const [showDeepgram, setShowDeepgram] = useState(false);
   const [showOpenai, setShowOpenai] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -241,27 +240,6 @@ export default function SettingsModal({
             </Field>
 
             <Field
-              label="Deepgram API key"
-              hint="僅 cloud backend 使用；console.deepgram.com"
-            >
-              <div className="flex gap-2">
-                <input
-                  type={showDeepgram ? "text" : "password"}
-                  className="flex-1 rounded border border-paper-300 px-2 py-1 font-mono text-xs"
-                  value={cfg.api.deepgram_api_key}
-                  onChange={(e) => update({ deepgram_api_key: e.target.value })}
-                  placeholder="（可留空）"
-                />
-                <button
-                  className="rounded border border-paper-300 px-2 text-xs text-paper-700 hover:bg-paper-100"
-                  onClick={() => setShowDeepgram(!showDeepgram)}
-                >
-                  {showDeepgram ? "隱藏" : "顯示"}
-                </button>
-              </div>
-            </Field>
-
-            <Field
               label="OpenAI API key"
               hint="僅 openai backend 使用；platform.openai.com/api-keys"
             >
@@ -375,7 +353,7 @@ export default function SettingsModal({
               hint={
                 running
                   ? "錄音中無法切換，請先停止"
-                  : "預設 mlx-whisper（免費、離線可用）；cloud / openai 需填對應 API key"
+                  : "預設 mlx-whisper（免費、離線可用）；openai 需填 API key"
               }
             >
               <select
@@ -385,7 +363,6 @@ export default function SettingsModal({
                 disabled={running}
               >
                 <option value="local">local (mlx-whisper)</option>
-                <option value="cloud">cloud (deepgram)</option>
                 <option value="openai">openai (realtime-whisper)</option>
               </select>
               {backend === "openai" && (

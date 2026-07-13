@@ -10,7 +10,7 @@
 
 ## 功能
 
-- 🎙️ **即時 STT**：mlx-whisper（本地，Mac Metal GPU 加速）或 Deepgram nova-3（雲端，更低延遲、interim 預覽）
+- 🎙️ **即時 STT**：mlx-whisper（本地，Mac Metal GPU 加速）或 OpenAI Realtime Whisper（雲端，邊講邊出字）
 - 🌐 **並行翻譯**：Claude Haiku 4.5 streaming，兩個目標語言同時送出
 - 🪟 **多視窗**：控制視窗 + 兩個譯文視窗（各自選目標語言、可關其一），可拖外接螢幕、釘最前、無邊框、字體 ±
 - ⌨️ **全域快捷鍵**：`⌘ + Shift + M` 切換錄音
@@ -25,7 +25,7 @@
 - **macOS 13+**（Apple Silicon 強烈推薦，Intel 未測試）
 - 麥克風
 - Anthropic API key（[申請](https://console.anthropic.com/)）
-- （選用）Deepgram API key — 想用雲端 STT 才需要
+- （選用）OpenAI API key — 想用雲端 STT 才需要
 
 首次啟動會下載 Whisper 模型約 1.6 GB（`large-v3-turbo`）。
 
@@ -76,7 +76,7 @@ pnpm install
 cd prototype
 python3.13 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp .env.example .env  # 填 ANTHROPIC_API_KEY 與 DEEPGRAM_API_KEY
+cp .env.example .env  # 填 ANTHROPIC_API_KEY（選用：OPENAI_API_KEY）
 ```
 
 ### 開發模式
@@ -143,7 +143,7 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
         ┌────────▼─────────┐  ┌────────▼──────────────────────┐
         │  React Frontend  │  │  Python Sidecar (stt_engine)  │
         │  3 個視窗        │  │  silero-vad + mlx-whisper      │
-        │                  │◄─┤  / Deepgram nova-3 (cloud)    │
+        │                  │◄─┤  / OpenAI Realtime (cloud)    │
         └────────┬─────────┘  └───────────────────────────────┘
                  │ Tauri event "transcript"
         ┌────────▼─────────────────────┐
@@ -164,7 +164,7 @@ open src-tauri/target/release/bundle/dmg/MeetingCast_*.dmg
 | 桌面框架 | Tauri 2 + React 19 + TypeScript | 安裝包小、記憶體低、Rust 後端穩定 |
 | UI | Tailwind v4 + 自訂 `@theme paper-*` | 暖紙墨色票集中管理 |
 | STT (local) | mlx-whisper | Mac Metal GPU 加速（ctranslate2 沒 Metal 支援，CPU 太慢） |
-| STT (cloud) | Deepgram nova-3 | 低延遲 interim 預覽 |
+| STT (cloud) | OpenAI Realtime Whisper | 邊講邊出字（live captioning） |
 | VAD | silero-vad | 偵測句子邊界，降低 Whisper 呼叫次數 |
 | 翻譯 | Claude Haiku 4.5 (streaming) | 低延遲 + 多語品質 + prompt caching |
 | 總結 | Claude Sonnet 4.6 | 結構化輸出品質高於 Haiku |

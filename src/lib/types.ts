@@ -54,7 +54,6 @@ export type GlossaryBook = {
 export type Config = {
   api: {
     anthropic_api_key: string;
-    deepgram_api_key: string;
     openai_api_key: string;
     model: string;
     summary_model: string;

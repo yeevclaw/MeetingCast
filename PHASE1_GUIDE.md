@@ -178,6 +178,6 @@ if __name__ == "__main__":
 | 情境 | 行動 |
 |------|------|
 | P50 < 2.5s, P95 < 4s | 進 Phase 2，按原計畫包 Tauri |
-| P50 2.5-4s | 試 `large-v3-turbo` → `medium`，或考慮 Deepgram |
+| P50 2.5-4s | 試 `large-v3-turbo` → `medium`，或考慮雲端 STT |
 | P50 > 4s | 重新評估架構，可能要全雲端 |
 | 翻譯品質差 | 強化 prompt、加術語表、考慮升級到 Sonnet |

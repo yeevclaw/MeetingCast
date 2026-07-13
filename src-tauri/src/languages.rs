@@ -41,8 +41,6 @@ pub struct LanguageDef {
     /// Full name substituted into the translation system prompt's `{lang}` /
     /// `{source_lang}` slots (e.g. `Japanese (日本語)`).
     pub prompt_name: String,
-    /// Deepgram nova-3 single-language code.
-    pub deepgram_code: String,
     /// Whisper language code (pins mlx-whisper / OpenAI Realtime decoding).
     pub whisper_code: String,
     /// verify.rs / checks.py language-correctness profile:
@@ -111,7 +109,6 @@ mod tests {
                 ("native_name", &l.native_name),
                 ("zh_ui_name", &l.zh_ui_name),
                 ("prompt_name", &l.prompt_name),
-                ("deepgram_code", &l.deepgram_code),
                 ("whisper_code", &l.whisper_code),
                 ("script_profile", &l.script_profile),
                 ("carrier", &l.carrier),

@@ -14,8 +14,8 @@ import threading
 from pathlib import Path
 
 # Point SSL libs at the certifi-bundled CA file BEFORE importing anything
-# that opens an HTTPS connection (huggingface_hub, deepgram-sdk via aiohttp,
-# etc.). PyInstaller bundles cacert.pem when --collect-all certifi is set,
+# that opens an HTTPS connection (huggingface_hub, websockets, etc.).
+# PyInstaller bundles cacert.pem when --collect-all certifi is set,
 # but the macOS system trust store isn't visible inside the bundle, so
 # without this, every HTTPS request fails with CERTIFICATE_VERIFY_FAILED on
 # user machines (dev machine works because Python finds the OpenSSL system
@@ -115,17 +115,9 @@ def list_input_devices() -> list[dict]:
 async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     backend_name = cmd.get("backend", "local")
     language = cmd.get("language", "zh")
-    # Cloud (Deepgram) may need a different language code than the canonical
-    # one (e.g. a regional variant); the Rust side supplies it from the
-    # registry. Absent → fall back to canonical below.
-    deepgram_language = cmd.get("deepgram_language")
     source_cfg = cmd.get("source", {"type": "mic"})
     api_cfg = cmd.get("api") or {}
     initial_prompt = cmd.get("initial_prompt") or None
-
-    deepgram_api_key = api_cfg.get("deepgram_api_key")
-    if deepgram_api_key:
-        os.environ["DEEPGRAM_API_KEY"] = deepgram_api_key
 
     openai_api_key = api_cfg.get("openai_api_key")
     if openai_api_key:
@@ -154,16 +146,10 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 source_cfg = {**source_cfg, "device": ""}
 
     try:
-        # Cloud backend ignores initial_prompt — Deepgram has its own keyword
-        # boost mechanism that we can wire later. Avoid passing the kwarg so
-        # we don't break DeepgramSTT's __init__ signature. Cloud also takes the
-        # registry-supplied deepgram_language when present; local/openai use
-        # the canonical code.
-        cloud_lang = deepgram_language or language
-        backend_kwargs = {"language": cloud_lang if backend_name == "cloud" else language}
+        backend_kwargs = {"language": language}
         if backend_name == "local":
             # Only the local backend has hallucination gates — route their
-            # skip diagnostics out as `diag` events. Cloud backends ignore it.
+            # skip diagnostics out as `diag` events. Other backends ignore it.
             backend_kwargs["on_diag"] = _emit_diag
             if initial_prompt:
                 backend_kwargs["initial_prompt"] = initial_prompt
@@ -215,7 +201,7 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # Extract any nested detail Deepgram/SDK may have attached so we don't
+        # Extract any nested detail the SDK may have attached so we don't
         # lose useful diagnostics inside the exception's __str__.
         detail = []
         for attr in ("status_code", "body", "reason", "code", "headers"):
@@ -334,7 +320,7 @@ def _prewarm_local_model():
     miss a poller thread reports download progress; on a cache hit we skip the
     poller entirely so a returning user never sees a progress flash.
 
-    Non-fatal — if the user only ever uses the cloud backend or the demo
+    Non-fatal — if the user only ever uses the openai backend or the demo
     WAV, this overhead is wasted but the sidecar still works.
     """
     stop_event = threading.Event()

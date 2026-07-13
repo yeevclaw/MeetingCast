@@ -23,10 +23,10 @@ flowchart LR
     end
 
     Anthropic[Anthropic API<br/>Claude Haiku 4.5<br/>SSE streaming]
-    Deepgram[Deepgram API<br/>nova-3<br/>WebSocket streaming]
+    OpenAI[OpenAI Realtime API<br/>Whisper<br/>WebSocket streaming]
 
     R -->|HTTPS POST<br/>SSE| Anthropic
-    P -.->|可選 cloud backend| Deepgram
+    P -.->|可選 openai backend| OpenAI
 ```
 
 三個進程：
@@ -43,7 +43,7 @@ sequenceDiagram
     participant User as 講者
     participant Mic as 麥克風
     participant VAD as silero-vad
-    participant STT as mlx-whisper / Deepgram
+    participant STT as mlx-whisper / OpenAI Realtime
     participant Sidecar as Sidecar (Python)
     participant Rust as Rust 主程序
     participant Ctrl as 控制視窗
@@ -84,7 +84,7 @@ sequenceDiagram
 | 桌面框架 | **Tauri 2.x** | Electron | 安裝包 ~1/3、記憶體低、Rust 後端穩定 |
 | 前端 | **React 19 + TS + Tailwind v4** | Vue / Svelte | 團隊熟悉度、生態最大 |
 | STT (本地) | **mlx-whisper** | faster-whisper, whisper.cpp | macOS Metal GPU 加速；ctranslate2 在 macOS 沒 Metal、CPU 4.3s 太慢 |
-| STT (雲端) | **Deepgram nova-3** | Google Chirp 2, Azure | 設定最單純（單一 API key、無 GCP 專案） |
+| STT (雲端) | **OpenAI Realtime Whisper** | Deepgram nova-3, Google Chirp 2, Azure | 邊講邊出字（live captioning）、技術詞彙準確；Deepgram 已於 0.1.20 後移除 |
 | VAD | **silero-vad** | webrtcvad | 中文友善、ONNX 輕量 |
 | 翻譯 LLM | **Claude Haiku 4.5** | Sonnet, GPT-4o | 首 token ~800ms、三語品質好、prompt caching 省 token |
 | 跨進程通訊 | **line-delimited JSON over stdio** | WebSocket, gRPC, JSON-RPC | 簡單可靠、無需額外服務 |
@@ -110,7 +110,7 @@ flowchart TD
     D -->|是| F
     F --> G[送 STT]
     G -->|local| H[mlx-whisper<br/>large-v3-turbo<br/>Metal GPU]
-    G -->|cloud| I[Deepgram nova-3<br/>WebSocket streaming]
+    G -->|openai| I[OpenAI Realtime Whisper<br/>WebSocket streaming]
     H --> J[中文逐字稿<br/>is_final=true]
     I --> J
     J --> K[並行翻譯<br/>2 路 SSE]
@@ -164,7 +164,7 @@ User: {來源逐字稿}
 | **Streaming SSE** | Anthropic 一回 chunk 立即 emit，UI 邊收邊顯示，不等整段譯文 |
 | **並行翻譯** | 中→英 / 中→越 同時送出（兩個 invoke 並行） |
 | **Utterance id** | 譯文 chunk 帶 id，UI 端依 id 對齊；並行翻譯不會交錯 |
-| **VAD/Deepgram cuts** | 後期針對切點調過 VAD 參數，降感知延遲 ~200ms |
+| **VAD cuts** | 後期針對切點調過 VAD 參數，降感知延遲 ~200ms |
 
 實測：感知延遲 P50 ~2.3s ✅、P95 ~3.1s ⚠️（詳見 `docs/LATENCY.md`）。
 
@@ -203,7 +203,7 @@ flowchart TD
 ```
 
 關鍵設計：
-- **Welcome wizard**：第一次啟動引導填 API key，Anthropic 必填、Deepgram 可略過
+- **Welcome wizard**：第一次啟動引導填 API key，Anthropic 必填
 - **Prewarm overlay**：三步驟（啟動子程序 / 載模型 / 初始化麥克風），全部 done 才解鎖按鈕；UI 直接告訴使用者「首次啟動需下載 ~1.5 GB」
 - **延遲麥克風授權**：getUserMedia 在 App 啟動時就觸發，使用者不會在第一次按錄音時被授權框打斷
 - **Cache hit 不閃爍**：模型載入 overlay 延遲 400ms 才繪，cache 命中時根本不會閃出來

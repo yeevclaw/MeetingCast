@@ -52,35 +52,25 @@ export default function WelcomeWizard({
 }) {
   const [step, setStep] = useState<Step>("intro");
   const [anthropic, setAnthropic] = useState(initialConfig.api.anthropic_api_key);
-  const [deepgram, setDeepgram] = useState(initialConfig.api.deepgram_api_key);
   const [showAnthropic, setShowAnthropic] = useState(false);
-  const [showDeepgram, setShowDeepgram] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [validating, setValidating] = useState(false);
   const [anthropicCheck, setAnthropicCheck] = useState<KeyCheck | null>(null);
-  const [deepgramCheck, setDeepgramCheck] = useState<KeyCheck | null>(null);
 
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
   const modelDone = stepStatus.model === "done";
-  const hasInvalidKey = anthropicCheck === "invalid" || deepgramCheck === "invalid";
+  const hasInvalidKey = anthropicCheck === "invalid";
 
   async function handleKeysNext() {
     setValidating(true);
     try {
-      // Deepgram is optional — only validate when the field is non-empty.
-      const [a, d] = await Promise.all([
-        invoke<KeyCheck>("validate_anthropic_key", { key: anthropic.trim() }),
-        deepgram.trim()
-          ? invoke<KeyCheck>("validate_deepgram_key", { key: deepgram.trim() })
-          : Promise.resolve<KeyCheck | null>(null),
-      ]);
+      const a = await invoke<KeyCheck>("validate_anthropic_key", { key: anthropic.trim() });
       setAnthropicCheck(a);
-      setDeepgramCheck(d);
       // Only a confirmed-invalid key blocks; "unknown" (network trouble)
       // never does — the user shouldn't be locked out of their own app
       // because the wifi is flaky.
-      if (a !== "invalid" && d !== "invalid") {
+      if (a !== "invalid") {
         setStep("ready");
       }
     } catch {
@@ -101,7 +91,6 @@ export default function WelcomeWizard({
         api: {
           ...initialConfig.api,
           anthropic_api_key: anthropic.trim(),
-          deepgram_api_key: deepgram.trim(),
         },
         onboarding_complete: true,
       };
@@ -193,43 +182,6 @@ export default function WelcomeWizard({
                 </div>
                 <p className="mt-1 text-xs text-paper-500">用來呼叫 Claude 翻譯（必填）</p>
                 <KeyCheckHint check={anthropicCheck} />
-              </div>
-
-              <div>
-                <label className="mb-1 flex items-center justify-between text-xs font-medium text-paper-700">
-                  <span>Deepgram API key（可略過）</span>
-                  <a
-                    className="text-xs text-paper-600 hover:underline"
-                    href="https://console.deepgram.com/"
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    取得金鑰 ↗
-                  </a>
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    type={showDeepgram ? "text" : "password"}
-                    className="flex-1 rounded border border-paper-300 px-2 py-1.5 font-mono text-xs"
-                    value={deepgram}
-                    onChange={(e) => {
-                      setDeepgram(e.target.value);
-                      setDeepgramCheck(null);
-                    }}
-                    placeholder="（留空也可，預設用本地 mlx-whisper）"
-                  />
-                  <button
-                    className="rounded border border-paper-300 px-2 text-xs text-paper-700 hover:bg-paper-100"
-                    onClick={() => setShowDeepgram(!showDeepgram)}
-                    type="button"
-                  >
-                    {showDeepgram ? "隱藏" : "顯示"}
-                  </button>
-                </div>
-                <p className="mt-1 text-xs text-paper-500">
-                  只在你想切到 cloud STT 時才需要；之後可在「設定」補
-                </p>
-                <KeyCheckHint check={deepgramCheck} />
               </div>
             </div>
 

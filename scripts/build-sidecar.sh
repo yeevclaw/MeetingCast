@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bundle python-sidecar/stt_engine.py + all its runtime deps (mlx-whisper,
-# silero-vad, deepgram-sdk, sounddevice, numpy, torch, etc.) into a single
+# silero-vad, sounddevice, numpy, torch, etc.) into a single
 # self-contained binary that Tauri can ship as externalBin alongside the
 # main app, removing the dev-mode dependency on prototype/.venv at runtime.
 #
@@ -75,14 +75,13 @@ cd "$ROOT/python-sidecar"
   --hidden-import vad \
   --hidden-import stt \
   --hidden-import stt.local \
-  --hidden-import stt.cloud \
+  --hidden-import stt.openai_realtime \
   --hidden-import stt.base \
   --collect-all mlx_whisper \
   --collect-all mlx \
   --collect-all silero_vad \
   --collect-all sounddevice \
   --collect-all soundfile \
-  --collect-all deepgram \
   --collect-all huggingface_hub \
   --collect-all torch \
   --collect-all torchaudio \

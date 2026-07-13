@@ -263,9 +263,9 @@ async fn spawn_inner_body(
 ) -> Result<(), String> {
     let (program, leading_args, cwd) = locate_sidecar()?;
 
-    let (deepgram_key, openai_key) = {
+    let openai_key = {
         let cfg = cfg_arc.lock().await;
-        (cfg.api.deepgram_api_key.clone(), cfg.api.openai_api_key.clone())
+        cfg.api.openai_api_key.clone()
     };
 
     let mut cmd = Command::new(&program);
@@ -277,9 +277,6 @@ async fn spawn_inner_body(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if !deepgram_key.is_empty() {
-        cmd.env("DEEPGRAM_API_KEY", deepgram_key);
-    }
     if !openai_key.is_empty() {
         cmd.env("OPENAI_API_KEY", openai_key);
     }
@@ -539,12 +536,6 @@ pub async fn start_stt(
     if !languages::is_valid(&language_str) {
         return Err(format!("unsupported source language: {language_str}"));
     }
-    // Per-language Deepgram code from the registry — an additive protocol
-    // field the cloud backend prefers; local/openai backends ignore it.
-    let deepgram_language = languages::get(&language_str)
-        .map(|l| l.deepgram_code.clone())
-        .unwrap_or_else(|| language_str.clone());
-
     // If source.type == "mic" and the caller didn't specify a device,
     // backfill from config so the user's persisted preference is honored
     // even when the frontend forgets to pass it.
@@ -583,10 +574,9 @@ pub async fn start_stt(
         }
     }
 
-    let (deepgram_api_key, openai_api_key, initial_prompt, idle_minutes) = {
+    let (openai_api_key, initial_prompt, idle_minutes) = {
         let cfg = config.lock().await;
         (
-            cfg.api.deepgram_api_key.clone(),
             cfg.api.openai_api_key.clone(),
             cfg.whisper_initial_prompt(),
             cfg.idle_auto_stop_minutes,
@@ -597,11 +587,9 @@ pub async fn start_stt(
         "backend": backend,
         "source": source,
         "language": language_str,
-        "deepgram_language": deepgram_language,
         "detect_language": false,
         "initial_prompt": initial_prompt,
         "api": {
-            "deepgram_api_key": deepgram_api_key,
             "openai_api_key": openai_api_key,
         },
     });

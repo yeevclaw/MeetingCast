@@ -26,7 +26,6 @@ REQUIRED_STRING_FIELDS = (
     "native_name",
     "zh_ui_name",
     "prompt_name",
-    "deepgram_code",
     "whisper_code",
     "script_profile",
     "carrier",

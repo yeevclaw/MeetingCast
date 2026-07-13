@@ -14,8 +14,6 @@ pub struct ApiConfig {
     #[serde(default)]
     pub anthropic_api_key: String,
     #[serde(default)]
-    pub deepgram_api_key: String,
-    #[serde(default)]
     pub openai_api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
@@ -38,7 +36,6 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             anthropic_api_key: String::new(),
-            deepgram_api_key: String::new(),
             openai_api_key: String::new(),
             model: default_model(),
             summary_model: default_summary_model(),
@@ -530,11 +527,6 @@ pub fn seed_from_dotenv(cfg: &mut Config) {
     if cfg.api.anthropic_api_key.is_empty() {
         if let Ok(v) = std::env::var("ANTHROPIC_API_KEY") {
             cfg.api.anthropic_api_key = v;
-        }
-    }
-    if cfg.api.deepgram_api_key.is_empty() {
-        if let Ok(v) = std::env::var("DEEPGRAM_API_KEY") {
-            cfg.api.deepgram_api_key = v;
         }
     }
     if cfg.api.openai_api_key.is_empty() {
@@ -1099,12 +1091,12 @@ vi = \"Tử Vi Đẩu Số\"\n";
             source_lang: "en".into(),
             entries: vec![
                 entry("MeetingCast", &[], "", ""),
-                entry("Deepgram", &[], "", ""),
+                entry("Whisper", &[], "", ""),
             ],
         });
         cfg.active_glossary = Some("x".into());
         let p = cfg.whisper_initial_prompt().unwrap();
         assert!(p.starts_with("This recording may contain"), "en carrier: {p}");
-        assert!(p.contains("MeetingCast, Deepgram"), "en join \", \": {p}");
+        assert!(p.contains("MeetingCast, Whisper"), "en join \", \": {p}");
     }
 }

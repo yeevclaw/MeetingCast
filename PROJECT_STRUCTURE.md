@@ -47,7 +47,7 @@ translationintime/
 │   └── stt/                        # backend 抽象（sidecar 透過 sys.path 借用）
 │       ├── base.py                 # Transcript 型別
 │       ├── local.py                # MLXWhisperSTT（預設）
-│       ├── cloud.py                # DeepgramSTT（nova-3, utterance_end_ms=1000）
+│       ├── openai_realtime.py      # OpenAIRealtimeWhisperSTT（cloud）
 │       └── __init__.py             # get_backend(name)
 │
 ├── docs/
@@ -119,5 +119,5 @@ Phase 1 CLI，但目前**仍是 canonical Python STT 模組來源**（sidecar �
 |---|---|
 | Frontend | React 19 + TypeScript + Tailwind v4 + Vite 7 |
 | Tauri | tauri 2.x + global-shortcut + opener、reqwest+rustls、tokio、dotenvy |
-| Python sidecar | mlx-whisper、silero-vad、sounddevice、numpy、deepgram-sdk 6.1+、soundfile |
+| Python sidecar | mlx-whisper、silero-vad、sounddevice、numpy、websockets、soundfile |
 | Build | PyInstaller（sidecar）、Tauri bundler（`.app` / `.dmg`） |

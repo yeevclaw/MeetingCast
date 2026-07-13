@@ -80,7 +80,7 @@ function formatElapsed(ms: number): string {
 
 export default function ControlWindow() {
   const [running, setRunning] = useState(false);
-  const [backend, setBackend] = useState<"local" | "cloud" | "openai">("local");
+  const [backend, setBackend] = useState<"local" | "openai">("local");
   const [useMic, setUseMic] = useState(true);
   const [selectedDevice, setSelectedDevice] = useState<string>("");
   const [micAvailable, setMicAvailable] = useState<boolean | null>(null);
@@ -407,17 +407,12 @@ export default function ControlWindow() {
 
     // Pre-flight key checks. Doing these in JS avoids spinning up the
     // recording pipeline only to have every translate fail with 401, or
-    // (for cloud STT) the sidecar connect with 401 leaving the UI stuck on
-    // "錄音中" with empty transcript.
+    // (for openai STT) the sidecar connect with 401 leaving the UI stuck
+    // on "錄音中" with empty transcript.
     try {
       const cfg = await invoke<Config>("get_config");
       if (!cfg.api.anthropic_api_key.trim()) {
         showToast("error", "請先在設定填入 Anthropic API key", 5000);
-        setShowSettings(true);
-        return;
-      }
-      if (backendRef.current === "cloud" && !cfg.api.deepgram_api_key.trim()) {
-        showToast("error", "切到 cloud 辨識需要 Deepgram API key", 5000);
         setShowSettings(true);
         return;
       }

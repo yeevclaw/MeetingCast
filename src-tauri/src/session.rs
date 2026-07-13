@@ -487,10 +487,10 @@ pub async fn export_session_markdown(session_id: String) -> Result<String, Strin
         format_duration_min_sec(meta.duration_secs)
     ));
     md.push_str(&format!("- 句數：{}\n", meta.count));
-    let backend_label = if meta.backend == "cloud" {
-        "雲端 Deepgram"
-    } else {
+    let backend_label = if meta.backend == "local" {
         "本地 mlx-whisper"
+    } else {
+        "雲端辨識"
     };
     md.push_str(&format!("- 辨識：{backend_label}\n"));
     let lang_label = languages::get(&meta.language)

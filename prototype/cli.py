@@ -153,9 +153,9 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 1 pipeline runner")
     parser.add_argument(
         "--backend",
-        choices=["local", "cloud", "openai"],
+        choices=["local", "openai"],
         default="local",
-        help="local = mlx-whisper; cloud = Deepgram; openai = gpt-realtime-whisper",
+        help="local = mlx-whisper; openai = gpt-realtime-whisper",
     )
     parser.add_argument(
         "--file",

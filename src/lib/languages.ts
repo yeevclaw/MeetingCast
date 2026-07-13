@@ -8,7 +8,6 @@ export interface LangInfo {
   native_name: string;
   zh_ui_name: string;
   prompt_name: string;
-  deepgram_code: string;
   whisper_code: string;
   script_profile: string;
   carrier: string;
