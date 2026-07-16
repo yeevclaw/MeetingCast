@@ -6,7 +6,7 @@
 
 - macOS 13+（Apple Silicon）
 - 麥克風
-- Anthropic API key（[申請](https://console.anthropic.com/)）
+- 翻譯引擎 API key，二選一：Anthropic（[申請](https://console.anthropic.com/)）或 OpenAI（[申請](https://platform.openai.com/api-keys)）
 
 ## 安裝
 
@@ -18,7 +18,7 @@
    ```
    （AirDrop / USB 傳的不需要）
 4. 雙擊開啟，首次啟動會下載語音模型（~1.6 GB）並跳出麥克風授權對話框，按允許
-5. 在 Welcome wizard 填入 Anthropic API key
+5. 在 Welcome wizard 選翻譯引擎（Anthropic 或 OpenAI）並填入對應的 API key
 
 ## 使用
 
