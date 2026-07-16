@@ -582,6 +582,11 @@ const META_MARKERS: &[&str] = &[
     "この入力は不完全",
     "文字化けして",
     "意味を成していない",
+    // Khmer meta (Claude breaking character for a km target)
+    "ខ្ញុំមិនអាចបកប្រែ",
+    "មិនអាចបកប្រែបាន",
+    "សូមផ្តល់អត្ថបទ",
+    "អត្ថបទមិនពេញលេញ",
 ];
 
 /// Detect when Claude breaks character and meta-comments instead of translating.
@@ -998,26 +1003,31 @@ fn template_headings(template: &str, target: &str) -> Option<Vec<&'static str>> 
         ("exec_brief", "en") => Some(vec!["Summary", "Decisions", "Action Items", "Open Questions"]),
         ("exec_brief", "ja") => Some(vec!["概要", "決定事項", "アクションアイテム", "未解決の課題"]),
         ("exec_brief", "vi") => Some(vec!["Tóm tắt", "Quyết định", "Hành động", "Vấn đề chưa rõ"]),
+        ("exec_brief", "km") => Some(vec!["សេចក្តីសង្ខេប", "សេចក្តីសម្រេច", "កិច្ចការត្រូវធ្វើ", "ចំណុចត្រូវបញ្ជាក់"]),
 
         ("minutes", "zh") => Some(vec!["與會者", "議題清單", "討論摘要", "決議事項", "行動方案", "後續事項"]),
         ("minutes", "en") => Some(vec!["Attendees", "Agenda", "Discussion", "Decisions", "Action Items", "Follow-up"]),
         ("minutes", "ja") => Some(vec!["出席者", "アジェンダ", "討議内容", "決定事項", "アクションアイテム", "フォローアップ"]),
         ("minutes", "vi") => Some(vec!["Người tham dự", "Chương trình", "Thảo luận", "Quyết định", "Hành động", "Theo dõi"]),
+        ("minutes", "km") => Some(vec!["អ្នកចូលរួម", "របៀបវារៈ", "ការពិភាក្សា", "សេចក្តីសម្រេច", "កិច្ចការត្រូវធ្វើ", "ការតាមដានបន្ត"]),
 
         ("discussion", "zh") => Some(vec!["議題背景", "主題與觀點", "共識點", "分歧點", "待驗證假設", "Parking Lot"]),
         ("discussion", "en") => Some(vec!["Topic Background", "Themes and Perspectives", "Points of Agreement", "Points of Divergence", "Open Hypotheses", "Parking Lot"]),
         ("discussion", "ja") => Some(vec!["背景", "テーマと見解", "合意点", "相違点", "検証すべき仮説", "Parking Lot"]),
         ("discussion", "vi") => Some(vec!["Bối cảnh", "Chủ đề và quan điểm", "Đồng thuận", "Khác biệt", "Giả định cần xác nhận", "Để dành sau"]),
+        ("discussion", "km") => Some(vec!["សាវតា", "ប្រធានបទ និងទស្សនៈ", "ចំណុចឯកភាព", "ចំណុចមិនឯកភាព", "សម្មតិកម្មត្រូវផ្ទៀងផ្ទាត់", "Parking Lot"]),
 
         ("decision_log", "zh") => Some(vec!["待決策問題", "候選方案", "論點與反論", "最終決定", "未採納方案的理由", "風險與假設"]),
         ("decision_log", "en") => Some(vec!["Decision Question", "Options Considered", "Arguments For and Against", "Decision", "Why Other Options Were Rejected", "Risks and Assumptions"]),
         ("decision_log", "ja") => Some(vec!["決定すべき課題", "選択肢", "賛成論と反対論", "最終決定", "不採用の理由", "リスクと前提"]),
         ("decision_log", "vi") => Some(vec!["Vấn đề cần quyết định", "Phương án", "Lập luận ủng hộ và phản đối", "Quyết định cuối cùng", "Lý do từ chối phương án khác", "Rủi ro và giả định"]),
+        ("decision_log", "km") => Some(vec!["បញ្ហាត្រូវសម្រេច", "ជម្រើសដែលបានពិចារណា", "ហេតុផលគាំទ្រ និងជំទាស់", "សេចក្តីសម្រេចចុងក្រោយ", "មូលហេតុមិនជ្រើសជម្រើសផ្សេង", "ហានិភ័យ និងការសន្មត"]),
 
         ("client_call", "zh") => Some(vec!["客戶情境", "需求與反對意見", "我方承諾", "Champion / Blocker", "Next Steps", "BANT 訊號"]),
         ("client_call", "en") => Some(vec!["Client Context", "Needs and Objections", "Our Commitments", "Champion / Blocker", "Next Steps", "BANT Signals"]),
         ("client_call", "ja") => Some(vec!["顧客の状況", "ニーズと懸念", "当方のコミットメント", "Champion / Blocker", "Next Steps", "BANTシグナル"]),
         ("client_call", "vi") => Some(vec!["Bối cảnh khách hàng", "Nhu cầu và phản đối", "Cam kết của chúng tôi", "Champion / Blocker", "Bước tiếp theo", "Tín hiệu BANT"]),
+        ("client_call", "km") => Some(vec!["ស្ថានភាពអតិថិជន", "តម្រូវការ និងការជំទាស់", "ការសន្យារបស់យើង", "Champion / Blocker", "ជំហានបន្ទាប់", "សញ្ញា BANT"]),
 
         _ => None,
     }
@@ -1121,6 +1131,7 @@ fn build_slide_outline_system(
         "en" => ("Cover", "Agenda", "Decisions & Action Items", "Next Steps"),
         "ja" => ("表紙", "アジェンダ", "決定事項・アクションアイテム", "次のステップ"),
         "vi" => ("Trang bìa", "Chương trình", "Quyết định & Hành động", "Bước tiếp theo"),
+        "km" => ("ទំព័រមុខ", "របៀបវារៈ", "សេចក្តីសម្រេច និងកិច្ចការត្រូវធ្វើ", "ជំហានបន្ទាប់"),
         _ => ("封面", "議程", "決議與 Action Items", "Next Steps"),
     };
     format!(
@@ -1664,7 +1675,7 @@ mod tests {
             ("client_call", 6),
         ];
         for (template, count) in expected {
-            for lang in ["zh", "en", "ja", "vi"] {
+            for lang in ["zh", "en", "ja", "vi", "km"] {
                 let headings = template_headings(template, lang)
                     .unwrap_or_else(|| panic!("missing arm for ({template}, {lang})"));
                 assert_eq!(headings.len(), *count, "({template}, {lang}) heading count");

@@ -37,3 +37,9 @@
 {"id": "en_ja_basic", "category": "ordinary", "source_lang": "en", "source": "Let's review the quarterly budget in tomorrow's meeting.", "targets": ["ja"], "expect": {"non_empty": true}}
 {"id": "en_ja_action_item", "category": "ordinary", "source_lang": "en", "source": "Action item: send the MeetingCast demo to the client before Friday.", "targets": ["ja"], "expect": {"contains": {"ja": ["MeetingCast"]}}}
 {"id": "ja_en_context", "category": "rule9_context", "source_lang": "ja", "source": "明日は引き続き予算の件について議論しましょう。", "targets": ["en"], "context": [{"source": "量子コンピュータの応用について話しました。", "translation": "We discussed the applications of quantum computers"}, {"source": "この分野は多くの研究開発資金が必要です。", "translation": "This direction needs a lot of R&D funding"}], "expect": {"not_contains": {"en": ["quantum"]}}}
+{"id": "zh_km_basic", "category": "ordinary", "source_lang": "zh", "source": "我們下週三下午開產品規劃會議", "targets": ["km"], "expect": {"non_empty": true}}
+{"id": "zh_km_proper_noun", "category": "rule3_proper_noun", "source_lang": "zh", "source": "MeetingCast 的新版本會在下個月釋出", "targets": ["km"], "expect": {"contains": {"km": ["MeetingCast"]}}}
+{"id": "zh_km_glossary", "category": "glossary", "source_lang": "zh", "source": "老師今天要講解紫微斗數的命盤怎麼看", "targets": ["km"], "glossary": [{"term": "紫微斗數", "translations": {"km": "Zi Wei Dou Shu"}}], "expect": {"contains": {"km": ["Zi Wei Dou Shu"]}}}
+{"id": "zh_km_numbers", "category": "ordinary", "source_lang": "zh", "source": "第二季的銷售額成長了百分之二十", "targets": ["km"], "expect": {"contains": {"km": ["20"]}}}
+{"id": "zh_km_hallucination_repeat", "category": "rule6_hallucination", "source_lang": "zh", "source": "謝謝謝謝謝謝謝謝謝謝謝謝謝謝謝謝", "targets": ["km"], "expect": {"empty": true}}
+{"id": "zh_km_max_cjk", "category": "ordinary", "source_lang": "zh", "source": "今天的會議重點是明年的預算分配", "targets": ["km"], "expect": {"non_empty": true, "max_cjk_ratio": 0.2}}

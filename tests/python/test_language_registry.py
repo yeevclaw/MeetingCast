@@ -18,8 +18,11 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 _REGISTRY_PATH = _REPO / "shared" / "languages.json"
 
-EXPECTED_CODES = ["zh", "en", "ja", "vi"]  # also the UI display order
-ALLOWED_SCRIPT_PROFILES = {"latin", "han", "japanese"}
+EXPECTED_CODES = ["zh", "en", "ja", "vi", "km"]  # also the UI display order
+ALLOWED_SCRIPT_PROFILES = {"latin", "han", "japanese", "khmer"}
+# code → source_capable. km is translation-target only: Whisper transcription
+# quality for Khmer is unusable, so it must never be offered as a source.
+EXPECTED_SOURCE_CAPABLE = {"zh": True, "en": True, "ja": True, "vi": True, "km": False}
 # Top-level string fields every entry must carry, non-empty.
 REQUIRED_STRING_FIELDS = (
     "code",
@@ -46,11 +49,20 @@ class TestLanguageRegistry(unittest.TestCase):
         self.assertIsInstance(self.registry, list)
         self.assertTrue(self.registry)
 
-    def test_exactly_the_four_expected_codes(self):
+    def test_exactly_the_expected_codes(self):
         self.assertEqual({e["code"] for e in self.registry}, set(EXPECTED_CODES))
 
-    def test_display_order_is_zh_en_ja_vi(self):
+    def test_display_order_is_zh_en_ja_vi_km(self):
         self.assertEqual([e["code"] for e in self.registry], EXPECTED_CODES)
+
+    def test_source_capable_present_and_expected(self):
+        for entry in self.registry:
+            with self.subTest(code=entry["code"]):
+                self.assertIn("source_capable", entry)
+                self.assertIsInstance(entry["source_capable"], bool)
+                self.assertEqual(
+                    entry["source_capable"], EXPECTED_SOURCE_CAPABLE[entry["code"]]
+                )
 
     def test_codes_are_unique(self):
         codes = [e["code"] for e in self.registry]

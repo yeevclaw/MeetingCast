@@ -6,6 +6,7 @@
     "prompt_name": "Traditional Chinese (繁體中文)",
     "whisper_code": "zh",
     "script_profile": "han",
+    "source_capable": true,
     "carrier": "本段語音可能包含以下術語：{terms}。",
     "term_join": "、",
     "empty_state": {
@@ -20,6 +21,7 @@
     "prompt_name": "English",
     "whisper_code": "en",
     "script_profile": "latin",
+    "source_capable": true,
     "carrier": "This recording may contain the following terms: {terms}.",
     "term_join": ", ",
     "empty_state": {
@@ -34,6 +36,7 @@
     "prompt_name": "Japanese (日本語)",
     "whisper_code": "ja",
     "script_profile": "japanese",
+    "source_capable": true,
     "carrier": "この音声には以下の用語が含まれる可能性があります：{terms}。",
     "term_join": "、",
     "empty_state": {
@@ -48,11 +51,27 @@
     "prompt_name": "Vietnamese (Tiếng Việt)",
     "whisper_code": "vi",
     "script_profile": "latin",
+    "source_capable": true,
     "carrier": "Đoạn ghi âm này có thể chứa các thuật ngữ sau: {terms}.",
     "term_join": ", ",
     "empty_state": {
       "waiting": "Bản dịch sẽ hiện ở đây khi bắt đầu ghi âm",
       "hint": "Bấm Bắt đầu ở cửa sổ điều khiển"
+    }
+  },
+  {
+    "code": "km",
+    "native_name": "ភាសាខ្មែរ",
+    "zh_ui_name": "柬埔寨文",
+    "prompt_name": "Khmer (ភាសាខ្មែរ)",
+    "whisper_code": "km",
+    "script_profile": "khmer",
+    "source_capable": false,
+    "carrier": "ការថតសំឡេងនេះអាចមានពាក្យបច្ចេកទេសដូចខាងក្រោម៖ {terms}។",
+    "term_join": ", ",
+    "empty_state": {
+      "waiting": "ការបកប្រែនឹងបង្ហាញនៅទីនេះ បន្ទាប់ពីចាប់ផ្តើមថតសំឡេង",
+      "hint": "សូមចុច «ចាប់ផ្តើម» នៅក្នុងបង្អួចបញ្ជា"
     }
   }
 ]

@@ -15,8 +15,9 @@
 | `latin` | en / vi | `(han+kana)/total > 0.5` |
 | `han` | zh | `latin/total > 0.5 且 han/total < 0.1`；或 `kana/total > 0.3` |
 | `japanese` | ja | `latin/total > 0.5 且 (han+kana)/total < 0.1`；或 `total ≥ 20 且 kana == 0 且 han/total > 0.5` |
+| `khmer` | km | `(han+kana)/total > 0.5`；或 `latin/total > 0.5 且 khmer/total < 0.1` |
 
-（字元域：han = U+4E00–9FFF ∪ U+3400–4DBF、kana = U+3040–309F ∪ U+30A0–30FF、latin = ASCII 英文字母；全規則先過「最短 8 非空白字」守門。）
+（字元域：han = U+4E00–9FFF ∪ U+3400–4DBF、kana = U+3040–309F ∪ U+30A0–30FF、latin = ASCII 英文字母、khmer = U+1780–17FF；全規則先過「最短 8 非空白字」守門。）
 
 - **新語言若能歸入現有 profile**（例：西班牙文 → `latin`）→ 不必動判定邏輯。
 - **新語言若需要新書寫系統**（例：韓文諺文、泰文、阿拉伯文）→ 必須在**同一個 commit**同時新增 `verify.rs::wrong_language` 與 `checks.py::is_wrong_language` 的 profile 分支（見步驟 4 的**parity 契約**）。
@@ -38,7 +39,8 @@
 | `zh_ui_name` | 繁中 UI 名（設定/歷史下拉、chip 用） |
 | `prompt_name` | 翻譯 system prompt 的目標語言名（如 `Japanese (日本語)`） |
 | `whisper_code` | Whisper 的語言 code（pin mlx-whisper / OpenAI Realtime 解碼） |
-| `script_profile` | `latin` \| `han` \| `japanese`（或前置步驟新增的 profile） |
+| `script_profile` | `latin` \| `han` \| `japanese` \| `khmer`（或前置步驟新增的 profile） |
+| `source_capable` | boolean。`false` = **target-only 語言**（如 km：Whisper 辨識品質不堪用）——會從 Settings 源語言與 GlossaryModal 術語語言選單隱藏，`config.rs::sanitize_language` 也會把它擋在 source 之外（回落 zh）；譯文槽位不受影響。target-only 語言可跳過步驟 2（hallucination 防禁）與 new→zh 向 golden 案例 |
 | `carrier` | Whisper `initial_prompt` 術語載句，**必含 `{terms}` 佔位** |
 | `term_join` | carrier 內術語串接分隔字（拉丁語系 `", "`、CJK `、`） |
 | `empty_state` | `{waiting, hint}`，該語言**原文**（譯文視窗待機提示） |

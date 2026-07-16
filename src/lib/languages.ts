@@ -10,12 +10,15 @@ export interface LangInfo {
   prompt_name: string;
   whisper_code: string;
   script_profile: string;
+  /** false = translation-target only; hidden from source-language pickers
+   *  (e.g. km — Whisper transcription quality is unusable as a source). */
+  source_capable: boolean;
   carrier: string;
   term_join: string;
   empty_state: { waiting: string; hint: string };
 }
 
-/** All languages in registry (UI display) order: zh → en → ja → vi. */
+/** All languages in registry (UI display) order: zh → en → ja → vi → km. */
 export const LANGS: LangInfo[] = registry as LangInfo[];
 
 /** Language codes in registry order. */

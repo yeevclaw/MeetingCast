@@ -45,13 +45,16 @@ pub fn check_glossary(
     violations
 }
 
-/// Count `(han, kana, latin, total_non_whitespace)` over `text`. Character
-/// domains (canonical — mirrored verbatim by checks.py `_script_counts`):
+/// Count `(han, kana, latin, khmer, total_non_whitespace)` over `text`.
+/// Character domains (canonical — mirrored verbatim by checks.py
+/// `_script_counts`):
 ///   han   = U+4E00–9FFF (CJK Unified) ∪ U+3400–4DBF (ext-A)
 ///   kana  = U+3040–309F (hiragana) ∪ U+30A0–30FF (katakana)
 ///   latin = ASCII alphabetic (A–Z / a–z)
-fn script_counts(text: &str) -> (usize, usize, usize, usize) {
-    let (mut han, mut kana, mut latin, mut total) = (0usize, 0usize, 0usize, 0usize);
+///   khmer = U+1780–17FF (Khmer block)
+fn script_counts(text: &str) -> (usize, usize, usize, usize, usize) {
+    let (mut han, mut kana, mut latin, mut khmer, mut total) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     for c in text.chars() {
         if c.is_whitespace() {
             continue;
@@ -63,9 +66,11 @@ fn script_counts(text: &str) -> (usize, usize, usize, usize) {
             kana += 1;
         } else if c.is_ascii_alphabetic() {
             latin += 1;
+        } else if ('\u{1780}'..='\u{17FF}').contains(&c) {
+            khmer += 1;
         }
     }
-    (han, kana, latin, total)
+    (han, kana, latin, khmer, total)
 }
 
 /// Heuristic: did the model reply in the wrong script for `target`?
@@ -99,11 +104,17 @@ fn script_counts(text: &str) -> (usize, usize, usize, usize) {
 /// * **han** (zh): flag an English/Vietnamese reply —
 ///   `latin/total > 0.5 && han/total < 0.1`; or a Japanese reply —
 ///   `kana/total > 0.3`.
+///
+/// * **khmer** (km): flag a Chinese/Japanese reply — `(han+kana)/total > 0.5`;
+///   or an English reply — `latin/total > 0.5 && khmer/total < 0.1`. Genuine
+///   Khmer text is majority U+1780–17FF, so both conditions stay false; the
+///   `khmer < 0.1` clause protects mixed sentences that keep Latin proper
+///   nouns (rule 3) alongside Khmer script.
 pub fn wrong_language(text: &str, target: &str) -> bool {
     let Some(profile) = languages::get(target).map(|l| l.script_profile.as_str()) else {
         return false;
     };
-    let (han, kana, latin, total) = script_counts(text);
+    let (han, kana, latin, khmer, total) = script_counts(text);
     if total < 8 {
         return false;
     }
@@ -111,6 +122,7 @@ pub fn wrong_language(text: &str, target: &str) -> bool {
     let han_f = han as f64;
     let kana_f = kana as f64;
     let latin_f = latin as f64;
+    let khmer_f = khmer as f64;
     match profile {
         "latin" => (han_f + kana_f) / total_f > 0.5,
         "japanese" => {
@@ -118,6 +130,10 @@ pub fn wrong_language(text: &str, target: &str) -> bool {
                 || (total >= 20 && kana == 0 && han_f / total_f > 0.5)
         }
         "han" => (latin_f / total_f > 0.5 && han_f / total_f < 0.1) || kana_f / total_f > 0.3,
+        "khmer" => {
+            (han_f + kana_f) / total_f > 0.5
+                || (latin_f / total_f > 0.5 && khmer_f / total_f < 0.1)
+        }
         _ => false,
     }
 }
@@ -362,6 +378,40 @@ mod tests {
     #[test]
     fn wrong_language_en_kana_dominant_ja_reply_is_true() {
         assert!(wrong_language("これはとても重要な会議のまとめです", "en"));
+    }
+
+    // ---- script-profile wrong_language: km target (khmer profile) ----
+
+    #[test]
+    fn wrong_language_km_khmer_reply_is_false() {
+        // Genuine Khmer text — majority U+1780–17FF, must never be killed.
+        assert!(!wrong_language("នេះជាសេចក្តីសង្ខេបនៃកិច្ចប្រជុំថ្ងៃនេះ", "km"));
+    }
+
+    #[test]
+    fn wrong_language_km_chinese_reply_is_true() {
+        assert!(wrong_language("這是今天會議的完整總結與決議內容", "km"));
+    }
+
+    #[test]
+    fn wrong_language_km_english_reply_is_true() {
+        assert!(wrong_language(
+            "This is the summary of today's project meeting discussion.",
+            "km"
+        ));
+    }
+
+    #[test]
+    fn wrong_language_km_khmer_with_latin_proper_noun_is_false() {
+        // Mixed sentence keeping a Latin product name (rule 3) — the khmer
+        // ratio stays above 0.1 so the English clause never fires.
+        assert!(!wrong_language("យើងបានពិភាក្សាអំពី MeetingCast នៅថ្ងៃនេះ", "km"));
+    }
+
+    #[test]
+    fn wrong_language_km_short_text_is_false() {
+        // Below the 8-char min-length guard even though it's all Latin.
+        assert!(!wrong_language("Hello", "km"));
     }
 
     // ---- glossary check via translations map (incl. ja) ----

@@ -44,8 +44,12 @@ pub struct LanguageDef {
     /// Whisper language code (pins mlx-whisper / OpenAI Realtime decoding).
     pub whisper_code: String,
     /// verify.rs / checks.py language-correctness profile:
-    /// `latin` | `han` | `japanese`.
+    /// `latin` | `han` | `japanese` | `khmer`.
     pub script_profile: String,
+    /// false = translation-target only; excluded from source-language pickers
+    /// and rejected by config sanitize (e.g. km — Whisper transcription
+    /// quality is unusable as a source).
+    pub source_capable: bool,
     /// Whisper `initial_prompt` glossary carrier sentence, in this language,
     /// with a `{terms}` placeholder for the joined term list.
     pub carrier: String,
@@ -58,7 +62,7 @@ const LANGUAGES_JSON: &str = include_str!("../../shared/languages.json");
 
 static REGISTRY: OnceLock<Vec<LanguageDef>> = OnceLock::new();
 
-/// All languages in registry (UI display) order: zh → en → ja → vi.
+/// All languages in registry (UI display) order: zh → en → ja → vi → km.
 pub fn all() -> &'static [LanguageDef] {
     REGISTRY
         .get_or_init(|| {
@@ -82,14 +86,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_parses_and_has_exactly_four() {
-        assert_eq!(all().len(), 4);
+    fn registry_parses_and_has_exactly_five() {
+        assert_eq!(all().len(), 5);
     }
 
     #[test]
-    fn registry_order_is_zh_en_ja_vi() {
+    fn registry_order_is_zh_en_ja_vi_km() {
         let codes: Vec<&str> = all().iter().map(|l| l.code.as_str()).collect();
-        assert_eq!(codes, vec!["zh", "en", "ja", "vi"]);
+        assert_eq!(codes, vec!["zh", "en", "ja", "vi", "km"]);
+    }
+
+    #[test]
+    fn only_km_is_not_source_capable() {
+        for l in all() {
+            assert_eq!(
+                l.source_capable,
+                l.code != "km",
+                "unexpected source_capable for {}",
+                l.code
+            );
+        }
     }
 
     #[test]
@@ -136,7 +152,10 @@ mod tests {
     fn script_profile_in_allowed_set() {
         for l in all() {
             assert!(
-                matches!(l.script_profile.as_str(), "latin" | "han" | "japanese"),
+                matches!(
+                    l.script_profile.as_str(),
+                    "latin" | "han" | "japanese" | "khmer"
+                ),
                 "unexpected script_profile {:?} for {}",
                 l.script_profile,
                 l.code

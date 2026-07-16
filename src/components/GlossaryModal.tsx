@@ -465,7 +465,7 @@ function EditView({
             value={bookSourceLang}
             onChange={(e) => setBookSourceLang(e.target.value)}
           >
-            {LANGS.map((l) => (
+            {LANGS.filter((l) => l.source_capable).map((l) => (
               <option key={l.code} value={l.code}>
                 {selectLabel(l.code)}
               </option>

@@ -82,6 +82,11 @@ META_MARKERS = (
     "この入力は不完全",
     "文字化けして",
     "意味を成していない",
+    # Khmer meta (Claude breaking character for a km target)
+    "ខ្ញុំមិនអាចបកប្រែ",
+    "មិនអាចបកប្រែបាន",
+    "សូមផ្តល់អត្ថបទ",
+    "អត្ថបទមិនពេញលេញ",
 )
 
 
@@ -96,7 +101,13 @@ def _load_script_profiles() -> dict[str, str]:
     """Map language code → script_profile from shared/languages.json (the same
     registry Rust `include_str!`s and TS imports). Falls back to a builtin dict
     if the repo file can't be found/parsed, so checks stay usable standalone."""
-    fallback = {"zh": "han", "en": "latin", "ja": "japanese", "vi": "latin"}
+    fallback = {
+        "zh": "han",
+        "en": "latin",
+        "ja": "japanese",
+        "vi": "latin",
+        "km": "khmer",
+    }
     try:
         # checks.py lives at prototype/eval/; repo root is two levels up.
         path = Path(__file__).resolve().parents[2] / "shared" / "languages.json"
@@ -110,11 +121,12 @@ def _load_script_profiles() -> dict[str, str]:
 SCRIPT_PROFILES = _load_script_profiles()
 
 
-def _script_counts(text: str) -> tuple[int, int, int, int]:
-    """Count (han, kana, latin, non-whitespace total). Mirrors verify.rs
+def _script_counts(text: str) -> tuple[int, int, int, int, int]:
+    """Count (han, kana, latin, khmer, non-whitespace total). Mirrors verify.rs
     `script_counts` verbatim: han = U+4E00–9FFF ∪ U+3400–4DBF; kana = U+3040–
-    309F ∪ U+30A0–30FF; latin = ASCII alphabetic (A–Z / a–z)."""
-    han = kana = latin = total = 0
+    309F ∪ U+30A0–30FF; latin = ASCII alphabetic (A–Z / a–z); khmer = U+1780–
+    17FF."""
+    han = kana = latin = khmer = total = 0
     for c in text:
         if c.isspace():
             continue
@@ -126,14 +138,16 @@ def _script_counts(text: str) -> tuple[int, int, int, int]:
             kana += 1
         elif ("a" <= c <= "z") or ("A" <= c <= "Z"):
             latin += 1
-    return han, kana, latin, total
+        elif 0x1780 <= o <= 0x17FF:
+            khmer += 1
+    return han, kana, latin, khmer, total
 
 
 def cjk_ratio(text: str) -> float:
     """Fraction of non-whitespace chars that are Han ideographs. 0.0 when the
     text has no non-whitespace content. (Used only by the `max_cjk_ratio`
     expectation; `is_wrong_language` uses the fuller script-profile logic.)"""
-    han, _, _, total = _script_counts(text)
+    han, _, _, _, total = _script_counts(text)
     if total == 0:
         return 0.0
     return han / total
@@ -150,11 +164,13 @@ def is_wrong_language(text: str, target: str) -> bool:
         0.1; or Chinese reply — total >= 20 and kana == 0 and han/total > 0.5
       * han (zh): English/Vietnamese reply — latin/total > 0.5 and han/total <
         0.1; or Japanese reply — kana/total > 0.3
+      * khmer (km): Chinese/Japanese reply — (han+kana)/total > 0.5; or English
+        reply — latin/total > 0.5 and khmer/total < 0.1
     """
     profile = SCRIPT_PROFILES.get(target)
     if profile is None:
         return False
-    han, kana, latin, total = _script_counts(text)
+    han, kana, latin, khmer, total = _script_counts(text)
     if total < 8:
         return False
     if profile == "latin":
@@ -165,6 +181,10 @@ def is_wrong_language(text: str, target: str) -> bool:
         )
     if profile == "han":
         return (latin / total > 0.5 and han / total < 0.1) or kana / total > 0.3
+    if profile == "khmer":
+        return (han + kana) / total > 0.5 or (
+            latin / total > 0.5 and khmer / total < 0.1
+        )
     return False
 
 
@@ -292,6 +312,11 @@ if __name__ == "__main__":
     assert is_wrong_language("This is the full English summary of the meeting.", "ja") is True
     assert is_wrong_language("MeetingCastとGoogle Slidesを統合します", "ja") is False
     assert is_wrong_language("これは今日の会議のまとめです", "zh") is True
+    # khmer profile (mirror verify.rs wrong_language km cases).
+    assert is_wrong_language("នេះជាសេចក្តីសង្ខេបនៃកិច្ចប្រជុំថ្ងៃនេះ", "km") is False
+    assert is_wrong_language("這是今天會議的完整總結與決議內容", "km") is True
+    assert is_wrong_language("This is the summary of today's meeting.", "km") is True
+    assert is_wrong_language("យើងបានពិភាក្សាអំពី MeetingCast នៅថ្ងៃនេះ", "km") is False
     # v2 translations map preferred; legacy en/vi fallback still resolves.
     assert glossary_violations(
         "我們談到紫微斗數", "占星術について話しました",

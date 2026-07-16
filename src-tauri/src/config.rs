@@ -473,7 +473,12 @@ impl Config {
     /// wrong-length slot list, a slot that duplicates the source or the other
     /// slot, or a summary target the registry doesn't recognize.
     pub fn sanitize_language(&mut self) {
-        if !languages::is_valid(&self.language.source) {
+        // The source must be a registry language that is source-capable —
+        // target-only languages (km) have no usable Whisper transcription.
+        let source_ok = languages::get(&self.language.source)
+            .map(|l| l.source_capable)
+            .unwrap_or(false);
+        if !source_ok {
             self.language.source = "zh".into();
         }
         let source = self.language.source.clone();
@@ -938,6 +943,21 @@ mod tests {
         cfg.language.source = "xx".into();
         cfg.sanitize_language();
         assert_eq!(cfg.language.source, "zh");
+    }
+
+    #[test]
+    fn sanitize_rejects_non_source_capable_source_but_keeps_km_slot() {
+        // km is a valid registry language but target-only: as a source it
+        // resets to zh, while a km target slot survives untouched.
+        let mut cfg = Config::default();
+        cfg.language.source = "km".into();
+        cfg.language.target_slots = vec!["en".into(), "km".into()];
+        cfg.sanitize_language();
+        assert_eq!(cfg.language.source, "zh");
+        assert_eq!(
+            cfg.language.target_slots,
+            vec!["en".to_string(), "km".to_string()]
+        );
     }
 
     #[test]
