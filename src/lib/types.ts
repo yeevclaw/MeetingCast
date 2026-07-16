@@ -53,10 +53,18 @@ export type GlossaryBook = {
 
 export type Config = {
   api: {
+    // LLM provider for translation + summary: "anthropic" (default) or
+    // "openai". Any other value degrades to Anthropic backend-side.
+    provider: string;
     anthropic_api_key: string;
     openai_api_key: string;
+    // Anthropic translation / summary models.
     model: string;
     summary_model: string;
+    // OpenAI counterparts — separate fields so switching provider never
+    // sends a Claude model id to OpenAI (or vice versa).
+    openai_model: string;
+    openai_summary_model: string;
   };
   audio: {
     input_device: string;

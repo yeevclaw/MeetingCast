@@ -56,6 +56,41 @@ const RULES: Array<{ test: RegExp; map: (m: RegExpMatchArray) => Omit<FriendlyEr
     }),
   },
   {
+    test: /OpenAI API key not configured/i,
+    map: () => ({
+      primary: "尚未設定 OpenAI API key",
+      secondary: "請點右上角「設定」填入金鑰",
+    }),
+  },
+  {
+    test: /openai 401/,
+    map: () => ({
+      primary: "OpenAI API key 無效或已過期",
+      secondary: "請在「設定」確認金鑰是否正確",
+    }),
+  },
+  {
+    test: /openai 403/,
+    map: () => ({
+      primary: "OpenAI API 拒絕存取",
+      secondary: "金鑰可能沒有此模型的權限，請到 platform.openai.com 確認",
+    }),
+  },
+  {
+    test: /openai 429/,
+    map: () => ({
+      primary: "OpenAI API 觸及配額限制",
+      secondary: "稍後再試，或到 platform.openai.com 檢查額度",
+    }),
+  },
+  {
+    test: /openai 5\d\d/,
+    map: () => ({
+      primary: "OpenAI API 暫時故障",
+      secondary: "稍候再試一次",
+    }),
+  },
+  {
     test: /python venv not found/,
     map: () => ({
       primary: "找不到 Python 環境",

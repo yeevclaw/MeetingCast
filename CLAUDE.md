@@ -113,9 +113,13 @@ macOS 13+（Apple Silicon 強烈推薦） / Python 3.13+ / Node.js 20+ / Rust 1.
 
 ```toml
 [api]                    # ✅ Settings UI 可改
+provider = "anthropic"   # 翻譯+總結的 LLM："anthropic"（預設）| "openai"
 anthropic_api_key = "sk-ant-..."
-openai_api_key = ""      # openai backend 才需要
+openai_api_key = ""      # openai 翻譯引擎或 openai 辨識 backend 才需要
 model = "claude-haiku-4-5"
+summary_model = "claude-sonnet-4-6"
+openai_model = "gpt-5.6-luna"           # provider = openai 時的翻譯模型
+openai_summary_model = "gpt-5.6-sol"    # provider = openai 時的總結模型
 
 [audio]                  # ✅ Settings UI 可改
 input_device = ""        # 空 = 系統預設

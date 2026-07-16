@@ -61,6 +61,7 @@ pub fn run() {
             config::get_config,
             config::set_config,
             keycheck::validate_anthropic_key,
+            keycheck::validate_openai_key,
             errors::open_config_folder,
             errors::open_errors_log,
             errors::open_mic_settings,

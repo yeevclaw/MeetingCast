@@ -70,6 +70,13 @@ function HistoryIcon({ className = "h-5 w-5" }: { className?: string }) {
   );
 }
 
+// The API key the selected LLM provider (translation + summary) actually
+// uses — the wizard gate and the start pre-flight must check this one, not
+// unconditionally the Anthropic key.
+function activeLlmKey(cfg: Config): string {
+  return cfg.api.provider === "openai" ? cfg.api.openai_api_key : cfg.api.anthropic_api_key;
+}
+
 function formatElapsed(ms: number): string {
   const total = Math.floor(ms / 1000);
   const m = Math.floor(total / 60);
@@ -178,7 +185,7 @@ export default function ControlWindow() {
     // never see it; a keyless skip isn't re-nagged on the next launch.
     invoke<Config>("get_config")
       .then((cfg) => {
-        if (!cfg.onboarding_complete && !cfg.api.anthropic_api_key.trim()) {
+        if (!cfg.onboarding_complete && !activeLlmKey(cfg).trim()) {
           setNeedsWelcome(cfg);
         }
         setSelectedDevice(cfg.audio?.input_device ?? "");
@@ -411,8 +418,12 @@ export default function ControlWindow() {
     // on "錄音中" with empty transcript.
     try {
       const cfg = await invoke<Config>("get_config");
-      if (!cfg.api.anthropic_api_key.trim()) {
-        showToast("error", "請先在設定填入 Anthropic API key", 5000);
+      if (!activeLlmKey(cfg).trim()) {
+        showToast(
+          "error",
+          `請先在設定填入 ${cfg.api.provider === "openai" ? "OpenAI" : "Anthropic"} API key`,
+          5000,
+        );
         setShowSettings(true);
         return;
       }

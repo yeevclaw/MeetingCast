@@ -11,6 +11,11 @@ use crate::languages;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiConfig {
+    /// LLM provider for translation + summary: "anthropic" (default) or
+    /// "openai". Any other value degrades to Anthropic at the call site
+    /// (`Provider::from_config`), so no sanitize pass is needed here.
+    #[serde(default = "default_provider")]
+    pub provider: String,
     #[serde(default)]
     pub anthropic_api_key: String,
     #[serde(default)]
@@ -22,6 +27,17 @@ pub struct ApiConfig {
     /// the one-shot summary while keeping translation cheap/fast.
     #[serde(default = "default_summary_model")]
     pub summary_model: String,
+    /// OpenAI counterparts of `model` / `summary_model`. Kept as separate
+    /// fields so switching provider never sends a Claude model id to OpenAI
+    /// (or vice versa) and old configs need no migration.
+    #[serde(default = "default_openai_model")]
+    pub openai_model: String,
+    #[serde(default = "default_openai_summary_model")]
+    pub openai_summary_model: String,
+}
+
+fn default_provider() -> String {
+    "anthropic".into()
 }
 
 fn default_model() -> String {
@@ -32,13 +48,26 @@ fn default_summary_model() -> String {
     "claude-sonnet-4-6".into()
 }
 
+fn default_openai_model() -> String {
+    // Luna is the cost tier (~US$0.6/hr of meeting, on par with Haiku 4.5);
+    // Terra stays selectable in Settings for users who want more quality.
+    "gpt-5.6-luna".into()
+}
+
+fn default_openai_summary_model() -> String {
+    "gpt-5.6-sol".into()
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
+            provider: default_provider(),
             anthropic_api_key: String::new(),
             openai_api_key: String::new(),
             model: default_model(),
             summary_model: default_summary_model(),
+            openai_model: default_openai_model(),
+            openai_summary_model: default_openai_summary_model(),
         }
     }
 }
@@ -802,6 +831,27 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.api.summary_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn provider_defaults_when_absent_and_round_trips() {
+        // Old configs (pre-provider) must parse as Anthropic with the OpenAI
+        // model defaults filled in.
+        let old: Config = toml::from_str("[api]\nmodel = \"claude-haiku-4-5\"\n").unwrap();
+        assert_eq!(old.api.provider, "anthropic");
+        assert_eq!(old.api.openai_model, "gpt-5.6-luna");
+        assert_eq!(old.api.openai_summary_model, "gpt-5.6-sol");
+
+        // A saved provider switch + model override must survive
+        // serialize → parse.
+        let mut cfg = Config::default();
+        cfg.api.provider = "openai".into();
+        cfg.api.openai_model = "gpt-5.6-terra".into();
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.api.provider, "openai");
+        assert_eq!(reparsed.api.openai_model, "gpt-5.6-terra");
+        assert_eq!(reparsed.api.openai_summary_model, "gpt-5.6-sol");
     }
 
     #[test]

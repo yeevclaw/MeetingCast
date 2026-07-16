@@ -51,22 +51,33 @@ export default function WelcomeWizard({
   micAvailable: boolean | null;
 }) {
   const [step, setStep] = useState<Step>("intro");
+  const [provider, setProvider] = useState<"anthropic" | "openai">(
+    initialConfig.api.provider === "openai" ? "openai" : "anthropic",
+  );
+  // Both keys keep their own state so toggling the provider never loses an
+  // already-typed value; handleFinish writes both back.
   const [anthropic, setAnthropic] = useState(initialConfig.api.anthropic_api_key);
-  const [showAnthropic, setShowAnthropic] = useState(false);
+  const [openai, setOpenai] = useState(initialConfig.api.openai_api_key);
+  const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [validating, setValidating] = useState(false);
-  const [anthropicCheck, setAnthropicCheck] = useState<KeyCheck | null>(null);
+  // Validation result for the currently selected provider's key; reset on
+  // input change or provider toggle.
+  const [keyCheck, setKeyCheck] = useState<KeyCheck | null>(null);
 
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
   const modelDone = stepStatus.model === "done";
-  const hasInvalidKey = anthropicCheck === "invalid";
+  const hasInvalidKey = keyCheck === "invalid";
+  const activeKey = provider === "openai" ? openai : anthropic;
 
   async function handleKeysNext() {
     setValidating(true);
     try {
-      const a = await invoke<KeyCheck>("validate_anthropic_key", { key: anthropic.trim() });
-      setAnthropicCheck(a);
+      const command =
+        provider === "openai" ? "validate_openai_key" : "validate_anthropic_key";
+      const a = await invoke<KeyCheck>(command, { key: activeKey.trim() });
+      setKeyCheck(a);
       // Only a confirmed-invalid key blocks; "unknown" (network trouble)
       // never does — the user shouldn't be locked out of their own app
       // because the wifi is flaky.
@@ -90,7 +101,9 @@ export default function WelcomeWizard({
         ...initialConfig,
         api: {
           ...initialConfig.api,
+          provider,
           anthropic_api_key: anthropic.trim(),
+          openai_api_key: openai.trim(),
         },
         onboarding_complete: true,
       };
@@ -147,13 +160,52 @@ export default function WelcomeWizard({
 
             <div className="mt-5 space-y-4 text-sm">
               <div>
+                <label className="mb-1 block text-xs font-medium text-paper-700">
+                  翻譯引擎
+                </label>
+                <div className="flex gap-2">
+                  {(
+                    [
+                      { id: "anthropic", label: "Anthropic (Claude)" },
+                      { id: "openai", label: "OpenAI (GPT)" },
+                    ] as const
+                  ).map((p) => (
+                    <button
+                      key={p.id}
+                      className={
+                        provider === p.id
+                          ? "flex-1 rounded border border-paper-900 bg-paper-900 px-3 py-1.5 text-xs font-medium text-white"
+                          : "flex-1 rounded border border-paper-300 px-3 py-1.5 text-xs text-paper-700 hover:bg-paper-100"
+                      }
+                      onClick={() => {
+                        setProvider(p.id);
+                        setKeyCheck(null);
+                      }}
+                      type="button"
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1 text-xs text-paper-500">
+                  {provider === "openai"
+                    ? "翻譯、總結與雲端辨識共用同一把 OpenAI key"
+                    : "預設；翻譯與總結呼叫 Claude"}
+                </p>
+              </div>
+              <div>
                 <label className="mb-1 flex items-center justify-between text-xs font-medium text-paper-700">
                   <span>
-                    Anthropic API key <span className="text-danger-700">*</span>
+                    {provider === "openai" ? "OpenAI" : "Anthropic"} API key{" "}
+                    <span className="text-danger-700">*</span>
                   </span>
                   <a
                     className="text-xs text-paper-900 hover:underline"
-                    href="https://console.anthropic.com/settings/keys"
+                    href={
+                      provider === "openai"
+                        ? "https://platform.openai.com/api-keys"
+                        : "https://console.anthropic.com/settings/keys"
+                    }
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -162,26 +214,34 @@ export default function WelcomeWizard({
                 </label>
                 <div className="flex gap-2">
                   <input
-                    type={showAnthropic ? "text" : "password"}
+                    type={showKey ? "text" : "password"}
                     className="flex-1 rounded border border-paper-300 px-2 py-1.5 font-mono text-xs"
-                    value={anthropic}
+                    value={activeKey}
                     onChange={(e) => {
-                      setAnthropic(e.target.value);
-                      setAnthropicCheck(null);
+                      if (provider === "openai") {
+                        setOpenai(e.target.value);
+                      } else {
+                        setAnthropic(e.target.value);
+                      }
+                      setKeyCheck(null);
                     }}
-                    placeholder="sk-ant-api03-..."
+                    placeholder={provider === "openai" ? "sk-..." : "sk-ant-api03-..."}
                     autoFocus
                   />
                   <button
                     className="rounded border border-paper-300 px-2 text-xs text-paper-700 hover:bg-paper-100"
-                    onClick={() => setShowAnthropic(!showAnthropic)}
+                    onClick={() => setShowKey(!showKey)}
                     type="button"
                   >
-                    {showAnthropic ? "隱藏" : "顯示"}
+                    {showKey ? "隱藏" : "顯示"}
                   </button>
                 </div>
-                <p className="mt-1 text-xs text-paper-500">用來呼叫 Claude 翻譯（必填）</p>
-                <KeyCheckHint check={anthropicCheck} />
+                <p className="mt-1 text-xs text-paper-500">
+                  {provider === "openai"
+                    ? "用來呼叫 GPT 翻譯（必填）"
+                    : "用來呼叫 Claude 翻譯（必填）"}
+                </p>
+                <KeyCheckHint check={keyCheck} />
               </div>
             </div>
 
@@ -213,7 +273,7 @@ export default function WelcomeWizard({
                 <button
                   className="rounded bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-700 disabled:bg-paper-400"
                   onClick={handleKeysNext}
-                  disabled={!anthropic.trim() || validating}
+                  disabled={!activeKey.trim() || validating}
                   type="button"
                 >
                   {validating ? "驗證中…" : "下一步"}

@@ -7,6 +7,42 @@ import { LANGS, selectLabel, zhName } from "@/lib/languages";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 const SUMMARY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
+const OPENAI_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra"];
+const OPENAI_SUMMARY_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra"];
+
+// 每小時翻譯費用概估（顯示在 option 文字）。假設：雙譯文視窗、每小時
+// ~30 分鐘語音（~300 句 utterance × 2 目標 ≈ 0.48M input / 0.024M output
+// tokens）、無 prompt cache。定價（2026-07 官方牌價 per 1M tokens）：
+//   claude-haiku-4-5 $1/$5、claude-sonnet-4-6 $3/$15、
+//   gpt-5.6-luna $1/$6、gpt-5.6-terra $2.5/$15、gpt-5.6-sol $5/$30。
+// 換 model 或官方調價時同步更新這兩張表。
+// 另：辨識引擎選項的費用標示（openai realtime-whisper $0.017/分鐘音訊，
+// 一小時會議依 30–60 分鐘計費音訊估 ≈US$0.5–1）寫在「辨識引擎」select
+// 的 option 文字，調價時一併更新。
+const TRANSLATE_COST_PER_HOUR: Record<string, string> = {
+  "claude-haiku-4-5": "0.6",
+  "claude-sonnet-4-6": "1.8",
+  "gpt-5.6-luna": "0.6",
+  "gpt-5.6-terra": "1.6",
+};
+
+// 每次總結費用概估（一小時會議逐字稿 ≈ 5k input / 1.5k output tokens）。
+const SUMMARY_COST_PER_RUN: Record<string, string> = {
+  "claude-sonnet-4-6": "0.04",
+  "claude-haiku-4-5": "0.01",
+  "gpt-5.6-sol": "0.07",
+  "gpt-5.6-terra": "0.04",
+};
+
+function translateModelLabel(m: string): string {
+  const cost = TRANSLATE_COST_PER_HOUR[m];
+  return cost ? `${m}（≈US$${cost}/小時）` : m;
+}
+
+function summaryModelLabel(m: string): string {
+  const cost = SUMMARY_COST_PER_RUN[m];
+  return cost ? `${m}（≈US$${cost}/次）` : m;
+}
 
 // Kept in sync with HistoryModal's SUMMARY_TEMPLATES labels (not exported
 // there). If the template set changes, update both.
@@ -219,8 +255,22 @@ export default function SettingsModal({
         ) : (
           <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4 text-sm">
             <Field
+              label="翻譯引擎（LLM）"
+              hint="翻譯與總結使用的服務；openai 模式下與雲端辨識共用同一把 OpenAI key"
+            >
+              <select
+                className="w-full rounded border border-paper-300 px-2 py-1"
+                value={cfg.api.provider === "openai" ? "openai" : "anthropic"}
+                onChange={(e) => update({ provider: e.target.value })}
+              >
+                <option value="anthropic">anthropic (Claude，預設)</option>
+                <option value="openai">openai (GPT)</option>
+              </select>
+            </Field>
+
+            <Field
               label="Anthropic API key"
-              hint="從 console.anthropic.com 建立"
+              hint="從 console.anthropic.com 建立；provider 為 anthropic 時必填"
             >
               <div className="flex gap-2">
                 <input
@@ -241,7 +291,7 @@ export default function SettingsModal({
 
             <Field
               label="OpenAI API key"
-              hint="僅 openai backend 使用；platform.openai.com/api-keys"
+              hint="openai 翻譯引擎或 openai 辨識 backend 使用；platform.openai.com/api-keys"
             >
               <div className="flex gap-2">
                 <input
@@ -260,31 +310,59 @@ export default function SettingsModal({
               </div>
             </Field>
 
-            <Field label="翻譯模型">
+            <Field
+              label="翻譯模型"
+              hint="費用為概估：兩個譯文視窗、每小時約 30 分鐘語音"
+            >
               <select
                 className="w-full rounded border border-paper-300 px-2 py-1"
-                value={cfg.api.model}
-                onChange={(e) => update({ model: e.target.value })}
+                value={cfg.api.provider === "openai" ? cfg.api.openai_model : cfg.api.model}
+                onChange={(e) =>
+                  update(
+                    cfg.api.provider === "openai"
+                      ? { openai_model: e.target.value }
+                      : { model: e.target.value },
+                  )
+                }
               >
-                {MODELS.map((m) => (
+                {(cfg.api.provider === "openai" ? OPENAI_MODELS : MODELS).map((m) => (
                   <option key={m} value={m}>
-                    {m}
+                    {translateModelLabel(m)}
                   </option>
                 ))}
               </select>
             </Field>
 
-            <Field label="總結模型" hint="會議紀錄的 AI 總結使用；預設 Sonnet 4.6">
+            <Field
+              label="總結模型"
+              hint={
+                cfg.api.provider === "openai"
+                  ? "會議紀錄的 AI 總結使用；預設 gpt-5.6-sol，費用為一小時會議的單次概估"
+                  : "會議紀錄的 AI 總結使用；預設 Sonnet 4.6，費用為一小時會議的單次概估"
+              }
+            >
               <select
                 className="w-full rounded border border-paper-300 px-2 py-1"
-                value={cfg.api.summary_model}
-                onChange={(e) => update({ summary_model: e.target.value })}
+                value={
+                  cfg.api.provider === "openai"
+                    ? cfg.api.openai_summary_model
+                    : cfg.api.summary_model
+                }
+                onChange={(e) =>
+                  update(
+                    cfg.api.provider === "openai"
+                      ? { openai_summary_model: e.target.value }
+                      : { summary_model: e.target.value },
+                  )
+                }
               >
-                {SUMMARY_MODELS.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
+                {(cfg.api.provider === "openai" ? OPENAI_SUMMARY_MODELS : SUMMARY_MODELS).map(
+                  (m) => (
+                    <option key={m} value={m}>
+                      {summaryModelLabel(m)}
+                    </option>
+                  ),
+                )}
               </select>
             </Field>
 
@@ -362,8 +440,8 @@ export default function SettingsModal({
                 onChange={(e) => setBackend(e.target.value as Backend)}
                 disabled={running}
               >
-                <option value="local">local (mlx-whisper)</option>
-                <option value="openai">openai (realtime-whisper)</option>
+                <option value="local">local (mlx-whisper)（免費，本機運算）</option>
+                <option value="openai">openai (realtime-whisper)（≈US$0.5–1/小時）</option>
               </select>
               {backend === "openai" && (
                 <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
@@ -519,7 +597,7 @@ export default function SettingsModal({
                     </div>
                   </div>
                   <p className="text-xs text-paper-500">
-                    每個語言各呼叫一次 Claude API（與手動產生總結相同）
+                    每個語言各呼叫一次總結模型 API（與手動產生總結相同）
                   </p>
                 </div>
               )}

@@ -36,3 +36,17 @@ pub async fn validate_anthropic_key(key: String) -> Result<String, String> {
     }
     .to_string())
 }
+
+#[tauri::command]
+pub async fn validate_openai_key(key: String) -> Result<String, String> {
+    let resp = client()?
+        .get("https://api.openai.com/v1/models")
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await;
+    Ok(match resp {
+        Ok(r) => classify(r.status().as_u16()),
+        Err(_) => "unknown",
+    }
+    .to_string())
+}

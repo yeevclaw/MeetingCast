@@ -79,6 +79,21 @@ impl TraceGuard {
         }
     }
 
+    /// Record usage counters from an OpenAI `usage` object (the final
+    /// streaming chunk under `stream_options.include_usage`, or the
+    /// non-streaming response body). Field mapping: `prompt_tokens` →
+    /// input, `completion_tokens` → output, `prompt_tokens_details.
+    /// cached_tokens` → cache_read. `cache_creation_input_tokens` stays
+    /// None — OpenAI has no explicit cache-write counter.
+    fn absorb_openai_usage(&mut self, usage: &Value) {
+        self.input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+        self.output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
+        self.cache_read_input_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64());
+    }
+
     /// Record cumulative output tokens + stop_reason from a `message_delta`.
     fn absorb_message_delta(&mut self, parsed: &Value) {
         if let Some(out) = parsed
@@ -156,6 +171,42 @@ struct DonePayload {
 }
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
+
+/// LLM provider for translation + summary. Selected per call from
+/// `config.api.provider`; anything that isn't exactly "openai" degrades to
+/// Anthropic so a hand-edited config never hard-errors here.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Provider {
+    Anthropic,
+    OpenAi,
+}
+
+impl Provider {
+    fn from_config(s: &str) -> Self {
+        if s == "openai" {
+            Provider::OpenAi
+        } else {
+            Provider::Anthropic
+        }
+    }
+
+    fn url(self) -> &'static str {
+        match self {
+            Provider::Anthropic => ANTHROPIC_URL,
+            Provider::OpenAi => OPENAI_URL,
+        }
+    }
+
+    /// Prefix used in error strings ("anthropic 429: …" / "openai 429: …") —
+    /// matched by the frontend banner rules in src/lib/errors.ts.
+    fn label(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAi => "openai",
+        }
+    }
+}
 
 /// Process-wide reqwest client shared across every Anthropic call. Pooling one
 /// client reuses TCP + TLS connections instead of paying a fresh handshake per
@@ -181,17 +232,30 @@ fn http_client() -> &'static Client {
 /// latency to ~1 s when both retries fail.
 const RETRY_BACKOFF_MS: &[u64] = &[250, 750];
 
-/// POST to Anthropic with bounded retries. Retries cover (a) transport
+/// Auth headers per provider. Anthropic's arm must stay byte-identical to
+/// the pre-provider behavior; OpenAI uses standard Bearer auth.
+fn apply_auth(req: reqwest::RequestBuilder, provider: Provider, api_key: &str) -> reqwest::RequestBuilder {
+    match provider {
+        Provider::Anthropic => req
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        Provider::OpenAi => req.header("Authorization", format!("Bearer {api_key}")),
+    }
+}
+
+/// POST to the LLM provider with bounded retries. Retries cover (a) transport
 /// failures where the request never reached the server (`reqwest::Error`
 /// from `send()`), and (b) explicit overload / transient-server signals from
-/// the API: HTTP 429 (rate-limit), 500 (internal), 503 (unavailable), and 529
-/// (overloaded). Other 4xx/5xx surface immediately — retrying a 401 or 400
-/// just produces the same answer while spending more wallclock against the
-/// user's perceived latency. When the server sends a `Retry-After` header with
-/// an integer-seconds value, the next backoff is `max(fixed_backoff, retry_after)`
-/// capped at 10s so we respect the server's pacing without stalling the UI
-/// indefinitely.
-async fn post_anthropic_with_retry(
+/// the API — Anthropic: HTTP 429 (rate-limit), 500 (internal), 503
+/// (unavailable), 529 (overloaded); OpenAI: 429, 500, and the 502/503/504
+/// its edge returns under load. Other 4xx/5xx surface immediately — retrying
+/// a 401 or 400 just produces the same answer while spending more wallclock
+/// against the user's perceived latency. When the server sends a `Retry-After`
+/// header with an integer-seconds value, the next backoff is
+/// `max(fixed_backoff, retry_after)` capped at 10s so we respect the server's
+/// pacing without stalling the UI indefinitely.
+async fn post_llm_with_retry(
+    provider: Provider,
     api_key: &str,
     body: &Value,
     retries: &mut u32,
@@ -213,10 +277,7 @@ async fn post_anthropic_with_retry(
                 .unwrap_or(backoff);
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        let resp = client
-            .post(ANTHROPIC_URL)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
+        let resp = apply_auth(client.post(provider.url()), provider, api_key)
             .header("content-type", "application/json")
             .json(body)
             .send()
@@ -235,17 +296,25 @@ async fn post_anthropic_with_retry(
                     .and_then(|s| s.trim().parse::<u64>().ok())
                     .map(|secs| secs.saturating_mul(1000).min(10_000));
                 let body_text = r.text().await.unwrap_or_default();
-                let msg = format!("anthropic {status}: {body_text}");
-                if matches!(status.as_u16(), 429 | 500 | 503 | 529) {
+                let msg = format!("{} {status}: {body_text}", provider.label());
+                let retryable = match provider {
+                    Provider::Anthropic => matches!(status.as_u16(), 429 | 500 | 503 | 529),
+                    Provider::OpenAi => matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504),
+                };
+                if retryable {
                     pending_delay_ms = retry_after_ms;
                     last_err = msg;
                     continue;
                 }
-                // A 404 (or a body flagging not_found_error) on this endpoint
-                // almost always means the configured model id is wrong or
-                // retired — prefix with an actionable Chinese hint the frontend
-                // banner keys off (see src/lib/errors.ts).
-                if status.as_u16() == 404 || body_text.contains("not_found_error") {
+                // A 404 (or a body flagging the provider's bad-model error
+                // code) on this endpoint almost always means the configured
+                // model id is wrong or retired — prefix with an actionable
+                // Chinese hint the frontend banner keys off (see
+                // src/lib/errors.ts).
+                if status.as_u16() == 404
+                    || body_text.contains("not_found_error")
+                    || body_text.contains("model_not_found")
+                {
                     return Err(format!("模型 id 無效（請在設定檢查 model 名稱）: {msg}"));
                 }
                 return Err(msg);
@@ -257,6 +326,147 @@ async fn post_anthropic_with_retry(
         }
     }
     Err(last_err)
+}
+
+/// Build the request body for one chat call. The Anthropic arm must stay
+/// byte-identical to the pre-provider JSON (system array + ephemeral
+/// cache_control); the OpenAI arm uses Chat Completions shape —
+/// `max_completion_tokens` (OpenAI deprecated `max_tokens`), system prompt as
+/// the leading message, and `stream_options.include_usage` so the final
+/// stream chunk carries token usage. `stream_options` is only legal when
+/// streaming — the non-streaming fallback strips it.
+fn build_chat_body(
+    provider: Provider,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    stream: bool,
+) -> Value {
+    match provider {
+        Provider::Anthropic => json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": user}]
+        }),
+        Provider::OpenAi => {
+            let mut body = json!({
+                "model": model,
+                "max_completion_tokens": max_tokens,
+                "stream": stream,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ]
+            });
+            if stream {
+                body["stream_options"] = json!({"include_usage": true});
+            }
+            body
+        }
+    }
+}
+
+/// Provider-neutral meaning of one SSE event, extracted so both stream
+/// consumers share a single decode path while keeping their own buffering /
+/// emit / meta-filter control flow.
+#[derive(Debug, PartialEq)]
+enum StreamAction {
+    /// A text delta to append/emit.
+    Delta(String),
+    /// The stream finished cleanly.
+    Stop,
+    /// The provider signalled an in-stream error; carries the message.
+    Error(String),
+    /// Bookkeeping event (usage, ping, …) — nothing for the consumer to do.
+    Ignore,
+}
+
+/// Decode one SSE event into a `StreamAction`, feeding usage / stop_reason
+/// into `guard` as a side effect. Anthropic uses named events; OpenAI sends
+/// unnamed `data:` chunks (surfaced by eventsource_stream with the default
+/// event name), a `[DONE]` sentinel, and — with include_usage — a final
+/// usage-only chunk whose `choices` array is empty. OpenAI's
+/// `finish_reason:"length"` is normalized to Anthropic's `max_tokens` so the
+/// existing truncation checks work for both providers.
+fn parse_stream_event(
+    provider: Provider,
+    event_name: &str,
+    data: &str,
+    guard: &mut TraceGuard,
+) -> StreamAction {
+    match provider {
+        Provider::Anthropic => match event_name {
+            "message_start" => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                    guard.absorb_message_start(&parsed);
+                }
+                StreamAction::Ignore
+            }
+            "message_delta" => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(data) {
+                    guard.absorb_message_delta(&parsed);
+                }
+                StreamAction::Ignore
+            }
+            "content_block_delta" => {
+                let delta = serde_json::from_str::<Value>(data).ok().and_then(|parsed| {
+                    parsed
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                });
+                match delta {
+                    Some(text) => StreamAction::Delta(text),
+                    None => StreamAction::Ignore,
+                }
+            }
+            "message_stop" => StreamAction::Stop,
+            "error" => StreamAction::Error(format!("anthropic stream error: {data}")),
+            _ => StreamAction::Ignore,
+        },
+        Provider::OpenAi => {
+            if data.trim() == "[DONE]" {
+                return StreamAction::Stop;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+                return StreamAction::Ignore;
+            };
+            if parsed.get("error").is_some() {
+                return StreamAction::Error(format!("openai stream error: {data}"));
+            }
+            if let Some(usage) = parsed.get("usage").filter(|u| !u.is_null()) {
+                guard.absorb_openai_usage(usage);
+            }
+            let choice = parsed.get("choices").and_then(|c| c.get(0));
+            if let Some(fr) = choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(|v| v.as_str())
+            {
+                guard.stop_reason = Some(if fr == "length" {
+                    "max_tokens".to_string()
+                } else {
+                    fr.to_string()
+                });
+            }
+            let delta = choice
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty());
+            match delta {
+                Some(text) => StreamAction::Delta(text.to_string()),
+                None => StreamAction::Ignore,
+            }
+        }
+    }
 }
 
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/translate_system.txt");
@@ -407,6 +617,7 @@ async fn consume_translation_stream(
     chunk_event: &str,
     id: &str,
     target: &str,
+    provider: Provider,
     guard: &mut TraceGuard,
 ) -> StreamOutcome {
     let mut stream = resp.bytes_stream().eventsource();
@@ -424,66 +635,48 @@ async fn consume_translation_stream(
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(ev) => match ev.event.as_str() {
-                "message_start" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_start(&parsed);
-                    }
-                }
-                "message_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_delta(&parsed);
-                    }
-                }
-                "content_block_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        if let Some(delta) = parsed
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                        {
-                            guard.mark_ttft();
-                            if decided {
-                                full_translation.push_str(delta);
-                                if !is_meta {
-                                    emitted_any = true;
-                                    let _ = app.emit(
-                                        chunk_event,
-                                        ChunkPayload { id: id.to_string(), text: delta.to_string() },
-                                    );
-                                }
+            Ok(ev) => match parse_stream_event(provider, ev.event.as_str(), &ev.data, guard) {
+                StreamAction::Delta(delta) => {
+                    guard.mark_ttft();
+                    if decided {
+                        full_translation.push_str(&delta);
+                        if !is_meta {
+                            emitted_any = true;
+                            let _ = app.emit(
+                                chunk_event,
+                                ChunkPayload { id: id.to_string(), text: delta },
+                            );
+                        }
+                    } else {
+                        buffer.push_str(&delta);
+                        if buffer.chars().count() >= META_SCAN_CHARS {
+                            decided = true;
+                            is_meta = is_meta_prefix(&buffer);
+                            if is_meta {
+                                errors::record(
+                                    "translation_meta_filtered",
+                                    &buffer.chars().take(80).collect::<String>(),
+                                    Some(serde_json::json!({ "target": target, "id": id })),
+                                );
                             } else {
-                                buffer.push_str(delta);
-                                if buffer.chars().count() >= META_SCAN_CHARS {
-                                    decided = true;
-                                    is_meta = is_meta_prefix(&buffer);
-                                    if is_meta {
-                                        errors::record(
-                                            "translation_meta_filtered",
-                                            &buffer.chars().take(80).collect::<String>(),
-                                            Some(serde_json::json!({ "target": target, "id": id })),
-                                        );
-                                    } else {
-                                        full_translation.push_str(&buffer);
-                                        emitted_any = true;
-                                        let _ = app.emit(
-                                            chunk_event,
-                                            ChunkPayload { id: id.to_string(), text: buffer.clone() },
-                                        );
-                                    }
-                                }
+                                full_translation.push_str(&buffer);
+                                emitted_any = true;
+                                let _ = app.emit(
+                                    chunk_event,
+                                    ChunkPayload { id: id.to_string(), text: buffer.clone() },
+                                );
                             }
                         }
                     }
                 }
-                "message_stop" => break,
-                "error" => {
+                StreamAction::Stop => break,
+                StreamAction::Error(err) => {
                     return StreamOutcome::Broken {
                         partial_emitted: emitted_any,
-                        err: format!("anthropic stream error: {}", ev.data),
+                        err,
                     };
                 }
-                _ => {}
+                StreamAction::Ignore => {}
             },
             Err(e) => {
                 return StreamOutcome::Broken {
@@ -516,10 +709,12 @@ async fn consume_translation_stream(
 }
 
 /// Single non-streaming re-issue of a translate request after the SSE stream
-/// broke. Reuses `body` with `stream:false`, sends it once through the shared
+/// broke. Reuses `body` with `stream:false` (dropping `stream_options`, which
+/// OpenAI rejects on non-streaming calls), sends it once through the shared
 /// client (no retry loop — that already ran on the original streaming call),
 /// and folds usage / stop_reason into `guard` (bumping the retry count).
 async fn translate_once_nonstreaming(
+    provider: Provider,
     api_key: &str,
     body: &Value,
     guard: &mut TraceGuard,
@@ -527,10 +722,10 @@ async fn translate_once_nonstreaming(
     guard.retries += 1;
     let mut nb = body.clone();
     nb["stream"] = Value::Bool(false);
-    let resp = http_client()
-        .post(ANTHROPIC_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
+    if let Some(obj) = nb.as_object_mut() {
+        obj.remove("stream_options");
+    }
+    let resp = apply_auth(http_client().post(provider.url()), provider, api_key)
         .header("content-type", "application/json")
         .json(&nb)
         .send()
@@ -539,28 +734,55 @@ async fn translate_once_nonstreaming(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(format!("anthropic {status}: {body_text}"));
+        return Err(format!("{} {status}: {body_text}", provider.label()));
     }
     let parsed: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-    if let Some(usage) = parsed.get("usage") {
-        guard.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
-        guard.output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
-        guard.cache_creation_input_tokens =
-            usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
-        guard.cache_read_input_tokens =
-            usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+    match provider {
+        Provider::Anthropic => {
+            if let Some(usage) = parsed.get("usage") {
+                guard.input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+                guard.output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
+                guard.cache_creation_input_tokens =
+                    usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64());
+                guard.cache_read_input_tokens =
+                    usage.get("cache_read_input_tokens").and_then(|v| v.as_u64());
+            }
+            if let Some(sr) = parsed.get("stop_reason").and_then(|v| v.as_str()) {
+                guard.stop_reason = Some(sr.to_string());
+            }
+            let text = parsed
+                .get("content")
+                .and_then(|c| c.get(0))
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(text)
+        }
+        Provider::OpenAi => {
+            if let Some(usage) = parsed.get("usage") {
+                guard.absorb_openai_usage(usage);
+            }
+            let choice = parsed.get("choices").and_then(|c| c.get(0));
+            if let Some(fr) = choice
+                .and_then(|c| c.get("finish_reason"))
+                .and_then(|v| v.as_str())
+            {
+                guard.stop_reason = Some(if fr == "length" {
+                    "max_tokens".to_string()
+                } else {
+                    fr.to_string()
+                });
+            }
+            let text = choice
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(text)
+        }
     }
-    if let Some(sr) = parsed.get("stop_reason").and_then(|v| v.as_str()) {
-        guard.stop_reason = Some(sr.to_string());
-    }
-    let text = parsed
-        .get("content")
-        .and_then(|c| c.get(0))
-        .and_then(|b| b.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .to_string();
-    Ok(text)
 }
 
 #[tauri::command]
@@ -572,7 +794,7 @@ pub async fn translate(
     text: String,
     target: String,
 ) -> Result<(), String> {
-    let (api_key, model, source_code, glossary_block, glossary_entries) = {
+    let (provider, api_key, model, source_code, glossary_block, glossary_entries) = {
         let cfg = config.lock().await;
         // Only feed glossary entries into the observe-only check when the active
         // book applies to the current source language (empty otherwise).
@@ -581,16 +803,25 @@ pub async fn translate(
         } else {
             Vec::new()
         };
+        let provider = Provider::from_config(&cfg.api.provider);
+        let (api_key, model) = match provider {
+            Provider::Anthropic => (cfg.api.anthropic_api_key.clone(), cfg.api.model.clone()),
+            Provider::OpenAi => (cfg.api.openai_api_key.clone(), cfg.api.openai_model.clone()),
+        };
         (
-            cfg.api.anthropic_api_key.clone(),
-            cfg.api.model.clone(),
+            provider,
+            api_key,
+            model,
             cfg.language.source.clone(),
             cfg.render_glossary_section(&target),
             glossary_entries,
         )
     };
     if api_key.is_empty() {
-        return Err("Anthropic API key not configured (open Settings)".into());
+        return Err(match provider {
+            Provider::Anthropic => "Anthropic API key not configured (open Settings)".into(),
+            Provider::OpenAi => "OpenAI API key not configured (open Settings)".into(),
+        });
     }
     // Reject an unknown target before spending a single token — this replaces
     // the old silent English fallback.
@@ -613,20 +844,10 @@ pub async fn translate(
         .replace("{source_lang}", source_name)
         .replace("{lang}", target_name)
         .replace("{glossary_section}", &glossary_block);
-    let body = json!({
-        "model": model,
-        "max_tokens": 1024,
-        "stream": true,
-        "system": [{
-            "type": "text",
-            "text": system,
-            "cache_control": {"type": "ephemeral"}
-        }],
-        "messages": [{"role": "user", "content": user_message}]
-    });
+    let body = build_chat_body(provider, &model, &system, &user_message, 1024, true);
 
     let mut guard = TraceGuard::new("translate", id.clone(), target.clone(), model.clone());
-    let resp = match post_anthropic_with_retry(&api_key, &body, &mut guard.retries).await {
+    let resp = match post_llm_with_retry(provider, &api_key, &body, &mut guard.retries).await {
         Ok(r) => r,
         Err(msg) => {
             errors::record(
@@ -647,13 +868,13 @@ pub async fn translate(
     let replace_event = format!("translation:replace:{}", target);
 
     let (full_text, is_meta) =
-        match consume_translation_stream(resp, &app, &chunk_event, &id, &target, &mut guard).await {
+        match consume_translation_stream(resp, &app, &chunk_event, &id, &target, provider, &mut guard).await {
             StreamOutcome::Completed { full_text, is_meta } => (full_text, is_meta),
             StreamOutcome::Broken { partial_emitted, err } => {
                 // The connection dropped mid-stream but the request was accepted.
                 // Retry once WITHOUT streaming, then replace whatever partial the
                 // UI already showed with the complete text.
-                match translate_once_nonstreaming(&api_key, &body, &mut guard).await {
+                match translate_once_nonstreaming(provider, &api_key, &body, &mut guard).await {
                     Ok(text) => {
                         let _ = app.emit(
                             &replace_event,
@@ -937,51 +1158,31 @@ async fn consume_summary_stream(
     app: &AppHandle,
     session_id: &str,
     target: &str,
+    provider: Provider,
     guard: &mut TraceGuard,
 ) -> SummaryStreamOutcome {
     let mut stream = resp.bytes_stream().eventsource();
     let mut full = String::new();
     while let Some(event) = stream.next().await {
         match event {
-            Ok(ev) => match ev.event.as_str() {
-                "message_start" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_start(&parsed);
-                    }
+            Ok(ev) => match parse_stream_event(provider, ev.event.as_str(), &ev.data, guard) {
+                StreamAction::Delta(delta) => {
+                    guard.mark_ttft();
+                    full.push_str(&delta);
+                    let _ = app.emit(
+                        "summary:chunk",
+                        SummaryChunk {
+                            session_id: session_id.to_string(),
+                            target: target.to_string(),
+                            text: delta,
+                        },
+                    );
                 }
-                "message_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        guard.absorb_message_delta(&parsed);
-                    }
+                StreamAction::Stop => break,
+                StreamAction::Error(err) => {
+                    return SummaryStreamOutcome::Broken(err);
                 }
-                "content_block_delta" => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&ev.data) {
-                        if let Some(delta) = parsed
-                            .get("delta")
-                            .and_then(|d| d.get("text"))
-                            .and_then(|t| t.as_str())
-                        {
-                            guard.mark_ttft();
-                            full.push_str(delta);
-                            let _ = app.emit(
-                                "summary:chunk",
-                                SummaryChunk {
-                                    session_id: session_id.to_string(),
-                                    target: target.to_string(),
-                                    text: delta.to_string(),
-                                },
-                            );
-                        }
-                    }
-                }
-                "message_stop" => break,
-                "error" => {
-                    return SummaryStreamOutcome::Broken(format!(
-                        "anthropic stream error: {}",
-                        ev.data
-                    ));
-                }
-                _ => {}
+                StreamAction::Ignore => {}
             },
             Err(e) => {
                 return SummaryStreamOutcome::Broken(format!("sse stream: {e}"));
@@ -1079,29 +1280,31 @@ pub async fn generate_summary(
     }
     let duration_min = (meta.duration_secs as f64 / 60.0).ceil() as u64;
 
-    let (api_key, summary_model) = {
+    let (provider, api_key, summary_model) = {
         let cfg = config.lock().await;
-        (cfg.api.anthropic_api_key.clone(), cfg.api.summary_model.clone())
+        let provider = Provider::from_config(&cfg.api.provider);
+        let (api_key, summary_model) = match provider {
+            Provider::Anthropic => {
+                (cfg.api.anthropic_api_key.clone(), cfg.api.summary_model.clone())
+            }
+            Provider::OpenAi => {
+                (cfg.api.openai_api_key.clone(), cfg.api.openai_summary_model.clone())
+            }
+        };
+        (provider, api_key, summary_model)
     };
     if api_key.is_empty() {
-        return Err("Anthropic API key not configured (open Settings)".into());
+        return Err(match provider {
+            Provider::Anthropic => "Anthropic API key not configured (open Settings)".into(),
+            Provider::OpenAi => "OpenAI API key not configured (open Settings)".into(),
+        });
     }
 
     let user_text = format!(
         "以下是 {duration_min} 分鐘的會議逐字稿（{source_label}）：\n\n---\n{transcript_body}\n---\n\n請輸出 {target_label} 的會議總結。"
     );
 
-    let body = json!({
-        "model": summary_model,
-        "max_tokens": 4096,
-        "stream": true,
-        "system": [{
-            "type": "text",
-            "text": system,
-            "cache_control": {"type": "ephemeral"}
-        }],
-        "messages": [{"role": "user", "content": user_text}]
-    });
+    let body = build_chat_body(provider, &summary_model, &system, &user_text, 4096, true);
 
     let mut guard = TraceGuard::new(
         "summary",
@@ -1109,7 +1312,7 @@ pub async fn generate_summary(
         target.clone(),
         summary_model.clone(),
     );
-    let resp = match post_anthropic_with_retry(&api_key, &body, &mut guard.retries).await {
+    let resp = match post_llm_with_retry(provider, &api_key, &body, &mut guard.retries).await {
         Ok(r) => r,
         Err(msg) => {
             errors::record(
@@ -1125,7 +1328,7 @@ pub async fn generate_summary(
         }
     };
 
-    let full = match consume_summary_stream(resp, &app, &session_id, &target, &mut guard).await {
+    let full = match consume_summary_stream(resp, &app, &session_id, &target, provider, &mut guard).await {
         SummaryStreamOutcome::Completed(full) => full,
         SummaryStreamOutcome::Broken(err) => {
             // The stream dropped mid-summary. Tell the UI to clear the partial
@@ -1136,10 +1339,10 @@ pub async fn generate_summary(
                 json!({ "session_id": session_id, "target": target }),
             );
             let mut retry_attempts: u32 = 0;
-            match post_anthropic_with_retry(&api_key, &body, &mut retry_attempts).await {
+            match post_llm_with_retry(provider, &api_key, &body, &mut retry_attempts).await {
                 Ok(resp2) => {
                     guard.retries += 1 + retry_attempts;
-                    match consume_summary_stream(resp2, &app, &session_id, &target, &mut guard).await
+                    match consume_summary_stream(resp2, &app, &session_id, &target, provider, &mut guard).await
                     {
                         SummaryStreamOutcome::Completed(full) => full,
                         SummaryStreamOutcome::Broken(err2) => {
@@ -1283,6 +1486,139 @@ pub async fn read_summary(session_id: String, target: String) -> Result<Option<S
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    /// TraceGuard flushes a TraceRecord to the real traces.jsonl on Drop —
+    /// tests must never do that, so every guard built here is leaked with
+    /// `mem::forget` after its fields are asserted.
+    fn test_guard() -> TraceGuard {
+        TraceGuard::new("translate", "test".into(), "en".into(), "m".into())
+    }
+
+    // ---- provider seam ----
+
+    #[test]
+    fn provider_from_config_unknown_falls_back_to_anthropic() {
+        assert_eq!(Provider::from_config("openai"), Provider::OpenAi);
+        assert_eq!(Provider::from_config("anthropic"), Provider::Anthropic);
+        assert_eq!(Provider::from_config(""), Provider::Anthropic);
+        assert_eq!(Provider::from_config("gemini"), Provider::Anthropic);
+    }
+
+    #[test]
+    fn build_chat_body_anthropic_is_byte_compatible() {
+        // Must reproduce the pre-provider request JSON exactly — system array
+        // with ephemeral cache_control, `max_tokens`, single user message.
+        let body = build_chat_body(Provider::Anthropic, "claude-haiku-4-5", "SYS", "USER", 1024, true);
+        let expected = json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1024,
+            "stream": true,
+            "system": [{
+                "type": "text",
+                "text": "SYS",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "USER"}]
+        });
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_chat_body_openai_shape() {
+        let body = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, true);
+        assert_eq!(body["model"], "gpt-5.6-terra");
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("system").is_none(), "system must be a message, not a top-level block");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "USER");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(!body.to_string().contains("cache_control"));
+
+        // stream_options is only legal on streaming calls.
+        let nb = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, false);
+        assert!(nb.get("stream_options").is_none());
+        assert_eq!(nb["stream"], false);
+    }
+
+    #[test]
+    fn parse_stream_event_openai_delta_and_done() {
+        let mut guard = test_guard();
+        let chunk = r#"{"choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
+        assert_eq!(
+            parse_stream_event(Provider::OpenAi, "message", chunk, &mut guard),
+            StreamAction::Delta("Hello".into())
+        );
+        assert_eq!(
+            parse_stream_event(Provider::OpenAi, "message", "[DONE]", &mut guard),
+            StreamAction::Stop
+        );
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn parse_stream_event_openai_length_normalizes_to_max_tokens() {
+        let mut guard = test_guard();
+        let chunk = r#"{"choices":[{"delta":{},"finish_reason":"length","index":0}]}"#;
+        assert_eq!(
+            parse_stream_event(Provider::OpenAi, "message", chunk, &mut guard),
+            StreamAction::Ignore
+        );
+        assert_eq!(guard.stop_reason.as_deref(), Some("max_tokens"));
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn parse_stream_event_openai_usage_chunk_with_empty_choices() {
+        // The include_usage final chunk has an empty `choices` array — must
+        // absorb tokens without panicking.
+        let mut guard = test_guard();
+        let chunk = r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":100}}}"#;
+        assert_eq!(
+            parse_stream_event(Provider::OpenAi, "message", chunk, &mut guard),
+            StreamAction::Ignore
+        );
+        assert_eq!(guard.input_tokens, Some(120));
+        assert_eq!(guard.output_tokens, Some(45));
+        assert_eq!(guard.cache_read_input_tokens, Some(100));
+        assert_eq!(guard.cache_creation_input_tokens, None);
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn parse_stream_event_openai_error() {
+        let mut guard = test_guard();
+        let chunk = r#"{"error":{"message":"boom","type":"server_error"}}"#;
+        match parse_stream_event(Provider::OpenAi, "message", chunk, &mut guard) {
+            StreamAction::Error(msg) => assert!(msg.starts_with("openai stream error:"), "{msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn parse_stream_event_anthropic_regression() {
+        let mut guard = test_guard();
+        let delta = r#"{"delta":{"type":"text_delta","text":"你好"}}"#;
+        assert_eq!(
+            parse_stream_event(Provider::Anthropic, "content_block_delta", delta, &mut guard),
+            StreamAction::Delta("你好".into())
+        );
+        assert_eq!(
+            parse_stream_event(Provider::Anthropic, "message_stop", "{}", &mut guard),
+            StreamAction::Stop
+        );
+        let msg_delta = r#"{"delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":9}}"#;
+        assert_eq!(
+            parse_stream_event(Provider::Anthropic, "message_delta", msg_delta, &mut guard),
+            StreamAction::Ignore
+        );
+        assert_eq!(guard.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(guard.output_tokens, Some(9));
+        std::mem::forget(guard);
+    }
 
     #[test]
     fn is_meta_prefix_flags_japanese_markers() {
