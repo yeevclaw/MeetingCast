@@ -45,6 +45,80 @@ TARGET_RATE = 24000  # OpenAI Realtime requires rate >= 24kHz
 WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 MIN_SPEECH_SEC = 0.25  # drop sub-syllable VAD opens (clicks/keyboard taps)
 
+SENTENCE_END_CHARS = "。？！?!."
+MIN_SEGMENT_CHARS = 6  # don't early-emit tiny sentences; they ride along with the next one
+
+
+def split_complete_sentences(
+    text: str, min_chars: int = MIN_SEGMENT_CHARS
+) -> tuple[str, str]:
+    """Split `text` at its last sentence-final punctuation.
+
+    Returns (complete-sentence prefix, unfinished tail). The prefix is ""
+    when there is no split point, or when it would be shorter than
+    `min_chars`. A '.' directly after a digit is a decimal point (3.5),
+    not a sentence end.
+    """
+    cut = -1
+    for i, ch in enumerate(text):
+        if ch not in SENTENCE_END_CHARS:
+            continue
+        if ch == "." and i > 0 and text[i - 1].isdigit():
+            continue
+        cut = i
+    if cut == -1 or cut + 1 < min_chars:
+        return "", text
+    return text[: cut + 1], text[cut + 1 :]
+
+
+class _SentenceSplitter:
+    """Per-item delta accumulation with punctuation-aware early finals.
+
+    Translation downstream only fires on is_final transcripts, which
+    normally arrive at VAD speech-end or the max_speech_sec force-flush —
+    up to 15s into fast, pause-free speech. Deltas lag the audio by only
+    ~1.3s, so once the running delta text contains a complete sentence we
+    emit it as a synthetic final immediately and keep only the unfinished
+    tail as the interim. `transcription.completed` then emits whatever
+    part of the item wasn't already emitted early.
+    """
+
+    def __init__(self):
+        self._partials: dict[str, str] = {}  # full delta accumulation per item_id
+        self._emitted: dict[str, str] = {}  # prefix already emitted as early finals
+
+    def on_delta(self, iid: str, delta: str) -> list[Transcript]:
+        self._partials[iid] = self._partials.get(iid, "") + delta
+        if not delta:
+            return []
+        done = self._emitted.get(iid, "")
+        pending = self._partials[iid][len(done):]
+        sentence, tail = split_complete_sentences(pending)
+        out: list[Transcript] = []
+        if sentence:
+            # offsets track the raw (unstripped) text; strip only for display
+            self._emitted[iid] = done + sentence
+            if sentence.strip():
+                out.append(Transcript(text=sentence.strip(), is_final=True))
+        if tail.strip():
+            out.append(Transcript(text=tail, is_final=False))
+        return out
+
+    def on_completed(self, iid: str, text: str) -> Transcript | None:
+        done = self._emitted.pop(iid, "")
+        accumulated = self._partials.pop(iid, "")
+        if done and not text.startswith(done):
+            # completed drifted from the delta concatenation (shouldn't
+            # happen) — trust the accumulation so early-emitted sentences
+            # aren't re-emitted and re-translated
+            remainder = accumulated[len(done):]
+        else:
+            remainder = text[len(done):]
+        remainder = remainder.strip()
+        if not remainder:
+            return None
+        return Transcript(text=remainder, is_final=True)
+
 
 class OpenAIRealtimeWhisperSTT:
     def __init__(
@@ -167,7 +241,11 @@ class OpenAIRealtimeWhisperSTT:
           * Transcript(is_final=False) for each incremental delta
             (build-up captioning shown to the user mid-utterance)
           * Transcript(is_final=True) for each completed utterance
-            (this is what triggers translation downstream)
+            (this is what triggers translation downstream). Complete
+            sentences inside a still-running utterance are emitted as
+            early finals via _SentenceSplitter, so translation of fast,
+            pause-free speech doesn't wait for VAD speech-end or the
+            max_speech_sec force-flush.
         """
         max_samples = int(self.max_speech_sec * sample_rate)
         vad_iter = VADIterator(
@@ -188,30 +266,23 @@ class OpenAIRealtimeWhisperSTT:
 
             async def reader():
                 """Consume WS events, push Transcripts into out_queue."""
-                # partial text per item_id — realtime-whisper deltas arrive
-                # as small fragments; concatenate so the interim Transcript
-                # is the full running text, not just the latest fragment
-                partials: dict[str, str] = {}
+                splitter = _SentenceSplitter()
                 try:
                     async for raw in ws:
                         event = json.loads(raw)
                         etype = event.get("type", "")
                         if etype.endswith("transcription.delta"):
-                            iid = event.get("item_id", "")
-                            delta = event.get("delta", "")
-                            partials[iid] = partials.get(iid, "") + delta
-                            if delta:
-                                await out_queue.put(Transcript(
-                                    text=partials[iid], is_final=False,
-                                ))
+                            for t in splitter.on_delta(
+                                event.get("item_id", ""), event.get("delta", "")
+                            ):
+                                await out_queue.put(t)
                         elif etype.endswith("transcription.completed"):
-                            iid = event.get("item_id", "")
-                            text = event.get("transcript", "").strip()
-                            partials.pop(iid, None)
-                            if text:
-                                await out_queue.put(Transcript(
-                                    text=text, is_final=True,
-                                ))
+                            t = splitter.on_completed(
+                                event.get("item_id", ""),
+                                event.get("transcript", ""),
+                            )
+                            if t:
+                                await out_queue.put(t)
                         elif etype == "error":
                             await out_queue.put(RuntimeError(
                                 f"OpenAI Realtime: {event.get('error', event)}"
