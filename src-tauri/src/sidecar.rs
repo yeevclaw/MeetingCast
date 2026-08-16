@@ -574,11 +574,12 @@ pub async fn start_stt(
         }
     }
 
-    let (openai_api_key, initial_prompt, idle_minutes) = {
+    let (openai_api_key, initial_prompt, keywords, idle_minutes) = {
         let cfg = config.lock().await;
         (
             cfg.api.openai_api_key.clone(),
             cfg.whisper_initial_prompt(),
+            cfg.stt_keywords(),
             cfg.idle_auto_stop_minutes,
         )
     };
@@ -589,6 +590,7 @@ pub async fn start_stt(
         "language": language_str,
         "detect_language": false,
         "initial_prompt": initial_prompt,
+        "keywords": keywords,
         "api": {
             "openai_api_key": openai_api_key,
         },

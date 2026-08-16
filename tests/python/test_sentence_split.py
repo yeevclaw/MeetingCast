@@ -1,5 +1,5 @@
 """Unit tests for punctuation-aware early sentence splitting in the
-OpenAI Realtime STT backend (prototype/stt/openai_realtime.py).
+OpenAI live Realtime STT backend (prototype/stt/openai_realtime.py).
 
 pytest is not installed in prototype/.venv, so these use stdlib unittest.
 Run (cwd = prototype/):

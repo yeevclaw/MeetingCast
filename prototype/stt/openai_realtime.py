@@ -1,22 +1,17 @@
-"""OpenAI Realtime Whisper STT backend.
+"""OpenAI live Realtime transcription backend.
 
-Uses `gpt-realtime-whisper` — OpenAI's true-streaming STT model. Its
-deltas arrive ~1.3s after a word is spoken (vs ~6s for non-streaming
-4o-mini-transcribe, vs end-of-utterance for mlx), so users see the
-transcript build up live instead of in chunks.
+Uses `gpt-live-transcribe` — OpenAI's recommended live STT model. It emits
+incremental deltas before the committed-turn completion event, so users see
+the transcript build up live instead of only at the end of an utterance.
 
 Tradeoffs vs mlx-whisper:
-  * pros: ~1s post-utterance final latency (better than mlx on long
-    segments), correct technical vocab (陣雨/鋒面/備雨具 vs mlx's
-    真雨/封面/被雨拒), and the streaming UX bonus
-  * cons: simplified-Chinese output when language=zh (model rejects the
-    `prompt` field that flips simp→繁; other languages unaffected), no
-    glossary/term injection (same reason)
+  * pros: streaming captions plus contextual, language, and keyword hints
+  * cons: cloud audio cost and network/privacy requirements
 
-The model also rejects `turn_detection`, so we run silero VAD
-client-side and send `input_audio_buffer.commit` ourselves when an
-utterance ends — that's what fires the `transcription.completed`
-event.
+MeetingCast keeps its existing Silero VAD client-side and disables server
+turn detection, sending `input_audio_buffer.commit` itself at each utterance.
+The live model accepts context, glossary keywords, and regional language hints;
+Traditional Chinese is sent as `zh-tw`.
 """
 
 import asyncio
@@ -33,14 +28,18 @@ import websockets
 from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
+from .openai_transcription_config import (
+    LIVE_TRANSCRIBE_MODEL,
+    TARGET_RATE,
+    build_session_payload,
+)
 
 
 # OpenAI Realtime requires intent=transcription for STT-only sessions;
 # the model is set inside session.update, not via URL query string.
 WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 
-MODEL = "gpt-realtime-whisper"
-TARGET_RATE = 24000  # OpenAI Realtime requires rate >= 24kHz
+MODEL = LIVE_TRANSCRIBE_MODEL
 
 WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 MIN_SPEECH_SEC = 0.25  # drop sub-syllable VAD opens (clicks/keyboard taps)
@@ -120,16 +119,14 @@ class _SentenceSplitter:
         return Transcript(text=remainder, is_final=True)
 
 
-class OpenAIRealtimeWhisperSTT:
+class OpenAILiveTranscribeSTT:
     def __init__(
         self,
         language: str = "zh",
         model: str | None = None,
         max_speech_sec: float = 15.0,
-        # initial_prompt is accepted but ignored — gpt-realtime-whisper
-        # rejects the prompt field. Kept in the signature so callers
-        # built around mlx can pass it without changes.
         initial_prompt: str | None = None,
+        keywords: list[str] | None = None,
     ):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -141,6 +138,8 @@ class OpenAIRealtimeWhisperSTT:
         self.language = language
         self.model = model or MODEL
         self.max_speech_sec = max_speech_sec
+        self.initial_prompt = initial_prompt
+        self.keywords = keywords or []
         self._vad_model = None
 
     def _vad(self):
@@ -167,23 +166,12 @@ class OpenAIRealtimeWhisperSTT:
         return (np.clip(out, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
     def _session_payload(self) -> dict:
-        # gpt-realtime-whisper rejects both `prompt` and `turn_detection`.
-        # Keep the payload minimal — model + language + audio format only.
-        return {
-            "type": "session.update",
-            "session": {
-                "type": "transcription",
-                "audio": {
-                    "input": {
-                        "format": {"type": "audio/pcm", "rate": TARGET_RATE},
-                        "transcription": {
-                            "model": self.model,
-                            "language": self.language,
-                        },
-                    },
-                },
-            },
-        }
+        return build_session_payload(
+            model=self.model,
+            language=self.language,
+            prompt=self.initial_prompt,
+            keywords=self.keywords,
+        )
 
     def transcribe_file(self, path: str) -> Transcript:
         """One-shot transcription. Block until the `completed` event arrives."""
@@ -384,3 +372,9 @@ class OpenAIRealtimeWhisperSTT:
                         await t
                     except (asyncio.CancelledError, Exception):
                         pass
+
+
+# Import compatibility for older dev scripts. The production factory below
+# resolves to OpenAILiveTranscribeSTT, while explicit imports of the old class
+# name continue to work during a rollback window.
+OpenAIRealtimeWhisperSTT = OpenAILiveTranscribeSTT

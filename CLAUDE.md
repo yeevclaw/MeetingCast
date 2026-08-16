@@ -2,12 +2,12 @@
 
 中／英／日／越任一語言會議即時轉寫 + 並行翻譯到兩個可配置譯文槽位視窗（各自選目標語言）供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。源語言可選 zh/en/ja/vi；目標語言可選 zh/en/ja/vi/km（km 柬埔寨文為 target-only，Whisper 對 Khmer 辨識品質不堪用，registry `source_capable: false` 把它從源語言選單隱藏）；單場單向，不同時處理對方發言。
 
-目前 ship 0.1.14 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
+目前 ship 0.1.24 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
 
 ## 關鍵架構決策（不要重新討論）
 
 - **STT 引擎用 mlx-whisper**（不是 faster-whisper）— ctranslate2 在 macOS 沒 Metal，CPU 4.3s vs mlx Metal 0.9s
-- **雙 backend**：`MLXWhisperSTT`（local 預設）+ `OpenAIRealtimeWhisperSTT`（openai cloud），同一 `Transcript` stream 介面，UI 可切。Deepgram backend 已於 0.1.20 後移除
+- **雙 backend**：`MLXWhisperSTT`（local 預設）+ `OpenAILiveTranscribeSTT`（`gpt-live-transcribe`，openai cloud），同一 `Transcript` stream 介面，UI 可切。雲端模式用 `zh-tw`／ISO 語言提示，並注入 active glossary 的 context prompt + canonical keywords。Deepgram backend 已於 0.1.20 後移除
 - **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source 可選 zh/en/ja/vi，target 可選 zh/en/ja/vi/km；`source_capable: false` 標記 target-only 語言（km），script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
 - **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
 - **翻譯在 Rust 不在 sidecar**：Anthropic API 由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT
@@ -74,7 +74,7 @@ cd src-tauri && cargo test
 | 桌面框架 | Tauri 2.x + React 19 + TypeScript |
 | UI | Tailwind v4 + 自訂 `@theme paper-*` token |
 | STT (local) | mlx-whisper（pin `<0.21`，Sequoia 相容） |
-| STT (cloud) | OpenAI Realtime Whisper |
+| STT (cloud) | OpenAI `gpt-live-transcribe` |
 | VAD | silero-vad |
 | 翻譯 / 總結 | Anthropic Claude Haiku 4.5 streaming（總結用 Sonnet 4.6） |
 | Python ↔ Rust | Tauri sidecar + line-delimited JSON over stdio |

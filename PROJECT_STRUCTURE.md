@@ -47,7 +47,8 @@ translationintime/
 │   └── stt/                        # backend 抽象（sidecar 透過 sys.path 借用）
 │       ├── base.py                 # Transcript 型別
 │       ├── local.py                # MLXWhisperSTT（預設）
-│       ├── openai_realtime.py      # OpenAIRealtimeWhisperSTT（cloud）
+│       ├── openai_realtime.py      # OpenAILiveTranscribeSTT（cloud）
+│       ├── openai_transcription_config.py # Realtime session 純設定／驗證 helpers
 │       └── __init__.py             # get_backend(name)
 │
 ├── docs/

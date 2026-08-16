@@ -16,9 +16,8 @@ const OPENAI_SUMMARY_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra"];
 //   claude-haiku-4-5 $1/$5、claude-sonnet-4-6 $3/$15、
 //   gpt-5.6-luna $1/$6、gpt-5.6-terra $2.5/$15、gpt-5.6-sol $5/$30。
 // 換 model 或官方調價時同步更新這兩張表。
-// 另：辨識引擎選項的費用標示（openai realtime-whisper $0.017/分鐘音訊，
-// 一小時會議依 30–60 分鐘計費音訊估 ≈US$0.5–1）寫在「辨識引擎」select
-// 的 option 文字，調價時一併更新。
+// OpenAI 雲端辨識費用會隨模型與官方定價調整，因此選項只標示「按用量
+// 計費」；若未來恢復顯示金額，須由官方 pricing 重新核對後更新。
 const TRANSLATE_COST_PER_HOUR: Record<string, string> = {
   "claude-haiku-4-5": "0.6",
   "claude-sonnet-4-6": "1.8",
@@ -387,7 +386,7 @@ export default function SettingsModal({
                 ))}
               </select>
               {swapNote && (
-                <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
+                <p className="mt-2 rounded border border-paper-200 bg-paper-50 px-2 py-1.5 text-xs text-paper-700">
                   {swapNote}
                 </p>
               )}
@@ -441,12 +440,12 @@ export default function SettingsModal({
                 disabled={running}
               >
                 <option value="local">local (mlx-whisper)（免費，本機運算）</option>
-                <option value="openai">openai (realtime-whisper)（≈US$0.5–1/小時）</option>
+                <option value="openai">openai (live-transcribe)（雲端，按用量計費）</option>
               </select>
               {backend === "openai" && (
                 <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
-                  ⚠ OpenAI Realtime Whisper 不支援術語表注入；來源語言為中文時只會輸出簡體字。
-                  優點：邊講邊出字（live captioning）、技術詞彙準確度較佳。
+                  OpenAI Live Transcribe 會使用來源語言提示；中文使用繁中（zh-tw），並將啟用中的術語表作為辨識提示。
+                  音訊會傳送至 OpenAI，術語提示可改善辨識但不保證逐字命中。
                 </p>
               )}
             </Field>

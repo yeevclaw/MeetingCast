@@ -6,8 +6,8 @@ def get_backend(name: str, **kwargs):
         from .local import MLXWhisperSTT
         return MLXWhisperSTT(**kwargs)
     if name == "openai":
-        from .openai_realtime import OpenAIRealtimeWhisperSTT
-        return OpenAIRealtimeWhisperSTT(**kwargs)
+        from .openai_realtime import OpenAILiveTranscribeSTT
+        return OpenAILiveTranscribeSTT(**kwargs)
     raise ValueError(f"unknown STT backend: {name!r} (expected 'local' / 'openai')")
 
 

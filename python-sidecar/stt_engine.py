@@ -118,6 +118,7 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     source_cfg = cmd.get("source", {"type": "mic"})
     api_cfg = cmd.get("api") or {}
     initial_prompt = cmd.get("initial_prompt") or None
+    keywords = cmd.get("keywords") or []
 
     openai_api_key = api_cfg.get("openai_api_key")
     if openai_api_key:
@@ -153,6 +154,14 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
             backend_kwargs["on_diag"] = _emit_diag
             if initial_prompt:
                 backend_kwargs["initial_prompt"] = initial_prompt
+        elif backend_name == "openai":
+            # gpt-live-transcribe accepts both contextual prose and literal
+            # keyword hints. The Rust config layer already applies the active
+            # glossary's source-language rules and 30-term cap.
+            if initial_prompt:
+                backend_kwargs["initial_prompt"] = initial_prompt
+            if keywords:
+                backend_kwargs["keywords"] = keywords
         stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on

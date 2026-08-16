@@ -240,7 +240,7 @@ pub struct Config {
     pub active_glossary: Option<String>,
 
     /// Minutes of recorded silence (no real-speech final transcripts) before
-    /// the session auto-stops. Primary motivation: OpenAI Realtime Whisper is
+    /// the session auto-stops. Primary motivation: OpenAI live transcription is
     /// billed per minute of session time, so leaving the recording on after a
     /// meeting ends silently burns budget. The check runs against any
     /// non-empty final transcript regardless of backend (the safety applies
@@ -353,7 +353,8 @@ impl Config {
         out
     }
 
-    /// Build the Chinese-language initial_prompt fed to mlx-whisper's decoder.
+    /// Build the source-language context prompt fed to local mlx-whisper and
+    /// OpenAI live transcription.
     /// Canonical terms are joined with 、 inside a carrier sentence — Whisper
     /// prompt-conditioning works best when the prompt is grammatically natural,
     /// not a bare list. Capped at 30 terms (decoder prompt has a ~224 BPE token
@@ -382,6 +383,23 @@ impl Config {
         // biases Whisper with a Japanese prompt, an en meeting an English one.
         let lang = languages::get(&self.language.source)?;
         Some(lang.carrier.replace("{terms}", &terms.join(lang.term_join.as_str())))
+    }
+
+    /// Canonical glossary terms sent as literal keyword hints to OpenAI live
+    /// transcription. Uses the same applicability rules and 30-term cap as
+    /// the local Whisper prompt; aliases stay excluded because they are the
+    /// recognition mistakes MeetingCast wants to correct, not encourage.
+    pub fn stt_keywords(&self) -> Vec<String> {
+        if !self.glossary_applies() {
+            return Vec::new();
+        }
+        self.active_entries()
+            .iter()
+            .map(|e| e.term.trim())
+            .filter(|term| !term.is_empty())
+            .take(30)
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Render the glossary section appended to translation / summary system
@@ -682,6 +700,21 @@ mod tests {
         assert!(prompt.contains("詞0、"));
         assert!(prompt.contains("詞29"));
         assert!(!prompt.contains("詞30"));
+    }
+
+    #[test]
+    fn stt_keywords_use_canonical_terms_and_match_prompt_cap() {
+        let mut entries: Vec<GlossaryEntry> = (0..35)
+            .map(|i| entry(&format!("詞{i}"), &["錯字"], "", ""))
+            .collect();
+        entries.insert(0, entry(" ", &[], "", ""));
+        let cfg = cfg_with_book("x", entries);
+        let keywords = cfg.stt_keywords();
+
+        assert_eq!(keywords.len(), 30);
+        assert_eq!(keywords.first().map(String::as_str), Some("詞0"));
+        assert_eq!(keywords.last().map(String::as_str), Some("詞29"));
+        assert!(!keywords.iter().any(|term| term == "錯字"));
     }
 
     #[test]
@@ -1125,6 +1158,7 @@ vi = \"Tử Vi Đẩu Số\"\n";
         cfg.language.source = "ja".into(); // book is zh → does not apply
         assert!(!cfg.glossary_applies());
         assert!(cfg.whisper_initial_prompt().is_none());
+        assert!(cfg.stt_keywords().is_empty());
         assert_eq!(cfg.apply_glossary_aliases("紫薇斗數"), "紫薇斗數");
         assert_eq!(cfg.render_glossary_section("en"), "");
     }

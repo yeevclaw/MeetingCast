@@ -155,7 +155,7 @@ def main():
         "--backend",
         choices=["local", "openai"],
         default="local",
-        help="local = mlx-whisper; openai = gpt-realtime-whisper",
+        help="local = mlx-whisper; openai = gpt-live-transcribe",
     )
     parser.add_argument(
         "--file",

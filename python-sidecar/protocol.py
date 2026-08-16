@@ -6,6 +6,8 @@ Rust → Python (commands):
     {"type": "start", "backend": "local"|"openai",
      "source": {"type": "mic"} | {"type": "wav", "path": "..."},
      "language": "zh",                 -- canonical code (session/meta/local/openai)
+     "initial_prompt": "..."?,         -- source-language glossary context
+     "keywords": ["..."]?,             -- canonical terms; OpenAI live only
      "detect_language": false?}        -- reserved for future auto-detect; ignored
     {"type": "stop"}
     {"type": "shutdown"}

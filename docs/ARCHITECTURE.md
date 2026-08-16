@@ -84,7 +84,7 @@ sequenceDiagram
 | 桌面框架 | **Tauri 2.x** | Electron | 安裝包 ~1/3、記憶體低、Rust 後端穩定 |
 | 前端 | **React 19 + TS + Tailwind v4** | Vue / Svelte | 團隊熟悉度、生態最大 |
 | STT (本地) | **mlx-whisper** | faster-whisper, whisper.cpp | macOS Metal GPU 加速；ctranslate2 在 macOS 沒 Metal、CPU 4.3s 太慢 |
-| STT (雲端) | **OpenAI Realtime Whisper** | Deepgram nova-3, Google Chirp 2, Azure | 邊講邊出字（live captioning）、技術詞彙準確；Deepgram 已於 0.1.20 後移除 |
+| STT (雲端) | **OpenAI `gpt-live-transcribe`** | Deepgram nova-3, Google Chirp 2, Azure | 邊講邊出字；支援繁中／多語提示與 active glossary context + keywords；Deepgram 已於 0.1.20 後移除 |
 | VAD | **silero-vad** | webrtcvad | 中文友善、ONNX 輕量 |
 | 翻譯 LLM | **Claude Haiku 4.5** | Sonnet, GPT-4o | 首 token ~800ms、三語品質好、prompt caching 省 token |
 | 跨進程通訊 | **line-delimited JSON over stdio** | WebSocket, gRPC, JSON-RPC | 簡單可靠、無需額外服務 |
@@ -110,7 +110,7 @@ flowchart TD
     D -->|是| F
     F --> G[送 STT]
     G -->|local| H[mlx-whisper<br/>large-v3-turbo<br/>Metal GPU]
-    G -->|openai| I[OpenAI Realtime Whisper<br/>WebSocket streaming]
+    G -->|openai| I[OpenAI Live Transcribe<br/>WebSocket streaming]
     H --> J[中文逐字稿<br/>is_final=true]
     I --> J
     J --> K[並行翻譯<br/>2 路 SSE]
