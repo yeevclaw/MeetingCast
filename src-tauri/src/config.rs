@@ -171,6 +171,55 @@ impl Default for SummaryConfig {
     }
 }
 
+/// Speech-to-text tuning. `openai_delay` is gpt-live-transcribe's `delay`
+/// level (minimal / low / medium / high / xhigh): lower emits partial text
+/// sooner, higher trades latency for word accuracy. Measured 2026-09-02 on a
+/// 90s clip: `minimal` ≈ 1.1s delta lag vs `low` ≈ 2.5s, same accuracy —
+/// hence the default. Ignored by the local mlx-whisper backend.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SttConfig {
+    #[serde(default = "default_openai_delay")]
+    pub openai_delay: String,
+}
+
+pub const OPENAI_DELAY_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
+fn default_openai_delay() -> String {
+    "minimal".into()
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self { openai_delay: default_openai_delay() }
+    }
+}
+
+/// Interpretation mode. `sentence` (default) = translate each final
+/// utterance independently (the original pipeline). `incremental` = the
+/// simultaneous-interpreter engine in `interp.rs`: the sidecar cuts speech
+/// into clause-level segments, translations stream as append-only
+/// continuations, and one utterance row is written per sentence group. The
+/// user opts in from Settings (3–4× more translate calls — see the cost
+/// notice there); an unknown value falls back to `sentence`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct InterpConfig {
+    #[serde(default = "default_interp_mode")]
+    pub mode: String,
+}
+
+pub const INTERP_MODE_SENTENCE: &str = "sentence";
+pub const INTERP_MODE_INCREMENTAL: &str = "incremental";
+
+fn default_interp_mode() -> String {
+    INTERP_MODE_SENTENCE.into()
+}
+
+impl Default for InterpConfig {
+    fn default() -> Self {
+        Self { mode: default_interp_mode() }
+    }
+}
+
 /// Source + target-slot language selection. `source` is the meeting language
 /// being transcribed; `target_slots` is always exactly length 2 (one per
 /// translation window), where `""` means that slot is closed. serde defaults
@@ -260,6 +309,14 @@ pub struct Config {
     /// leave the feature disabled.
     #[serde(default)]
     pub summary: SummaryConfig,
+
+    /// STT tuning (`[stt]`). Absent in old configs → defaults.
+    #[serde(default)]
+    pub stt: SttConfig,
+
+    /// Interpretation mode (`[interp]`). Absent in old configs → `sentence`.
+    #[serde(default)]
+    pub interp: InterpConfig,
 }
 
 fn default_idle_minutes() -> u32 {
@@ -541,6 +598,23 @@ impl Config {
         self.summary
             .auto_targets
             .retain(|t| languages::is_valid(t));
+
+        // [stt] / [interp] enums: anything off-list collapses to the default
+        // so a hand-edited config never reaches the sidecar or the engine
+        // with a value they don't understand.
+        if !OPENAI_DELAY_LEVELS.contains(&self.stt.openai_delay.as_str()) {
+            self.stt.openai_delay = default_openai_delay();
+        }
+        if self.interp.mode != INTERP_MODE_SENTENCE && self.interp.mode != INTERP_MODE_INCREMENTAL {
+            self.interp.mode = default_interp_mode();
+        }
+    }
+
+    /// Whether the incremental (simultaneous-interpreter) engine owns
+    /// translation for this session instead of the frontend-driven
+    /// sentence-level `translate` command.
+    pub fn incremental_enabled(&self) -> bool {
+        self.interp.mode == INTERP_MODE_INCREMENTAL
     }
 }
 
@@ -1043,6 +1117,32 @@ mod tests {
         cfg.sanitize_language();
         assert_eq!(cfg.language.target_slots[0], "zh");
         assert_eq!(cfg.language.target_slots[1], "vi");
+    }
+
+    #[test]
+    fn stt_and_interp_default_when_absent_and_sanitize_off_list_values() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.stt.openai_delay, "minimal");
+        assert_eq!(cfg.interp.mode, "sentence");
+        assert!(!cfg.incremental_enabled());
+
+        let mut cfg: Config = toml::from_str(
+            "[stt]\nopenai_delay = \"turbo\"\n[interp]\nmode = \"magic\"\n",
+        )
+        .unwrap();
+        cfg.sanitize_language();
+        assert_eq!(cfg.stt.openai_delay, "minimal");
+        assert_eq!(cfg.interp.mode, "sentence");
+
+        let mut cfg: Config = toml::from_str(
+            "[stt]\nopenai_delay = \"high\"\n[interp]\nmode = \"incremental\"\n",
+        )
+        .unwrap();
+        cfg.sanitize_language();
+        assert_eq!(cfg.stt.openai_delay, "high");
+        assert!(cfg.incremental_enabled());
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[stt]") && out.contains("[interp]"));
     }
 
     #[test]

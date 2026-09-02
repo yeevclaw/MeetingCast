@@ -4,6 +4,13 @@ import { getVersion } from "@tauri-apps/api/app";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { AudioDevice, Config } from "@/lib/types";
 import { LANGS, selectLabel, zhName } from "@/lib/languages";
+import {
+  INTERP_CALL_MULTIPLIER,
+  INTERP_COST_INCREASE,
+  INTERP_COST_PER_HOUR_AFTER_USD,
+  INTERP_COST_PER_HOUR_BEFORE_USD,
+  OPENAI_DELAY_LEVELS,
+} from "@/lib/cost";
 
 const MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"];
 const SUMMARY_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5"];
@@ -118,6 +125,9 @@ export default function SettingsModal({
   // translation slot and we auto-swap that slot to the old source. Cleared on
   // the next language change or on save.
   const [swapNote, setSwapNote] = useState<string | null>(null);
+  // Enabling 同步口譯模式 multiplies translate calls; the toggle only flips
+  // after the user reads the cost notice and confirms. Disabling never asks.
+  const [confirmInterp, setConfirmInterp] = useState(false);
   // Which translation-slot windows the user has manually closed (null on
   // getByLabel). An enabled slot with a closed window can't show translations
   // until the app restarts — surfaced as a warning under that field.
@@ -207,6 +217,18 @@ export default function SettingsModal({
     if (!cfg) return;
     setCfg({ ...cfg, summary: { ...cfg.summary, ...patch } });
   }
+
+  function updateStt(patch: Partial<Config["stt"]>) {
+    if (!cfg) return;
+    setCfg({ ...cfg, stt: { ...(cfg.stt ?? { openai_delay: "minimal" }), ...patch } });
+  }
+
+  function updateInterpMode(mode: "sentence" | "incremental") {
+    if (!cfg) return;
+    setCfg({ ...cfg, interp: { ...(cfg.interp ?? { mode: "sentence" }), mode } });
+  }
+
+  const interpOn = cfg?.interp?.mode === "incremental";
 
   // Pick a new source language. If it collides with an existing translation
   // slot, auto-swap that slot to the OLD source (the slots are always distinct
@@ -446,6 +468,98 @@ export default function SettingsModal({
                 <p className="mt-2 rounded border border-warn-200 bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
                   OpenAI Live Transcribe 會使用來源語言提示；中文使用繁中（zh-tw），並將啟用中的術語表作為辨識提示。
                   音訊會傳送至 OpenAI，術語提示可改善辨識但不保證逐字命中。
+                </p>
+              )}
+            </Field>
+
+            {backend === "openai" && (
+              <Field
+                label="辨識延遲（openai）"
+                hint={
+                  running
+                    ? "錄音中無法切換，請先停止"
+                    : "越低字越早上螢幕；越高辨識越準。實測 minimal 比 low 快約 1.4 秒且準確度相當"
+                }
+              >
+                <select
+                  className="w-full rounded border border-paper-300 px-2 py-1 disabled:opacity-50"
+                  value={cfg.stt?.openai_delay ?? "minimal"}
+                  onChange={(e) => updateStt({ openai_delay: e.target.value })}
+                  disabled={running}
+                >
+                  {OPENAI_DELAY_LEVELS.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+
+            <Field
+              label="同步口譯模式（實驗）"
+              hint={
+                running
+                  ? "錄音中無法切換，請先停止"
+                  : "不等整句說完就開始翻譯，譯文只追加不修改，較接近真人同步口譯；需 openai 辨識引擎才有效果"
+              }
+            >
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 cursor-pointer accent-paper-900 disabled:opacity-50"
+                  checked={interpOn}
+                  disabled={running}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      setConfirmInterp(true);
+                    } else {
+                      setConfirmInterp(false);
+                      updateInterpMode("sentence");
+                    }
+                  }}
+                />
+                啟用同步口譯模式
+              </label>
+              {confirmInterp && !interpOn && (
+                <div
+                  role="alertdialog"
+                  aria-label="費用提醒"
+                  className="mt-3 space-y-2 rounded border border-warn-200 bg-warn-50 px-3 py-2.5 text-xs text-warn-900"
+                >
+                  <p className="font-medium">開啟前請確認費用變化</p>
+                  <ul className="list-disc space-y-1 pl-4">
+                    <li>翻譯 API 呼叫次數約增加為 {INTERP_CALL_MULTIPLIER}（每個語意片段呼叫一次）</li>
+                    <li>
+                      翻譯費用估計增加約 <strong>{INTERP_COST_INCREASE}</strong>（兩個譯文視窗：每小時約 US$
+                      {INTERP_COST_PER_HOUR_BEFORE_USD} → US${INTERP_COST_PER_HOUR_AFTER_USD}）
+                    </li>
+                    <li>辨識與總結費用不變</li>
+                  </ul>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="button"
+                      className="rounded bg-paper-900 px-3 py-1 text-xs text-white hover:bg-paper-800"
+                      onClick={() => {
+                        updateInterpMode("incremental");
+                        setConfirmInterp(false);
+                      }}
+                    >
+                      確認開啟
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded border border-paper-300 px-3 py-1 text-xs text-paper-700 hover:bg-paper-100"
+                      onClick={() => setConfirmInterp(false)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
+              {interpOn && backend !== "openai" && (
+                <p className="mt-2 text-xs text-warn-700">
+                  本機 mlx-whisper 只能在句尾出字，同步口譯模式下行為與一般模式相同；切到 openai 辨識引擎才會提前開口
                 </p>
               )}
             </Field>

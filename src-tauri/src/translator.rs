@@ -23,7 +23,7 @@ use crate::verify;
 /// of `translate` / `generate_summary`, including early `?`/`return Err`, gets
 /// recorded without a `record()` call before each return. `outcome` defaults
 /// to "error"; the happy path overwrites it before returning.
-struct TraceGuard {
+pub(crate) struct TraceGuard {
     kind: &'static str,
     id: String,
     target: String,
@@ -34,14 +34,14 @@ struct TraceGuard {
     output_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
-    stop_reason: Option<String>,
-    retries: u32,
-    outcome: &'static str,
+    pub(crate) stop_reason: Option<String>,
+    pub(crate) retries: u32,
+    pub(crate) outcome: &'static str,
     glossary_violations: Option<Vec<String>>,
 }
 
 impl TraceGuard {
-    fn new(kind: &'static str, id: String, target: String, model: String) -> Self {
+    pub(crate) fn new(kind: &'static str, id: String, target: String, model: String) -> Self {
         Self {
             kind,
             id,
@@ -60,7 +60,7 @@ impl TraceGuard {
         }
     }
 
-    fn mark_ttft(&mut self) {
+    pub(crate) fn mark_ttft(&mut self) {
         if self.ttft_ms.is_none() {
             self.ttft_ms = Some(self.start.elapsed().as_millis() as u64);
         }
@@ -140,7 +140,7 @@ impl Drop for TraceGuard {
 /// translate call. Max ~2 entries per target keeps the prompt small enough
 /// not to blow up the input token cost — most of the lift comes from the
 /// most recent sentence anyway.
-const CONTEXT_PAIRS: usize = 2;
+pub(crate) const CONTEXT_PAIRS: usize = 2;
 
 /// Per target: rolling window of `(t_start, zh source, target translation)`,
 /// kept sorted ascending by `t_start`. The leading `t_start` lets write-back
@@ -177,13 +177,13 @@ const OPENAI_URL: &str = "https://api.openai.com/v1/chat/completions";
 /// `config.api.provider`; anything that isn't exactly "openai" degrades to
 /// Anthropic so a hand-edited config never hard-errors here.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Provider {
+pub(crate) enum Provider {
     Anthropic,
     OpenAi,
 }
 
 impl Provider {
-    fn from_config(s: &str) -> Self {
+    pub(crate) fn from_config(s: &str) -> Self {
         if s == "openai" {
             Provider::OpenAi
         } else {
@@ -200,7 +200,7 @@ impl Provider {
 
     /// Prefix used in error strings ("anthropic 429: …" / "openai 429: …") —
     /// matched by the frontend banner rules in src/lib/errors.ts.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Provider::Anthropic => "anthropic",
             Provider::OpenAi => "openai",
@@ -254,7 +254,7 @@ fn apply_auth(req: reqwest::RequestBuilder, provider: Provider, api_key: &str) -
 /// header with an integer-seconds value, the next backoff is
 /// `max(fixed_backoff, retry_after)` capped at 10s so we respect the server's
 /// pacing without stalling the UI indefinitely.
-async fn post_llm_with_retry(
+pub(crate) async fn post_llm_with_retry(
     provider: Provider,
     api_key: &str,
     body: &Value,
@@ -377,7 +377,7 @@ fn build_chat_body(
 /// consumers share a single decode path while keeping their own buffering /
 /// emit / meta-filter control flow.
 #[derive(Debug, PartialEq)]
-enum StreamAction {
+pub(crate) enum StreamAction {
     /// A text delta to append/emit.
     Delta(String),
     /// The stream finished cleanly.
@@ -395,7 +395,7 @@ enum StreamAction {
 /// usage-only chunk whose `choices` array is empty. OpenAI's
 /// `finish_reason:"length"` is normalized to Anthropic's `max_tokens` so the
 /// existing truncation checks work for both providers.
-fn parse_stream_event(
+pub(crate) fn parse_stream_event(
     provider: Provider,
     event_name: &str,
     data: &str,
@@ -591,7 +591,7 @@ const META_MARKERS: &[&str] = &[
 
 /// Detect when Claude breaks character and meta-comments instead of translating.
 /// Scan the first META_SCAN_CHARS characters for any blocklist substring.
-fn is_meta_prefix(buffer: &str) -> bool {
+pub(crate) fn is_meta_prefix(buffer: &str) -> bool {
     let head: String = buffer
         .trim_start()
         .to_lowercase()

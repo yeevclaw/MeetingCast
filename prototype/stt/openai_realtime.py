@@ -29,6 +29,7 @@ from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
 from .openai_transcription_config import (
+    DEFAULT_DELAY,
     LIVE_TRANSCRIBE_MODEL,
     TARGET_RATE,
     build_session_payload,
@@ -46,6 +47,146 @@ MIN_SPEECH_SEC = 0.25  # drop sub-syllable VAD opens (clicks/keyboard taps)
 
 SENTENCE_END_CHARS = "。？！?!."
 MIN_SEGMENT_CHARS = 6  # don't early-emit tiny sentences; they ride along with the next one
+
+# ---- Segment boundaries (see docs/PLAN_INCREMENTAL_INTERP.md) ----------------
+# A "segment" is a semantic unit (5–15 zh chars) emitted as an early final so
+# the incremental translator can start before the sentence ends. The boundary
+# kind tells Rust whether the translation group stays open (clause / forced)
+# or closes (sentence / pause).
+BOUNDARY_CLAUSE = "clause"
+BOUNDARY_SENTENCE = "sentence"
+BOUNDARY_PAUSE = "pause"
+BOUNDARY_FORCED = "forced"
+
+# Early-final segmentation modes. "sentence" = today's behaviour (cut only at
+# sentence-final punctuation, each final is an independent utterance for the
+# sentence-level translator). "fine" = clause / marker / max-length cuts for
+# the incremental interpreter, which stitches segments back into groups.
+SEGMENTATION_SENTENCE = "sentence"
+SEGMENTATION_FINE = "fine"
+
+CLAUSE_CHARS = "，,、；;：:"
+# ASCII punctuation directly after a digit is numeric (3.5 / 1,000 / 3:30),
+# never a boundary.
+_NUMERIC_GUARDED = ".,:"
+
+# (min_chars, max_chars) per script family. CJK counts characters; spaced
+# languages (en / vi) count characters too but force-cut at the last space so
+# a word is never split — 12/60 chars is roughly 3–12 words.
+SEGMENT_LIMITS = {"cjk": (4, 15), "spaced": (12, 60)}
+
+# Discourse markers: cut BEFORE the marker so it opens the next segment. Only
+# for languages where punctuation alone under-segments fast speech. Keep the
+# list conservative — a false cut only costs one extra clause boundary, but a
+# marker that is really a word-internal substring would fragment words.
+DISCOURSE_MARKERS = {
+    "zh": (
+        "也就是說", "換句話說", "接下來",
+        "然後", "所以", "但是", "不過", "另外", "那麼", "首先", "接著", "再來",
+        "第一", "第二", "第三", "因為", "如果", "總之", "其實",
+    ),
+    "ja": ("それから", "ですので", "それで", "しかし", "つまり", "ただし", "そして", "でも", "まず", "次に"),
+}
+
+
+def _lang_family(language: str) -> str:
+    return "cjk" if language.lower().split("-")[0] in ("zh", "ja") else "spaced"
+
+
+def _marker_at(text: str, i: int, markers: tuple[str, ...]) -> str | None:
+    for m in markers:  # DISCOURSE_MARKERS lists longer markers first
+        if text.startswith(m, i):
+            return m
+    return None
+
+
+def split_segments(
+    text: str, language: str = "zh"
+) -> tuple[list[tuple[str, str]], str]:
+    """Cut `text` into semantic segments for the incremental translator.
+
+    Returns (segments, tail): `segments` is a list of (raw_text, boundary)
+    in order; `tail` is the unfinished remainder. Segment texts are raw
+    slices (not stripped) so callers can track offsets into `text`;
+    `"".join(seg for seg, _ in segments) + tail == text` always holds.
+
+    Cut points, in priority order at each position:
+      1. sentence-final punctuation      -> BOUNDARY_SENTENCE
+      2. clause punctuation              -> BOUNDARY_CLAUSE
+      3. a discourse marker starting here -> BOUNDARY_CLAUSE (cut before it)
+      4. segment reached max_chars       -> BOUNDARY_FORCED
+    A cut is skipped (the text rides along into the next segment) when the
+    would-be segment is shorter than min_chars. ASCII . , : after a digit
+    are numeric, not boundaries.
+    """
+    family = _lang_family(language)
+    min_chars, max_chars = SEGMENT_LIMITS[family]
+    markers = DISCOURSE_MARKERS.get(language.lower().split("-")[0], ())
+    segments: list[tuple[str, str]] = []
+    start = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        numeric = ch in _NUMERIC_GUARDED and i > 0 and text[i - 1].isdigit()
+        cut_after: str | None = None
+        if ch in SENTENCE_END_CHARS and not numeric:
+            cut_after = BOUNDARY_SENTENCE
+        elif ch in CLAUSE_CHARS and not numeric:
+            cut_after = BOUNDARY_CLAUSE
+
+        if cut_after is not None:
+            seg = text[start : i + 1]
+            if len(seg.strip()) >= min_chars:
+                segments.append((seg, cut_after))
+                start = i + 1
+            i += 1
+            continue
+
+        if i > start and markers:
+            m = _marker_at(text, i, markers)
+            if m is not None and len(text[start:i].strip()) >= min_chars:
+                segments.append((text[start:i], BOUNDARY_CLAUSE))
+                start = i
+                i += len(m)
+                continue
+
+        if i - start + 1 >= max_chars:
+            # Never force-cut inside a Latin/digit run embedded in CJK text
+            # ("MeetingCast", "Q3", "GPU"): the next char may still be part
+            # of the word and hasn't arrived yet. Wait for the run to end —
+            # a CJK char or punctuation always follows soon.
+            if family == "cjk" and ch.isascii() and ch.isalnum():
+                i += 1
+                continue
+            if family == "spaced":
+                sp = text.rfind(" ", start, i + 1)
+                if sp > start:
+                    # keep the space inside the emitted segment so offsets
+                    # stay contiguous; on_delta strips for display
+                    segments.append((text[start : sp + 1], BOUNDARY_FORCED))
+                    start = sp + 1
+                    i += 1
+                    continue
+            segments.append((text[start : i + 1], BOUNDARY_FORCED))
+            start = i + 1
+        i += 1
+    return segments, text[start:]
+
+
+def _closing_boundary(text: str) -> str:
+    """Boundary for the remainder emitted at item completion: `sentence` if
+    it already ends with sentence-final punctuation, else `pause` (the VAD
+    closed the item mid-sentence, or the 15s force-commit fired)."""
+    t = text.rstrip()
+    if not t:
+        return BOUNDARY_PAUSE
+    last = t[-1]
+    if last in SENTENCE_END_CHARS:
+        if last == "." and len(t) > 1 and t[-2].isdigit():
+            return BOUNDARY_PAUSE
+        return BOUNDARY_SENTENCE
+    return BOUNDARY_PAUSE
 
 
 def split_complete_sentences(
@@ -71,20 +212,30 @@ def split_complete_sentences(
 
 
 class _SentenceSplitter:
-    """Per-item delta accumulation with punctuation-aware early finals.
+    """Per-item delta accumulation with segment-aware early finals.
 
     Translation downstream only fires on is_final transcripts, which
     normally arrive at VAD speech-end or the max_speech_sec force-flush —
     up to 15s into fast, pause-free speech. Deltas lag the audio by only
-    ~1.3s, so once the running delta text contains a complete sentence we
-    emit it as a synthetic final immediately and keep only the unfinished
-    tail as the interim. `transcription.completed` then emits whatever
-    part of the item wasn't already emitted early.
+    ~1.3s, so as soon as the running delta text contains a complete
+    segment (sentence, clause, discourse-marker cut or max-length cut —
+    see `split_segments`) we emit it as a synthetic final tagged with its
+    boundary kind and keep only the unfinished tail as the interim.
+    `transcription.completed` then emits whatever part of the item wasn't
+    already emitted early, tagged `sentence` or `pause`.
     """
 
-    def __init__(self):
+    def __init__(self, language: str = "zh", segmentation: str = SEGMENTATION_SENTENCE):
+        self.language = language
+        self.segmentation = segmentation
         self._partials: dict[str, str] = {}  # full delta accumulation per item_id
         self._emitted: dict[str, str] = {}  # prefix already emitted as early finals
+
+    def _split(self, pending: str) -> tuple[list[tuple[str, str]], str]:
+        if self.segmentation == SEGMENTATION_FINE:
+            return split_segments(pending, self.language)
+        sentence, tail = split_complete_sentences(pending)
+        return ([(sentence, BOUNDARY_SENTENCE)] if sentence else []), tail
 
     def on_delta(self, iid: str, delta: str) -> list[Transcript]:
         self._partials[iid] = self._partials.get(iid, "") + delta
@@ -92,13 +243,17 @@ class _SentenceSplitter:
             return []
         done = self._emitted.get(iid, "")
         pending = self._partials[iid][len(done):]
-        sentence, tail = split_complete_sentences(pending)
+        segments, tail = self._split(pending)
         out: list[Transcript] = []
-        if sentence:
+        if segments:
             # offsets track the raw (unstripped) text; strip only for display
-            self._emitted[iid] = done + sentence
-            if sentence.strip():
-                out.append(Transcript(text=sentence.strip(), is_final=True))
+            consumed = pending[: len(pending) - len(tail)]
+            self._emitted[iid] = done + consumed
+            for seg, boundary in segments:
+                if seg.strip():
+                    out.append(
+                        Transcript(text=seg.strip(), is_final=True, boundary=boundary)
+                    )
         if tail.strip():
             out.append(Transcript(text=tail, is_final=False))
         return out
@@ -116,7 +271,9 @@ class _SentenceSplitter:
         remainder = remainder.strip()
         if not remainder:
             return None
-        return Transcript(text=remainder, is_final=True)
+        return Transcript(
+            text=remainder, is_final=True, boundary=_closing_boundary(remainder)
+        )
 
 
 class OpenAILiveTranscribeSTT:
@@ -127,6 +284,8 @@ class OpenAILiveTranscribeSTT:
         max_speech_sec: float = 15.0,
         initial_prompt: str | None = None,
         keywords: list[str] | None = None,
+        delay: str = DEFAULT_DELAY,
+        segmentation: str = SEGMENTATION_SENTENCE,
     ):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -140,6 +299,10 @@ class OpenAILiveTranscribeSTT:
         self.max_speech_sec = max_speech_sec
         self.initial_prompt = initial_prompt
         self.keywords = keywords or []
+        # gpt-live-transcribe `delay` level: lower = earlier partial text,
+        # higher = more audio context per emitted word (better WER).
+        self.delay = delay
+        self.segmentation = segmentation
         self._vad_model = None
 
     def _vad(self):
@@ -171,6 +334,7 @@ class OpenAILiveTranscribeSTT:
             language=self.language,
             prompt=self.initial_prompt,
             keywords=self.keywords,
+            delay=self.delay,
         )
 
     def transcribe_file(self, path: str) -> Transcript:
@@ -254,7 +418,7 @@ class OpenAILiveTranscribeSTT:
 
             async def reader():
                 """Consume WS events, push Transcripts into out_queue."""
-                splitter = _SentenceSplitter()
+                splitter = _SentenceSplitter(self.language, self.segmentation)
                 try:
                     async for raw in ws:
                         event = json.loads(raw)

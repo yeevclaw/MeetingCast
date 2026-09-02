@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::SharedConfig;
 use crate::errors;
+use crate::interp;
 use crate::languages;
 use crate::session::{self, SharedRecorder};
 use crate::traces;
@@ -66,6 +67,19 @@ pub enum SidecarEvent {
         is_final: bool,
         t_start: f64,
         t_end: f64,
+        /// Segment boundary kind on finals (`clause` / `forced` keep the
+        /// incremental-translation group open, `sentence` / `pause` close
+        /// it). Absent on interims and on sidecars predating the field —
+        /// consumers treat `None` as `sentence`. Skipped on serialize when
+        /// absent so the frontend payload is byte-identical for old sidecars.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boundary: Option<String>,
+        /// Incremental mode only: the id of the sentence group this segment
+        /// belongs to — the frontend keys UI rows and utterances by it
+        /// instead of by `t_start`. Never sent by the sidecar; filled in by
+        /// the stdout reader after handing the segment to `interp`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utterance_id: Option<String>,
     },
     /// Response to a `list_devices` command — consumed by the matching
     /// oneshot in `list_audio_devices`, never forwarded to the frontend
@@ -324,8 +338,11 @@ async fn spawn_inner_body(
                         // be paid for output the user barely sees, and a partial
                         // alias inside an interim might trigger a wrong rewrite
                         // that stabilizes once the full word is recognized.
-                        SidecarEvent::Transcript { text, is_final, t_start, t_end } if is_final => {
-                            let rewritten = cfg_o.lock().await.apply_glossary_aliases(&text);
+                        SidecarEvent::Transcript { text, is_final, t_start, t_end, boundary, .. } if is_final => {
+                            let (rewritten, incremental) = {
+                                let cfg = cfg_o.lock().await;
+                                (cfg.apply_glossary_aliases(&text), cfg.incremental_enabled())
+                            };
                             // Reset the idle watcher's activity clock on any
                             // speech-bearing final. Empty transcripts (which
                             // some backends emit on noise) deliberately do NOT
@@ -337,6 +354,24 @@ async fn spawn_inner_body(
                                     m.last_activity_at = Some(Instant::now());
                                 }
                             }
+                            // Incremental mode: the engine owns translation +
+                            // persistence for this segment; the frontend only
+                            // renders. Sentence mode: unchanged, the frontend
+                            // invokes `translate` per final.
+                            let utterance_id = if incremental && !rewritten.trim().is_empty() {
+                                Some(
+                                    interp::on_final_segment(
+                                        &app_o,
+                                        &rewritten,
+                                        t_start,
+                                        t_end,
+                                        boundary.as_deref(),
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            };
                             emit_event(
                                 &app_o,
                                 SidecarEvent::Transcript {
@@ -344,6 +379,8 @@ async fn spawn_inner_body(
                                     is_final,
                                     t_start,
                                     t_end,
+                                    boundary,
+                                    utterance_id,
                                 },
                             );
                         }
@@ -574,13 +611,15 @@ pub async fn start_stt(
         }
     }
 
-    let (openai_api_key, initial_prompt, keywords, idle_minutes) = {
+    let (openai_api_key, initial_prompt, keywords, idle_minutes, openai_delay, incremental) = {
         let cfg = config.lock().await;
         (
             cfg.api.openai_api_key.clone(),
             cfg.whisper_initial_prompt(),
             cfg.stt_keywords(),
             cfg.idle_auto_stop_minutes,
+            cfg.stt.openai_delay.clone(),
+            cfg.incremental_enabled(),
         )
     };
     let cmd = serde_json::json!({
@@ -593,6 +632,14 @@ pub async fn start_stt(
         "keywords": keywords,
         "api": {
             "openai_api_key": openai_api_key,
+        },
+        // Per-backend tuning. `segmentation: fine` asks the openai splitter
+        // for clause-level early finals, which only make sense when the
+        // incremental engine stitches them back into groups; the sentence
+        // translator gets today's sentence-level cuts.
+        "stt": {
+            "delay": openai_delay,
+            "segmentation": if incremental { "fine" } else { "sentence" },
         },
     });
     {
@@ -611,6 +658,7 @@ pub async fn start_stt(
             // Clear the rolling translation context so a source-language switch
             // (or any fresh start) doesn't carry stale prior-utterance pairs.
             ctx.lock().await.clear();
+            interp::reset(&app).await;
             let _ = app.emit("session:reset", ());
             // Reset the idle clock and (re)start the per-session watcher. If
             // a previous watcher is somehow still alive (shouldn't happen
@@ -723,6 +771,7 @@ pub async fn sidecar_ready(state: tauri::State<'_, SharedManager>) -> Result<boo
 
 #[tauri::command]
 pub async fn stop_stt(
+    app: AppHandle,
     state: tauri::State<'_, SharedManager>,
     recorder: tauri::State<'_, SharedRecorder>,
 ) -> Result<Option<String>, String> {
@@ -746,6 +795,10 @@ pub async fn stop_stt(
     // the recorder slot is already empty (see session_append_utterance).
     // That's the right tradeoff: a meta.json with one fewer count is
     // better than racing the file write with concurrent appends.
+    // Incremental mode: close the open sentence group and wait (bounded) for
+    // its final translation calls so the last row lands before meta.json is
+    // finalized. No-op in sentence mode (no open group, no workers).
+    interp::flush(&app).await;
     // Return the just-closed session id so the frontend can kick off
     // opt-in post-session work (auto-summary); `None` = nothing was open.
     Ok(session::stop_session(recorder.inner()).await)
@@ -806,6 +859,7 @@ async fn idle_watch_loop(
                 }
             };
             if fallback_stop {
+                interp::flush(&app).await;
                 let _ = session::stop_session(&recorder).await;
                 errors::record(
                     "idle_timeout_fallback",

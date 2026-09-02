@@ -75,9 +75,11 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
     if (!lang) return;
     const unlistens: Array<Promise<() => void>> = [
       listen<TranscriptPayload>("transcript", (e) => {
-        const { is_final, text, t_start } = e.payload;
+        const { is_final, text, t_start, utterance_id } = e.payload;
         if (!is_final || !text) return;
-        const id = String(t_start);
+        // Incremental mode groups several segments under one utterance id;
+        // sentence mode keys by t_start. Either way one row per utterance.
+        const id = utterance_id ?? String(t_start);
         setRows((prev) => {
           if (prev.some((u) => u.id === id)) return prev; // dedup
           return [...prev, { id, text: "" }];

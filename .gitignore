@@ -55,3 +55,6 @@ target/
 *.ntvs*
 *.njsproj
 *.sln
+
+# stream_bench.py reference-timing cache
+prototype/.bench_cache/

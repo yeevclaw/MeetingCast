@@ -9,6 +9,13 @@ export type TranscriptPayload = {
   is_final: boolean;
   t_start: number;
   t_end: number;
+  // Segment boundary kind on finals: "clause" | "forced" (translation group
+  // stays open) | "sentence" | "pause" (group closes). Absent on interims
+  // and on old sidecar binaries (treated as "sentence").
+  boundary?: string;
+  // Incremental (同步口譯) mode only: id of the sentence group this segment
+  // belongs to. UI rows and utterances are keyed by it instead of t_start.
+  utterance_id?: string;
 };
 
 export type Source =
@@ -82,6 +89,15 @@ export type Config = {
     auto_generate: boolean;
     auto_template: string;
     auto_targets: string[];
+  };
+  // gpt-live-transcribe delay level: minimal | low | medium | high | xhigh.
+  stt: {
+    openai_delay: string;
+  };
+  // "sentence" (default, per-utterance translate) | "incremental" (the
+  // simultaneous-interpreter engine in Rust; 3–4× more translate calls).
+  interp: {
+    mode: string;
   };
 };
 

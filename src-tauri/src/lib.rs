@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 mod config;
 mod errors;
+mod interp;
 mod keycheck;
 mod languages;
 mod session;
@@ -45,6 +46,7 @@ pub fn run() {
         .manage::<sidecar::SharedManager>(Arc::new(Mutex::new(sidecar::SidecarManager::new())))
         .manage(shared_config)
         .manage(translator::new_context())
+        .manage(interp::new_engine())
         .manage(session::new_recorder())
         .invoke_handler(tauri::generate_handler![
             sidecar::start_stt,

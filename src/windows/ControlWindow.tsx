@@ -95,7 +95,9 @@ export default function ControlWindow() {
   // Source language mirrored into state so the transcript panel's badge
   // re-renders on change; the ref below is the live copy handlers read.
   const [sourceLang, setSourceLang] = useState("zh");
-  const [history, setHistory] = useState<string[]>([]);
+  // One line per utterance. In incremental mode consecutive segments of the
+  // same sentence group share an id and are merged into one line.
+  const [history, setHistory] = useState<Array<{ id: string; text: string }>>([]);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -148,10 +150,15 @@ export default function ControlWindow() {
     source: "zh",
     slots: ["en", "vi"],
   });
+  // "sentence" | "incremental". In incremental mode Rust's interp engine owns
+  // translation + persistence, so the transcript listener must not invoke
+  // `translate` or seat pending utterances.
+  const interpModeRef = useRef<string>("sentence");
   const applyLangCfg = useCallback((cfg: Config) => {
     const source = cfg.language?.source ?? "zh";
     const slots = cfg.language?.target_slots ?? ["en", "vi"];
     langCfgRef.current = { source, slots: [slots[0] ?? "", slots[1] ?? ""] };
+    interpModeRef.current = cfg.interp?.mode ?? "sentence";
     setSourceLang(source);
   }, []);
   // Target languages we actually translate to: non-empty, not equal to the
@@ -549,14 +556,53 @@ export default function ControlWindow() {
     }
   }, [flushPending, showToast]);
 
+  // Dev-only headless automation. `VITE_MC_AUTOSTART="openai-demo:100"` (or
+  // `local-demo:N`) picks the backend + the bundled demo WAV, starts once the
+  // sidecar is ready and stops after N seconds — so a pipeline change can be
+  // verified from session files / traces without clicking through the UI.
+  // Compiled out of release builds (import.meta.env.DEV) and inert when the
+  // variable is unset. Never clears its timers: the effect re-runs when
+  // `handleStart`/`handleStop` identities change and must not cancel the stop.
+  const autostartDoneRef = useRef(false);
+  useEffect(() => {
+    const spec = import.meta.env.DEV ? (import.meta.env.VITE_MC_AUTOSTART as string | undefined) : undefined;
+    if (!spec || autostartDoneRef.current || !sidecarReady) return;
+    const [preset, secs] = spec.split(":");
+    if (preset !== "openai-demo" && preset !== "local-demo") return;
+    autostartDoneRef.current = true;
+    setBackend(preset === "openai-demo" ? "openai" : "local");
+    setUseMic(false);
+    const runMs = (parseInt(secs ?? "100", 10) || 100) * 1000;
+    setTimeout(() => {
+      handleStart();
+    }, 800);
+    setTimeout(() => {
+      handleStop();
+    }, 800 + runMs);
+  }, [sidecarReady, handleStart, handleStop]);
+
   useEffect(() => {
     const unlistens: Array<Promise<() => void>> = [
       listen<TranscriptPayload>("transcript", (e) => {
         const { text, is_final, t_start, t_end } = e.payload;
         if (!text) return;
         if (is_final) {
-          setHistory((h) => [...h, text]);
           setLatestSrc("");
+          if (interpModeRef.current === "incremental") {
+            // Rust translated + persisted this segment already (see
+            // interp.rs). Merge it into its sentence group's line.
+            const gid = e.payload.utterance_id ?? String(t_start);
+            setHistory((h) => {
+              const last = h[h.length - 1];
+              if (last && last.id === gid) {
+                return [...h.slice(0, -1), { id: gid, text: last.text + text }];
+              }
+              return [...h, { id: gid, text }];
+            });
+            finalizedThisSessionRef.current += 1;
+            return;
+          }
+          setHistory((h) => [...h, { id: String(t_start), text }]);
           const id = String(t_start);
           const targets = enabledTargets();
           // Skip the translate call for trivially short utterances —
@@ -1061,8 +1107,8 @@ export default function ControlWindow() {
               className="space-y-2 text-base leading-relaxed text-paper-900"
               onContextMenu={handleTranscriptContextMenu}
             >
-              {history.map((h, i) => (
-                <li key={i}>{h}</li>
+              {history.map((h) => (
+                <li key={h.id}>{h.text}</li>
               ))}
               {latestSrc && <li className="italic text-paper-500">{latestSrc}</li>}
             </ul>

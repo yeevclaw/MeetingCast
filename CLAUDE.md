@@ -11,7 +11,8 @@
 - **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source 可選 zh/en/ja/vi，target 可選 zh/en/ja/vi/km；`source_capable: false` 標記 target-only 語言（km），script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
 - **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
 - **翻譯在 Rust 不在 sidecar**：Anthropic API 由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT
-- **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start` / `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
+- **兩種翻譯模式**：`[interp] mode = "sentence"`（預設）由前端 ControlWindow 逐句 `invoke("translate")`；`"incremental"` 由 Rust `interp.rs` 接手：sidecar 送 clause 級片段（`transcript.boundary`），引擎把片段拼成句群、每語言一條序列化隊列、譯文只追加（Anthropic 用 assistant prefill）、句群關閉時自己寫 session。事件名沿用 `translation:chunk/done:{lang}`，id = 句群 id（`transcript.utterance_id`）。設計與基線數字見 `docs/PLAN_INCREMENTAL_INTERP.md`
+- **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start`（含 `stt: {delay, segmentation}`）/ `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript`（final 帶 `boundary`: clause/forced/sentence/pause）/ `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
 - **dev sidecar binary 陷阱**：`pnpm tauri dev` 會把 `binaries/stt_engine-<triple>` copy 到 `target/debug/`，sidecar.rs 優先吃這個 stale binary。測 Python 改動前先 `mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`
 - **色票統一**：`App.css` 的 `@theme paper-* / danger-* / warn-* / recording`，元件不寫 hex
@@ -138,7 +139,13 @@ vi = "Tử Vi Đẩu Số"
 
 active_glossary = "預設"
 
-# [stt] / [vad] / [ui] 暫 hardcoded（schema 已預留 Phase 5）
+[stt]                    # ✅ Settings UI 可改（辨識引擎為 openai 時顯示）
+openai_delay = "minimal" # gpt-live-transcribe delay 等級：minimal/low/medium/high/xhigh；minimal 比 low 快約 1.4s
+
+[interp]                 # ✅ Settings UI 可改（開啟時跳費用確認框，翻譯費用約 2–3 倍）
+mode = "sentence"        # "sentence"（預設，逐句翻）| "incremental"（同步口譯引擎 src-tauri/src/interp.rs）
+
+# [vad] / [ui] 暫 hardcoded
 ```
 
 **API key 載入**：app 啟動讀 `config.toml` → 欄位空時 dev 模式 fallback dotenvy 從 `prototype/.env` seed → Settings UI 改值 persist 回 config.toml。

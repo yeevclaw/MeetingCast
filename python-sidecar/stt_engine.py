@@ -119,6 +119,9 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     api_cfg = cmd.get("api") or {}
     initial_prompt = cmd.get("initial_prompt") or None
     keywords = cmd.get("keywords") or []
+    # Per-backend tuning from the Rust config layer ([stt] / [interp]).
+    # Absent on older hosts → backend defaults.
+    stt_opts = cmd.get("stt") or {}
 
     openai_api_key = api_cfg.get("openai_api_key")
     if openai_api_key:
@@ -162,6 +165,10 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 backend_kwargs["initial_prompt"] = initial_prompt
             if keywords:
                 backend_kwargs["keywords"] = keywords
+            if stt_opts.get("delay"):
+                backend_kwargs["delay"] = str(stt_opts["delay"])
+            if stt_opts.get("segmentation"):
+                backend_kwargs["segmentation"] = str(stt_opts["segmentation"])
         stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on
@@ -197,13 +204,19 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 t_start = max(elapsed, last_synthetic_start + 0.000001)
                 t_end = t_start
                 last_synthetic_start = t_start
-            emit({
+            event = {
                 "type": "transcript",
                 "text": transcript.text,
                 "is_final": transcript.is_final,
                 "t_start": t_start,
                 "t_end": t_end,
-            })
+            }
+            # Segment boundary (clause / forced / sentence / pause) — only
+            # finals carry it. Omitted when the backend didn't set one so
+            # the wire format stays identical for old consumers.
+            if transcript.is_final and getattr(transcript, "boundary", None):
+                event["boundary"] = transcript.boundary
+            emit(event)
 
     try:
         await stream_with_cancel()

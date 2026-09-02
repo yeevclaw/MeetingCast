@@ -399,7 +399,7 @@ class MLXWhisperSTT:
                     text = await asyncio.to_thread(self._transcribe_audio, full_audio)
                     if text:
                         yield Transcript(
-                            text=text, is_final=True,
+                            text=text, is_final=True, boundary="sentence",
                             t_start=speech_start_sec, t_end=float(event["end"]),
                         )
                     speech_buffer = []
@@ -413,7 +413,7 @@ class MLXWhisperSTT:
                     text = await asyncio.to_thread(self._transcribe_audio, full_audio)
                     if text:
                         yield Transcript(
-                            text=text, is_final=True,
+                            text=text, is_final=True, boundary="sentence",
                             t_start=speech_start_sec, t_end=cut_at,
                         )
                     speech_buffer = []
@@ -426,6 +426,6 @@ class MLXWhisperSTT:
             text = await asyncio.to_thread(self._transcribe_audio, full_audio)
             if text:
                 yield Transcript(
-                    text=text, is_final=True,
+                    text=text, is_final=True, boundary="sentence",
                     t_start=speech_start_sec, t_end=samples_processed / sample_rate,
                 )

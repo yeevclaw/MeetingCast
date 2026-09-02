@@ -14,6 +14,18 @@ LEGACY_REALTIME_WHISPER_MODEL = "gpt-realtime-whisper"
 TARGET_RATE = 24_000
 MAX_KEYWORDS = 30
 
+# The `zh-tw` language hint alone does NOT make gpt-live-transcribe emit
+# Traditional characters (measured 2026-09-02: simplified output on a 90s
+# Taiwanese weather clip). A short Traditional-Chinese carrier sentence in the
+# prompt fixed it (reference similarity 0.69 → 0.88). Prepended to whatever
+# glossary context the config layer supplies.
+ZH_TW_SCRIPT_PROMPT = "以下為繁體中文的會議內容，請以繁體中文輸出。"
+
+# gpt-live-transcribe `delay` levels, fastest first. `minimal` measured ~1.1s
+# delta lag vs ~2.5s for `low` with no visible accuracy change on the same clip.
+DELAY_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+DEFAULT_DELAY = "minimal"
+
 
 def _language_hints(language: str) -> list[str]:
     """Return the model's expected-language hints for a source language.
@@ -59,7 +71,7 @@ def build_session_payload(
     language: str,
     prompt: str | None = None,
     keywords: Iterable[str] | None = None,
-    delay: str = "low",
+    delay: str = DEFAULT_DELAY,
 ) -> dict[str, Any]:
     """Build a Realtime transcription `session.update` event.
 
@@ -84,11 +96,15 @@ def build_session_payload(
             },
         }
 
+    if delay not in DELAY_LEVELS:
+        delay = DEFAULT_DELAY
     transcription: dict[str, Any] = {"model": model, "delay": delay}
     language_hints = _language_hints(language)
     if language_hints:
         transcription["languages"] = language_hints
     clean_prompt = (prompt or "").strip()
+    if language_hints == ["zh-tw"]:
+        clean_prompt = (ZH_TW_SCRIPT_PROMPT + " " + clean_prompt).strip()
     if clean_prompt:
         transcription["prompt"] = clean_prompt
     clean_keywords = sanitize_keywords(keywords)
