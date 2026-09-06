@@ -1,6 +1,6 @@
 [package]
 name = "meetingcast"
-version = "0.1.26"
+version = "0.1.27"
 description = "Real-time multi-language meeting translator (zh/en/ja/vi)"
 authors = ["TPI Software"]
 edition = "2021"
