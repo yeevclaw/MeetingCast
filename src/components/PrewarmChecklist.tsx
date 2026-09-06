@@ -59,7 +59,7 @@ export default function PrewarmChecklist({
               <p
                 className={
                   status === "done"
-                    ? "text-paper-500 line-through decoration-paper-400"
+                    ? "text-paper-500 line-through decoration-paper-300"
                     : status === "in_progress"
                       ? "font-medium text-paper-900"
                       : status === "error"
@@ -116,10 +116,10 @@ function ModelProgressDetail({ progress }: { progress: ModelProgress }) {
   return (
     <>
       <div className="mt-1.5 flex items-center gap-2">
-        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-paper-200">
+        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-paper-100">
           <div
             className={`h-full rounded-full transition-[width] duration-700 ${
-              stalled ? "bg-warn-700" : "bg-paper-700"
+              stalled ? "bg-warn-700" : "ai-bar"
             }`}
             style={{ width: `${pct}%` }}
           />
@@ -154,7 +154,7 @@ function formatEta(sec: number): string {
 function StepIcon({ status, stalled }: { status: StepStatus; stalled?: boolean }) {
   if (status === "done") {
     return (
-      <span className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-paper-700 text-white">
+      <span className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-ok-700 text-white">
         <svg viewBox="0 0 16 16" className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
           <path d="M3 8.5 L6.5 12 L13 4.5" />
         </svg>
@@ -174,7 +174,7 @@ function StepIcon({ status, stalled }: { status: StepStatus; stalled?: boolean }
       );
     }
     return (
-      <span className="mt-0.5 inline-block h-4 w-4 flex-shrink-0 animate-spin rounded-full border-2 border-paper-200 border-t-paper-900" />
+      <span className="mt-0.5 inline-block h-4 w-4 flex-shrink-0 animate-spin rounded-full border-2 border-paper-200 border-t-ai-violet" />
     );
   }
   if (status === "error") {

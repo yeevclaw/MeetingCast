@@ -566,6 +566,9 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Stri
     if api_key.is_empty() {
         return Err(format!("{} API key not configured", provider.label()));
     }
+    if !crate::netcheck::is_online(app) {
+        return Err(crate::netcheck::OFFLINE_ERR.into());
+    }
     let Some(target_name) = languages::get(lang).map(|l| l.prompt_name.as_str()) else {
         return Err(format!("invalid target: {lang}"));
     };

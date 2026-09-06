@@ -99,6 +99,11 @@ export type Config = {
   interp: {
     mode: string;
   };
+  // Translation-window appearance, global to both windows.
+  ui: {
+    translation_theme: string; // "dark" | "light"
+    glow: boolean;
+  };
 };
 
 // transcript.jsonl row (schema v2) as delivered by get_session_transcript.

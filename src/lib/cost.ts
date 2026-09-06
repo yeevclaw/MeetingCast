@@ -17,3 +17,52 @@ export const OPENAI_DELAY_LEVELS: Array<{ id: string; label: string }> = [
   { id: "high", label: "high" },
   { id: "xhigh", label: "xhigh（最準、最慢）" },
 ];
+
+// ---- Hourly estimate shown on the console's 本場設定 card ----
+//
+// Translation per hour (two windows, ~30 min of speech, no prompt cache),
+// 2026-07 list prices per 1M tokens: haiku-4-5 $1/$5, sonnet-4-6 $3/$15,
+// gpt-5.6-luna $1/$6, gpt-5.6-terra $2.5/$15. Summary per run assumes a
+// one-hour transcript (~5k in / 1.5k out).
+export const TRANSLATE_COST_PER_HOUR: Record<string, number> = {
+  "claude-haiku-4-5": 0.6,
+  "claude-sonnet-4-6": 1.8,
+  "gpt-5.6-luna": 0.6,
+  "gpt-5.6-terra": 1.6,
+};
+export const SUMMARY_COST_PER_RUN: Record<string, number> = {
+  "claude-sonnet-4-6": 0.04,
+  "claude-haiku-4-5": 0.01,
+  "gpt-5.6-sol": 0.07,
+  "gpt-5.6-terra": 0.04,
+};
+// gpt-live-transcribe ≈ US$0.017 per minute of session time.
+export const OPENAI_STT_COST_PER_HOUR_USD = 1.0;
+// Measured ratio of incremental-mode translate spend to sentence mode.
+export const INTERP_MULTIPLIER = 2.5;
+
+export type CostInputs = {
+  provider: string;
+  model: string;
+  openaiModel: string;
+  interpIncremental: boolean;
+  targetCount: number;
+  cloudStt: boolean;
+};
+
+/** Rough US$ per hour for the current configuration, or null when the model
+ *  isn't in the table. Scales linearly with the number of active targets
+ *  (the table assumes two). */
+export function estimateHourlyUsd(i: CostInputs): number | null {
+  const model = i.provider === "openai" ? i.openaiModel : i.model;
+  const base = TRANSLATE_COST_PER_HOUR[model];
+  if (base == null) return null;
+  let translate = (base * i.targetCount) / 2;
+  if (i.interpIncremental) translate *= INTERP_MULTIPLIER;
+  return translate + (i.cloudStt ? OPENAI_STT_COST_PER_HOUR_USD : 0);
+}
+
+export function formatUsd(v: number | null): string {
+  if (v == null) return "—";
+  return v < 0.1 ? "< US$0.1" : `≈ US$${v.toFixed(1)}`;
+}

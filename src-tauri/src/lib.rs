@@ -10,6 +10,7 @@ mod errors;
 mod interp;
 mod keycheck;
 mod languages;
+mod netcheck;
 mod session;
 mod sidecar;
 mod traces;
@@ -48,6 +49,7 @@ pub fn run() {
         .manage(translator::new_context())
         .manage(interp::new_engine())
         .manage(session::new_recorder())
+        .manage(netcheck::new_state())
         .invoke_handler(tauri::generate_handler![
             sidecar::start_stt,
             sidecar::stop_stt,
@@ -62,6 +64,8 @@ pub fn run() {
             translator::read_summary,
             config::get_config,
             config::set_config,
+            netcheck::network_status,
+            netcheck::network_probe_now,
             keycheck::validate_anthropic_key,
             keycheck::validate_openai_key,
             errors::open_config_folder,
@@ -91,6 +95,10 @@ pub fn run() {
             // The frontend shows a "preparing" overlay while we wait for the
             // child's first `ready` event. Use Tauri's async runtime since
             // setup() is a sync context — tokio::spawn would panic here.
+            // Reachability probe for the LLM endpoint (drives the 網路 chip,
+            // the translation-paused banner and the offline fast-fail).
+            netcheck::spawn_monitor(app.handle().clone());
+
             let app_handle = app.handle().clone();
             let mgr: sidecar::SharedManager = app.state::<sidecar::SharedManager>().inner().clone();
             let cfg: config::SharedConfig = app.state::<config::SharedConfig>().inner().clone();

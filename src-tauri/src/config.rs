@@ -220,6 +220,33 @@ impl Default for InterpConfig {
     }
 }
 
+/// Appearance shared by both translation windows (`[ui]`). `translation_theme`
+/// is "dark" (pure black, projector default) or "light"; `glow` toggles the
+/// rotating AI-gradient aura drawn just inside each window's edge. Both are
+/// global so two projectors always look the same. Absent in old configs →
+/// dark + glow on.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct UiConfig {
+    #[serde(default = "default_translation_theme")]
+    pub translation_theme: String,
+    #[serde(default = "default_glow")]
+    pub glow: bool,
+}
+
+fn default_translation_theme() -> String {
+    "dark".into()
+}
+
+fn default_glow() -> bool {
+    true
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { translation_theme: default_translation_theme(), glow: default_glow() }
+    }
+}
+
 /// Source + target-slot language selection. `source` is the meeting language
 /// being transcribed; `target_slots` is always exactly length 2 (one per
 /// translation window), where `""` means that slot is closed. serde defaults
@@ -317,6 +344,10 @@ pub struct Config {
     /// Interpretation mode (`[interp]`). Absent in old configs → `sentence`.
     #[serde(default)]
     pub interp: InterpConfig,
+
+    /// Translation-window appearance (`[ui]`). Absent in old configs → defaults.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 fn default_idle_minutes() -> u32 {
@@ -678,6 +709,9 @@ pub async fn set_config(
     // always in the canonical v2 shape regardless of what the frontend sent.
     config.sanitize_language();
     config.migrate_glossary_entries();
+    if config.ui.translation_theme != "light" {
+        config.ui.translation_theme = "dark".into();
+    }
 
     let prev_language = state.lock().await.language.clone();
     if let Err(e) = save(&config) {
@@ -687,6 +721,10 @@ pub async fn set_config(
     let language_changed = config.language != prev_language;
     let new_language = config.language.clone();
     *state.lock().await = config;
+
+    // Every window re-reads config on this (appearance, interp mode, …). The
+    // payload is intentionally empty — consumers call get_config.
+    let _ = app.emit("config:changed", ());
 
     // Signal windows to re-read config (they re-`get_config`, don't trust the
     // payload). Only fire when the language selection actually changed.

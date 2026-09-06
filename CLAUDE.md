@@ -15,7 +15,9 @@
 - **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start`（含 `stt: {delay, segmentation}`）/ `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript`（final 帶 `boundary`: clause/forced/sentence/pause）/ `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
 - **dev sidecar binary 陷阱**：`pnpm tauri dev` 會把 `binaries/stt_engine-<triple>` copy 到 `target/debug/`，sidecar.rs 優先吃這個 stale binary。測 Python 改動前先 `mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`
-- **色票統一**：`App.css` 的 `@theme paper-* / danger-* / warn-* / recording`，元件不寫 hex
+- **色票統一**：`App.css` 的 `@theme paper-*`（2026-09 起為冷灰中性階，名稱沿用）/ `ai-*`（藍→紫→粉→橘漸層，只用在品牌字、開始鍵與錄音點、譻文視窗光暈、進度四處）/ `ok-* / warn-* / danger-* / recording` / `stage-*`（譯文視窗，`.stage-light` 切淺色），元件不寫 hex。utility：`.ai-text .ai-fill .ai-bar .ai-dot .ai-caret .aura-host`
+- **UI 結構（2026-09 改版）**：主控台 960×640 = 狀態列 chip（可點開 popover）＋逐字稿優先＋右欄「本場設定」卡；兩個譯文視窗純黑＋光暈、字級隨高度自動；設定三分頁（會議／帳號／進階）；onboarding 六步。設計與實作對照見 `docs/UX_REDESIGN_2026-09.md`
+- **網路探測在 Rust**：`netcheck.rs` 每 20 秒 TCP connect 供應商 API host，發 `network:status`；離線時 `translate` / `interp` 立即回 `offline:` 前綴錯誤，前端視為「暫停」不報錯
 
 ## 常用指令
 
@@ -144,6 +146,10 @@ openai_delay = "minimal" # gpt-live-transcribe delay 等級：minimal/low/medium
 
 [interp]                 # ✅ Settings UI 可改（開啟時跳費用確認框，翻譯費用約 2–3 倍）
 mode = "sentence"        # "sentence"（預設，逐句翻）| "incremental"（同步口譯引擎 src-tauri/src/interp.rs）
+
+[ui]                     # ✅ Settings UI 可改（進階分頁）
+translation_theme = "dark"  # 譯文視窗 "dark"（純黑，投影預設）| "light"
+glow = true              # 譯文視窗外框 AI 漸層光暈
 
 # [vad] / [ui] 暫 hardcoded
 ```

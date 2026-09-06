@@ -828,6 +828,11 @@ pub async fn translate(
             Provider::OpenAi => "OpenAI API key not configured (open Settings)".into(),
         });
     }
+    // Offline: fail fast instead of burning the retry ladder on DNS timeouts.
+    // The frontend treats this exact prefix as "paused", not as an error.
+    if !crate::netcheck::is_online(&app) {
+        return Err(crate::netcheck::OFFLINE_ERR.into());
+    }
     // Reject an unknown target before spending a single token — this replaces
     // the old silent English fallback.
     let Some(target_name) = target_lang_name(&target) else {

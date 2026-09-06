@@ -14,10 +14,12 @@
       {
         "label": "control",
         "title": "MeetingCast",
-        "width": 480,
-        "height": 540,
+        "width": 960,
+        "height": 640,
         "x": 40,
-        "y": 80
+        "y": 80,
+        "minWidth": 760,
+        "minHeight": 520
       },
       {
         "label": "t1",
@@ -50,8 +52,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/stt_engine"],
-    "resources": ["../prototype/samples/weather_90s.wav"],
+    "externalBin": [
+      "binaries/stt_engine"
+    ],
+    "resources": [
+      "../prototype/samples/weather_90s.wav"
+    ],
     "macOS": {
       "infoPlist": "./Info.plist",
       "entitlements": "./Entitlements.plist",

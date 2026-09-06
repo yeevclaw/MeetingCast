@@ -2,7 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capabilities for all MeetingCast windows",
-  "windows": ["control", "t1", "t2"],
+  "windows": [
+    "control",
+    "t1",
+    "t2"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-always-on-top",
@@ -10,6 +14,13 @@
     "core:window:allow-set-size",
     "core:window:allow-set-title",
     "opener:default",
-    "global-shortcut:default"
+    "global-shortcut:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-inner-size",
+    "core:window:allow-close"
   ]
 }

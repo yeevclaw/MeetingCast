@@ -1,30 +1,234 @@
 @import "tailwindcss";
 
+/*
+ * MeetingCast palette — "中性打底，漸層點題" (2026-09 redesign).
+ *
+ * Neutrals are the Apple-style cool greys; the AI gradient (blue → violet →
+ * pink → orange) appears only where the AI is visibly working: the wordmark,
+ * the start button / recording dot, the translation-window aura, and progress.
+ * Text is never gradient-filled. Semantic colours (ok / warn / danger) are kept
+ * apart from the gradient so state never looks decorative.
+ *
+ * The `paper-*` names are kept so every component's existing class names
+ * keep working; the values are the new neutral ramp.
+ */
 @theme {
-  /* Warm paper neutral scale — single source of truth across all windows */
-  --color-paper-50: #FBF8F1;
-  --color-paper-100: #F5F1E8;
-  --color-paper-200: #EAE3D2;
-  --color-paper-300: #E0D8C5;
-  --color-paper-400: #C7BBA0;
-  --color-paper-500: #A89A7E;
-  --color-paper-600: #6B5E4A;
-  --color-paper-700: #4A3F30;
-  --color-paper-800: #3A3024;
-  --color-paper-900: #2A2018;
+  /* Neutral ramp (cool grey) */
+  --color-paper-0: #ffffff;
+  --color-paper-50: #f5f5f7;
+  --color-paper-100: #ebebf0;
+  --color-paper-200: #e2e2e7;
+  --color-paper-300: #d2d2d7;
+  --color-paper-400: #aeaeb2;
+  --color-paper-500: #8e8e93;
+  --color-paper-600: #6e6e73;
+  --color-paper-700: #48484a;
+  --color-paper-800: #2c2c2e;
+  --color-paper-900: #1d1d1f;
+  --color-paper-950: #000000;
 
-  /* Status colors stay within the warm family — no saturated rose/emerald/sky */
-  --color-danger-50: #F4E7DD;
-  --color-danger-100: #ECD8C8;
-  --color-danger-200: #D9B8A8;
-  --color-danger-700: #7A3D2A;
-  --color-danger-900: #5C2A1A;
+  /* AI gradient stops */
+  --color-ai-blue: #0a84ff;
+  --color-ai-cyan: #5ac8fa;
+  --color-ai-violet: #bf5af2;
+  --color-ai-pink: #ff375f;
+  --color-ai-orange: #ff9f0a;
 
-  --color-warn-50: #FAF3E0;
-  --color-warn-200: #E8D9B0;
-  --color-warn-700: #7A5A1F;
-  --color-warn-900: #5C3F0E;
+  /* Semantic */
+  --color-ok-50: #e3f7e8;
+  --color-ok-200: #b6e8c4;
+  --color-ok-700: #248a3d;
+  --color-ok-900: #14532d;
 
-  /* Recording indicator — muted brick, not the punchy rose-500 */
-  --color-recording: #B0413E;
+  --color-warn-50: #fff4e0;
+  --color-warn-200: #f5d9a8;
+  --color-warn-700: #8a4b00;
+  --color-warn-900: #6b3a00;
+
+  --color-danger-50: #ffe9e7;
+  --color-danger-100: #ffd9d6;
+  --color-danger-200: #f3b9b4;
+  --color-danger-700: #b3261e;
+  --color-danger-900: #9a1f17;
+
+  /* Recording / stop is plain red — never the gradient */
+  --color-recording: #ff453a;
+
+  /* Translation window (dark default). `.stage-light` overrides below. */
+  --color-stage-bg: #000000;
+  --color-stage-chrome: #0b0b0d;
+  --color-stage-fg: #f5f5f7;
+  --color-stage-dim: #8e8e93;
+  --color-stage-rule: #1c1c1e;
+}
+
+@property --mc-aura-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+:root {
+  --ai-grad: linear-gradient(
+    90deg,
+    var(--color-ai-blue) 0%,
+    var(--color-ai-violet) 38%,
+    var(--color-ai-pink) 68%,
+    var(--color-ai-orange) 100%
+  );
+  --ai-grad-btn: linear-gradient(
+    135deg,
+    var(--color-ai-blue),
+    var(--color-ai-violet) 55%,
+    var(--color-ai-pink)
+  );
+  --ai-conic: conic-gradient(
+    from var(--mc-aura-angle),
+    var(--color-ai-blue),
+    var(--color-ai-violet),
+    var(--color-ai-pink),
+    var(--color-ai-orange),
+    var(--color-ai-cyan),
+    var(--color-ai-blue)
+  );
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Light variant of the translation window, toggled globally from Settings. */
+.stage-light {
+  --color-stage-bg: #ffffff;
+  --color-stage-chrome: #f5f5f7;
+  --color-stage-fg: #1d1d1f;
+  --color-stage-dim: #8e8e93;
+  --color-stage-rule: #e5e5ea;
+}
+
+/* ---- AI gradient utilities ---- */
+.ai-text {
+  background: var(--ai-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.ai-fill {
+  background: var(--ai-grad-btn);
+  color: #fff;
+}
+.ai-bar {
+  background: var(--ai-grad);
+}
+
+/* Recording dot: gradient fill + soft violet pulse ring. */
+.ai-dot {
+  background: var(--ai-grad-btn);
+  box-shadow: 0 0 0 0 rgba(191, 90, 242, 0.5);
+  animation: mc-pulse 1.8s infinite;
+}
+@keyframes mc-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(191, 90, 242, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(191, 90, 242, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(191, 90, 242, 0);
+  }
+}
+
+/* Streaming caret at the end of a partial transcript line. */
+.ai-caret::after {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  vertical-align: -0.15em;
+  margin-left: 3px;
+  border-radius: 2px;
+  background: var(--ai-grad-btn);
+  animation: mc-blink 1.1s steps(2) infinite;
+}
+@keyframes mc-blink {
+  to {
+    opacity: 0;
+  }
+}
+
+/*
+ * Translation-window aura: a 2px rotating gradient ring drawn just inside the
+ * window edge plus a soft inner glow. Driven by data attributes on the host:
+ *   data-aura="off"     → nothing drawn
+ *   data-live="true"    → brighter glow (recording)
+ *   data-paused="true"  → greyscale (offline / translation paused)
+ */
+.aura-host {
+  position: relative;
+  isolation: isolate;
+}
+.aura-host::before,
+.aura-host::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background: var(--ai-conic);
+  animation: mc-spin 16s linear infinite;
+  transition: opacity 0.6s;
+}
+/* crisp 2px ring */
+.aura-host::before {
+  padding: 2px;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  opacity: 0.8;
+}
+/* soft inner glow */
+.aura-host::after {
+  padding: 14px;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  filter: blur(12px);
+  opacity: 0.22;
+}
+.aura-host[data-live="true"]::after {
+  opacity: 0.42;
+}
+.aura-host[data-paused="true"]::before,
+.aura-host[data-paused="true"]::after {
+  filter: grayscale(1);
+  opacity: 0.2;
+}
+.aura-host[data-paused="true"]::after {
+  filter: blur(12px) grayscale(1);
+}
+.aura-host[data-aura="off"]::before,
+.aura-host[data-aura="off"]::after {
+  display: none;
+}
+@keyframes mc-spin {
+  to {
+    --mc-aura-angle: 360deg;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-dot,
+  .ai-caret::after,
+  .aura-host::before,
+  .aura-host::after {
+    animation: none;
+  }
 }

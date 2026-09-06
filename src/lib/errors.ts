@@ -12,7 +12,22 @@ export type FriendlyError = {
   raw: string;
 };
 
+/** Rust returns this prefix from translate / interp while the network probe
+ *  says we're offline (src-tauri/src/netcheck.rs). It's a pause, not a fault:
+ *  callers skip the error card and let the 網路 chip + window banner speak. */
+export const OFFLINE_PREFIX = "offline:";
+export function isOfflineError(raw: unknown): boolean {
+  return String(raw).startsWith(OFFLINE_PREFIX);
+}
+
 const RULES: Array<{ test: RegExp; map: (m: RegExpMatchArray) => Omit<FriendlyError, "raw"> }> = [
+  {
+    test: /^offline:/,
+    map: () => ({
+      primary: "目前沒有網路，翻譯已暫停",
+      secondary: "逐字稿照常進行；網路恢復後新的句子會自動翻譯",
+    }),
+  },
   {
     test: /Anthropic API key not configured/i,
     map: () => ({
