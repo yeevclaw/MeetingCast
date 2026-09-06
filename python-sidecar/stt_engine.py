@@ -470,7 +470,15 @@ async def main():
                         await stt_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                return
+                # Hard exit. A plain `return` lets asyncio.run() wait for the
+                # default executor, i.e. for the prewarm worker threads — and a
+                # mic thread wedged inside CoreAudio (device unplugged mid-open)
+                # never returns, so the process would outlive the `shutdown`
+                # and keep emitting stale prewarm/progress events while Rust
+                # waits to respawn. Nothing here needs graceful teardown.
+                emit({"type": "stopped"})
+                sys.stdout.flush()
+                os._exit(0)
             elif cmd_type == "list_devices":
                 try:
                     devices = list_input_devices()

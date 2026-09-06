@@ -139,6 +139,12 @@ export default function ControlWindow() {
   // real download.
   const [modelCached, setModelCached] = useState(false);
   const [retryingPrewarm, setRetryingPrewarm] = useState(false);
+  // True while restart_sidecar is in flight. Prewarm/ready events arriving in
+  // that window come from the OLD child winding down (its download poller
+  // keeps emitting `progress` until the process dies) and must not touch the
+  // freshly reset checklist — otherwise "spawn" flips to done with the other
+  // rows stuck on pending.
+  const restartingRef = useRef(false);
   const [sessionStartedAt, setSessionStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   // Network reachability of the LLM endpoint (Rust netcheck probe).
@@ -801,6 +807,7 @@ export default function ControlWindow() {
         closedLangsNotifiedRef.current.clear();
       }),
       listen("stt:ready", () => {
+        if (restartingRef.current) return;
         setSidecarReady(true);
         // `ready` only confirms the sidecar's stdin loop is alive — model and
         // mic prewarm tasks are still running in the background at this point
@@ -813,6 +820,7 @@ export default function ControlWindow() {
         setStepStatus((s) => ({ ...s, spawn: "done" }));
       }),
       listen<PrewarmPayload>("stt:prewarm", (e) => {
+        if (restartingRef.current) return;
         const { step, state, message, downloaded_bytes, total_bytes, cached } =
           e.payload;
         const id = step as StepId;
@@ -1010,6 +1018,7 @@ export default function ControlWindow() {
     dlSpeedEmaRef.current = null;
     dlLastIncreaseRef.current = null;
     setSidecarReady(false);
+    restartingRef.current = true;
     try {
       await invoke("restart_sidecar");
     } catch (e) {
@@ -1019,6 +1028,7 @@ export default function ControlWindow() {
       setStepStatus((s) => ({ ...s, spawn: "error" }));
       setStepError((m) => ({ ...m, spawn: String(e) }));
     } finally {
+      restartingRef.current = false;
       setRetryingPrewarm(false);
     }
   }, []);

@@ -110,6 +110,11 @@ pub enum SidecarEvent {
 
 pub struct SidecarManager {
     stdin: Option<ChildStdin>,
+    /// OS pid of the live child, so `restart_sidecar` can SIGKILL a process
+    /// that ignores `shutdown` (e.g. a prewarm thread wedged inside CoreAudio
+    /// after the mic was unplugged — Python's asyncio.run waits for executor
+    /// threads and never exits).
+    pid: Option<u32>,
     last_start: Option<Value>,
     restart_attempts: u32,
     starting: bool,
@@ -141,6 +146,7 @@ impl SidecarManager {
     pub fn new() -> Self {
         Self {
             stdin: None,
+            pid: None,
             last_start: None,
             restart_attempts: 0,
             starting: false,
@@ -307,6 +313,7 @@ async fn spawn_inner_body(
     {
         let mut m = mgr.lock().await;
         m.stdin = Some(stdin);
+        m.pid = child.id();
         m.starting = false;
         m.intentional_stop = false;
         m.stderr_tail.clear();
@@ -422,6 +429,7 @@ async fn spawn_inner_body(
         let (intentional, attempts, last_start, tail) = {
             let mut m = mgr_w.lock().await;
             m.stdin = None;
+            m.pid = None;
             m.starting = false;
             m.ready = false;
             // Crash teardown: drop the idle watcher so it doesn't keep
@@ -529,7 +537,15 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
-        SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes, cached } => app.emit(
+        SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes, cached } => {
+            if state == "error" {
+                errors::record(
+                    "sidecar_prewarm_error",
+                    message.as_deref().unwrap_or("unknown"),
+                    Some(serde_json::json!({ "step": step })),
+                );
+            }
+            app.emit(
             "stt:prewarm",
             serde_json::json!({
                 "step": step,
@@ -539,7 +555,8 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
                 "total_bytes": total_bytes,
                 "cached": cached,
             }),
-        ),
+        )
+        }
         SidecarEvent::Warning { message } => app.emit("stt:warning", message),
         SidecarEvent::Error { message } => {
             errors::record("sidecar_protocol_error", message, None);
@@ -743,23 +760,51 @@ pub async fn restart_sidecar(
     state: tauri::State<'_, SharedManager>,
     config: tauri::State<'_, SharedConfig>,
 ) -> Result<(), String> {
-    {
+    let pid = {
         let mut m = state.lock().await;
         // Reset restart_attempts so the watchdog doesn't refuse the new spawn
         // on the basis of stale crash counts from before the user hit retry.
         m.restart_attempts = 0;
         m.request_shutdown().await;
+        m.pid
+    };
+    // Wait for the child to exit cleanly (the watchdog clears `stdin` once it
+    // has reaped it). A graceful exit normally takes well under a second, but
+    // a prewarm thread stuck in CoreAudio can hold the process open forever,
+    // so after a grace period we SIGKILL it. Never fall through to `prewarm`
+    // while the old child is alive: `prewarm` would see `stdin.is_some()`,
+    // do nothing, and the UI would wait for a spawn that never happens.
+    if !wait_for_exit(state.inner(), Duration::from_secs(3)).await {
+        if let Some(pid) = pid {
+            errors::record(
+                "sidecar_restart_force_kill",
+                &format!("sidecar pid {pid} ignored shutdown for 3s; sending SIGKILL"),
+                None,
+            );
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+        if !wait_for_exit(state.inner(), Duration::from_secs(3)).await {
+            return Err("辨識引擎沒有結束，無法重新啟動；請關閉並重新開啟 App".into());
+        }
     }
-    // Wait briefly for the child to exit cleanly. Polling stdin == None is
-    // the cheapest signal that the watchdog has reaped it. Cap at 1 s — if
-    // the child is wedged we'd rather force-spawn anyway than block forever.
-    for _ in 0..20 {
+    prewarm(app, state.inner().clone(), config.inner().clone()).await
+}
+
+/// Poll until the watchdog has reaped the child (`stdin == None`) or the
+/// deadline passes. Returns true when the child is gone.
+async fn wait_for_exit(state: &SharedManager, max: Duration) -> bool {
+    let deadline = Instant::now() + max;
+    loop {
         if state.lock().await.stdin.is_none() {
-            break;
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    prewarm(app, state.inner().clone(), config.inner().clone()).await
 }
 
 /// Whether the sidecar has emitted its initial `ready` event and can accept
