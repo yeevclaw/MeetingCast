@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- MeetingCast palette: stage black + AI gradient (App.css ai-*) -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c2c2e"/>
+      <stop offset="1" stop-color="#0b0b0d"/>
+    </linearGradient>
+    <linearGradient id="ai" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"    stop-color="#0a84ff"/>
+      <stop offset="0.38" stop-color="#bf5af2"/>
+      <stop offset="0.68" stop-color="#ff375f"/>
+      <stop offset="1"    stop-color="#ff9f0a"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="28"/>
+    </filter>
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="186" ry="186"/>
+    </clipPath>
+  </defs>
+
+  <!-- squircle body -->
+  <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="url(#bg)"/>
+  <!-- 2px-ish gradient rim like the translation-window aura -->
+  <rect x="106" y="106" width="812" height="812" rx="180" ry="180" fill="none" stroke="url(#ai)" stroke-width="10" opacity="0.9"/>
+
+  <g clip-path="url(#squircle)">
+    <!-- soft glow behind the bubble -->
+    <path d="M292 292 h440 a92 92 0 0 1 92 92 v236 a92 92 0 0 1 -92 92 h-268 l-124 104 v-104 h-48 a92 92 0 0 1 -92 -92 v-236 a92 92 0 0 1 92 -92 z"
+          fill="url(#ai)" opacity="0.45" filter="url(#glow)"/>
+    <!-- speech bubble, gradient fill -->
+    <path d="M292 292 h440 a92 92 0 0 1 92 92 v236 a92 92 0 0 1 -92 92 h-268 l-124 104 v-104 h-48 a92 92 0 0 1 -92 -92 v-236 a92 92 0 0 1 92 -92 z"
+          fill="url(#ai)"/>
+    <!-- live caption lines -->
+    <rect x="352" y="380" width="320" height="52" rx="26" fill="#ffffff"/>
+    <rect x="352" y="466" width="232" height="52" rx="26" fill="#ffffff" opacity="0.92"/>
+    <rect x="352" y="552" width="144" height="52" rx="26" fill="#ffffff" opacity="0.7"/>
+    <!-- streaming caret dot at the end of the last line -->
+    <circle cx="536" cy="578" r="26" fill="#ffffff" opacity="0.7"/>
+  </g>
+</svg>
