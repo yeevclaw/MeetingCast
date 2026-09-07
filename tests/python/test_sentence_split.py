@@ -255,6 +255,33 @@ class TestSplitSegments(unittest.TestCase):
         self.assertEqual(segs, [("我們的產品叫做 MeetingCast主", BOUNDARY_FORCED)])
         self.assertEqual(tail, "打即時")
 
+    def test_forced_cut_never_splits_a_number_or_spaced_ascii_phrase(self):
+        # Live failure 2026-09-07: "而且也领先于 Claude 5" is exactly 15 chars
+        # and the next char is the decimal point of "5.1". The old rule only
+        # deferred on alnum chars, so the forced cut landed at "Claude 5."
+        # and the interpreter emitted "ahead of Claude 5." — the ".1" could
+        # never be appended. Numeric punctuation after a digit and a space
+        # between two ASCII tokens now keep the run open.
+        segs, tail = split_segments("而且也领先于 Claude 5.1。然后这一项就是商业工作流。")
+        self.assertEqual(
+            segs,
+            [
+                ("而且也领先于 Claude 5.1。", BOUNDARY_SENTENCE),
+                ("然后这一项就是商业工作流。", BOUNDARY_SENTENCE),
+            ],
+        )
+        self.assertEqual(tail, "")
+        # Still open while the number is being spoken: nothing emitted.
+        self.assertEqual(split_segments("而且也领先于 Claude 5."), ([], "而且也领先于 Claude 5."))
+        # A space between two ASCII tokens is part of the run.
+        segs, tail = split_segments("我們用的模型是 GPT 5.6 Terra，效果不錯")
+        self.assertEqual(segs, [("我們用的模型是 GPT 5.6 Terra，", BOUNDARY_CLAUSE)])
+        self.assertEqual(tail, "效果不錯")
+        # A space followed by CJK ends the run: the forced cut lands right
+        # after that CJK char (same as the no-space case above).
+        segs, tail = split_segments("我們的產品叫做 MeetingCast 主打即時")
+        self.assertEqual(segs, [("我們的產品叫做 MeetingCast 主", BOUNDARY_FORCED)])
+
     def test_numeric_punctuation_is_not_a_boundary(self):
         self.assertEqual(split_segments("溫度是3.5度左右"), ([], "溫度是3.5度左右"))
         self.assertEqual(split_segments("預算是1,000萬元"), ([], "預算是1,000萬元"))
@@ -333,6 +360,26 @@ class TestClosingBoundary(unittest.TestCase):
 
 
 class TestSplitterBoundaries(unittest.TestCase):
+    def test_char_by_char_deltas_keep_version_number_whole(self):
+        # Same live case as above but fed one character per delta, the way
+        # gpt-live-transcribe streams it: the first early final must be the
+        # whole first sentence, never "…Claude 5." (forced).
+        s = _fine()
+        text = "而且也领先于 Claude 5.1。然后这一项就是商业工作流。"
+        finals = []
+        for ch in text:
+            finals += [(t.text, t.boundary) for t in s.on_delta("i1", ch) if t.is_final]
+        done = s.on_completed("i1", text)
+        if done is not None:
+            finals.append((done.text, done.boundary))
+        self.assertEqual(
+            finals,
+            [
+                ("而且也领先于 Claude 5.1。", BOUNDARY_SENTENCE),
+                ("然后这一项就是商业工作流。", BOUNDARY_SENTENCE),
+            ],
+        )
+
     def test_clause_final_carries_clause_boundary_and_tail_interim(self):
         s = _fine()
         out = s.on_delta("i1", "今天我們討論預算，然後")

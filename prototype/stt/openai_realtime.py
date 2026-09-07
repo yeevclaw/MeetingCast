@@ -153,10 +153,10 @@ def split_segments(
 
         if i - start + 1 >= max_chars:
             # Never force-cut inside a Latin/digit run embedded in CJK text
-            # ("MeetingCast", "Q3", "GPU"): the next char may still be part
-            # of the word and hasn't arrived yet. Wait for the run to end —
-            # a CJK char or punctuation always follows soon.
-            if family == "cjk" and ch.isascii() and ch.isalnum():
+            # ("MeetingCast", "Q3", "Claude 5.1"): the next char may still be
+            # part of the token and hasn't arrived yet. Wait for the run to
+            # end — a CJK char or punctuation always follows soon.
+            if family == "cjk" and _continues_ascii_run(text, i):
                 i += 1
                 continue
             if family == "spaced":
@@ -172,6 +172,26 @@ def split_segments(
             start = i + 1
         i += 1
     return segments, text[start:]
+
+
+def _continues_ascii_run(text: str, i: int) -> bool:
+    """True when `text[i]` is still part of an ASCII token run inside CJK
+    text, so a forced cut here would split a word or a number. Covers the
+    token itself ("MeetingCast", "Q3"), numeric punctuation after a digit
+    ("5.1", "1,000", "3:30" — the number is not over) and a single space
+    between two ASCII tokens ("Claude 5", "GPT 5.6 Terra"). Seen live
+    2026-09-07: cutting at "Claude 5." made the interpreter emit
+    "ahead of Claude 5." and the ".1" could never be appended.
+    """
+    ch = text[i]
+    if ch.isascii() and ch.isalnum():
+        return True
+    prev = text[i - 1] if i > 0 else ""
+    if ch in _NUMERIC_GUARDED and prev.isdigit():
+        return True
+    if ch == " " and prev.isascii() and prev.isalnum():
+        return True
+    return False
 
 
 def _closing_boundary(text: str) -> str:
