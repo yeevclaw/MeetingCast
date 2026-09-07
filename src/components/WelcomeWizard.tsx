@@ -104,7 +104,7 @@ export default function WelcomeWizard({
 }) {
   const [step, setStep] = useState<StepIndex>(0);
   const [provider, setProvider] = useState<"anthropic" | "openai">(
-    initialConfig.api.provider === "openai" ? "openai" : "anthropic",
+    initialConfig.api.provider === "anthropic" ? "anthropic" : "openai",
   );
   // Both keys keep their own state so toggling the provider never loses an
   // already-typed value; every save writes both back.
@@ -178,6 +178,7 @@ export default function WelcomeWizard({
         openai_api_key: openai.trim(),
       },
       language: { source, target_slots: [slots[0], slots[1]] },
+      stt: { ...initialConfig.stt, backend },
       onboarding_complete: complete,
     };
   }
@@ -372,14 +373,14 @@ export default function WelcomeWizard({
               <Block h="多久">
                 <p>
                   全部約 <span className="tabular-nums">{formatMinutes(remainingMinutes)}</span>
-                  ，其中大部分是等模型下載。每一步都可以略過，之後在「設定」補。
+                  ，其中大部分是等模型下載。每一步都可以略過，之後在主控台或「設定」補。
                 </p>
               </Block>
             </StepShell>
           )}
 
           {step === 1 && (
-            <StepShell title="1 · 選擇辨識方式" subtitle="決定聲音在哪裡變成文字。之後可在設定切換。">
+            <StepShell title="1 · 選擇辨識方式" subtitle="決定聲音在哪裡變成文字。之後可在主控台右欄切換。">
               <Block h="在做什麼">
                 <div className="grid grid-cols-2 gap-3">
                   <ChoiceCard
@@ -473,7 +474,7 @@ export default function WelcomeWizard({
               <Block h="可能問題">
                 <ul className="list-disc space-y-1 pl-4">
                   <li>按到「不允許」 → 打開系統設定手動勾選 MeetingCast，回來按「重新檢查」</li>
-                  <li>要用藍牙耳機或外接麥克風 → 先接好，之後在「設定 → 會議 → 麥克風」選它</li>
+                  <li>要用藍牙耳機或外接麥克風 → 先接好，之後在主控台右欄「本場設定 → 麥克風」選它</li>
                   <li>授權後仍顯示未授權 → 重新啟動 App（macOS 限制，只需一次）</li>
                 </ul>
               </Block>
@@ -489,8 +490,8 @@ export default function WelcomeWizard({
                     <div className="flex gap-2">
                       {(
                         [
-                          { id: "anthropic", label: "Anthropic（Claude）" },
                           { id: "openai", label: "OpenAI（GPT）" },
+                          { id: "anthropic", label: "Anthropic（Claude）" },
                         ] as const
                       ).map((p) => (
                         <button
@@ -512,8 +513,8 @@ export default function WelcomeWizard({
                     </div>
                     <p className="mt-1 text-xs text-paper-500">
                       {provider === "openai"
-                        ? "翻譯、總結與雲端辨識共用同一把 OpenAI key"
-                        : "預設；翻譯與總結呼叫 Claude"}
+                        ? "預設；翻譯、總結與雲端辨識共用同一把 OpenAI key"
+                        : "翻譯與總結呼叫 Claude；若選雲端辨識仍需另一把 OpenAI key"}
                     </p>
                   </div>
 

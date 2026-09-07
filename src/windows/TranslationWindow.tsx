@@ -311,7 +311,7 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
               此視窗未啟用
             </p>
             <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center opacity-70">
-              可在「設定 → 會議」選擇第二個翻譯語言
+              可在主控台右欄「本場設定」選擇第二個翻譯語言
             </p>
           </div>
         ) : rows.length === 0 ? (

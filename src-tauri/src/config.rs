@@ -11,9 +11,10 @@ use crate::languages;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiConfig {
-    /// LLM provider for translation + summary: "anthropic" (default) or
-    /// "openai". Any other value degrades to Anthropic at the call site
-    /// (`Provider::from_config`), so no sanitize pass is needed here.
+    /// LLM provider for translation + summary: "openai" (default since
+    /// 0.1.29) or "anthropic". Any value other than exactly "openai" is
+    /// treated as Anthropic at the call site (`Provider::from_config`), so
+    /// configs from before the switch keep working unchanged.
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
@@ -37,7 +38,7 @@ pub struct ApiConfig {
 }
 
 fn default_provider() -> String {
-    "anthropic".into()
+    "openai".into()
 }
 
 fn default_model() -> String {
@@ -176,13 +177,23 @@ impl Default for SummaryConfig {
 /// sooner, higher trades latency for word accuracy. Measured 2026-09-02 on a
 /// 90s clip: `minimal` ≈ 1.1s delta lag vs `low` ≈ 2.5s, same accuracy —
 /// hence the default. Ignored by the local mlx-whisper backend.
+///
+/// `backend` is the STT engine the console starts with: "local" (mlx-whisper,
+/// default) or "openai" (gpt-live-transcribe). Persisted since 0.1.29 so the
+/// choice survives relaunch; anything else is normalised to "local" on save.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct SttConfig {
+    #[serde(default = "default_stt_backend")]
+    pub backend: String,
     #[serde(default = "default_openai_delay")]
     pub openai_delay: String,
 }
 
 pub const OPENAI_DELAY_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
+fn default_stt_backend() -> String {
+    "local".into()
+}
 
 fn default_openai_delay() -> String {
     "minimal".into()
@@ -190,7 +201,10 @@ fn default_openai_delay() -> String {
 
 impl Default for SttConfig {
     fn default() -> Self {
-        Self { openai_delay: default_openai_delay() }
+        Self {
+            backend: default_stt_backend(),
+            openai_delay: default_openai_delay(),
+        }
     }
 }
 
@@ -636,6 +650,9 @@ impl Config {
         if !OPENAI_DELAY_LEVELS.contains(&self.stt.openai_delay.as_str()) {
             self.stt.openai_delay = default_openai_delay();
         }
+        if self.stt.backend != "openai" {
+            self.stt.backend = default_stt_backend();
+        }
         if self.interp.mode != INTERP_MODE_SENTENCE && self.interp.mode != INTERP_MODE_INCREMENTAL {
             self.interp.mode = default_interp_mode();
         }
@@ -985,10 +1002,11 @@ mod tests {
 
     #[test]
     fn provider_defaults_when_absent_and_round_trips() {
-        // Old configs (pre-provider) must parse as Anthropic with the OpenAI
-        // model defaults filled in.
+        // Configs without an explicit provider get the default (OpenAI since
+        // 0.1.29) with both providers' model defaults filled in.
         let old: Config = toml::from_str("[api]\nmodel = \"claude-haiku-4-5\"\n").unwrap();
-        assert_eq!(old.api.provider, "anthropic");
+        assert_eq!(old.api.provider, "openai");
+        assert_eq!(old.api.model, "claude-haiku-4-5");
         assert_eq!(old.api.openai_model, "gpt-5.6-luna");
         assert_eq!(old.api.openai_summary_model, "gpt-5.6-sol");
 
@@ -1160,23 +1178,26 @@ mod tests {
     #[test]
     fn stt_and_interp_default_when_absent_and_sanitize_off_list_values() {
         let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.stt.backend, "local");
         assert_eq!(cfg.stt.openai_delay, "minimal");
         assert_eq!(cfg.interp.mode, "sentence");
         assert!(!cfg.incremental_enabled());
 
         let mut cfg: Config = toml::from_str(
-            "[stt]\nopenai_delay = \"turbo\"\n[interp]\nmode = \"magic\"\n",
+            "[stt]\nbackend = \"deepgram\"\nopenai_delay = \"turbo\"\n[interp]\nmode = \"magic\"\n",
         )
         .unwrap();
         cfg.sanitize_language();
+        assert_eq!(cfg.stt.backend, "local");
         assert_eq!(cfg.stt.openai_delay, "minimal");
         assert_eq!(cfg.interp.mode, "sentence");
 
         let mut cfg: Config = toml::from_str(
-            "[stt]\nopenai_delay = \"high\"\n[interp]\nmode = \"incremental\"\n",
+            "[stt]\nbackend = \"openai\"\nopenai_delay = \"high\"\n[interp]\nmode = \"incremental\"\n",
         )
         .unwrap();
         cfg.sanitize_language();
+        assert_eq!(cfg.stt.backend, "openai");
         assert_eq!(cfg.stt.openai_delay, "high");
         assert!(cfg.incremental_enabled());
         let out = toml::to_string(&cfg).unwrap();

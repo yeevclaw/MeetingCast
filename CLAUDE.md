@@ -10,13 +10,13 @@
 - **雙 backend**：`MLXWhisperSTT`（local 預設）+ `OpenAILiveTranscribeSTT`（`gpt-live-transcribe`，openai cloud），同一 `Transcript` stream 介面，UI 可切。雲端模式用 `zh-tw`／ISO 語言提示，並注入 active glossary 的 context prompt + canonical keywords。Deepgram backend 已於 0.1.20 後移除
 - **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source 可選 zh/en/ja/vi，target 可選 zh/en/ja/vi/km；`source_capable: false` 標記 target-only 語言（km），script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
 - **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
-- **翻譯在 Rust 不在 sidecar**：Anthropic API 由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT
+- **翻譯在 Rust 不在 sidecar**：LLM API（OpenAI 預設／Anthropic 可選，`[api] provider`）由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT。0.1.29 起新安裝預設 `provider = "openai"`（gpt-5.6-luna 翻譯、gpt-5.6-sol 總結），Anthropic 走 Haiku 4.5 / Sonnet 4.6；舊 config 沒寫 provider 的也會變 openai，但既有使用者檔案裡都已有明確值
 - **兩種翻譯模式**：`[interp] mode = "sentence"`（預設）由前端 ControlWindow 逐句 `invoke("translate")`；`"incremental"` 由 Rust `interp.rs` 接手：sidecar 送 clause 級片段（`transcript.boundary`），引擎把片段拼成句群、每語言一條序列化隊列、譯文只追加（Anthropic 用 assistant prefill）、句群關閉時自己寫 session。事件名沿用 `translation:chunk/done:{lang}`，id = 句群 id（`transcript.utterance_id`）。設計與基線數字見 `docs/PLAN_INCREMENTAL_INTERP.md`
 - **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start`（含 `stt: {delay, segmentation}`）/ `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript`（final 帶 `boundary`: clause/forced/sentence/pause）/ `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
 - **dev sidecar binary 陷阱**：`pnpm tauri dev` 會把 `binaries/stt_engine-<triple>` copy 到 `target/debug/`，sidecar.rs 優先吃這個 stale binary。測 Python 改動前先 `mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`
-- **色票統一**：`App.css` 的 `@theme paper-*`（2026-09 起為冷灰中性階，名稱沿用）/ `ai-*`（藍→紫→粉→橘漸層，只用在品牌字、開始鍵與錄音點、譻文視窗光暈、進度四處）/ `ok-* / warn-* / danger-* / recording` / `stage-*`（譯文視窗，`.stage-light` 切淺色），元件不寫 hex。utility：`.ai-text .ai-fill .ai-bar .ai-dot .ai-caret .aura-host`
-- **UI 結構（2026-09 改版）**：主控台 960×640 = 狀態列 chip（可點開 popover）＋逐字稿優先＋右欄「本場設定」卡；兩個譯文視窗純黑＋光暈、字級隨高度自動；設定三分頁（會議／帳號／進階）；onboarding 六步。設計與實作對照見 `docs/UX_REDESIGN_2026-09.md`
+- **色票統一**：`App.css` 的 `@theme paper-*`（2026-09 起為冷灰中性階，名稱沿用）/ `ai-*`（藍→紫→粉→橘漸層，只用在品牌字、開始鍵與錄音點、譯文視窗光暈、進度四處）/ `ok-* / warn-* / danger-* / recording` / `stage-*`（譯文視窗，`.stage-light` 切淺色），元件不寫 hex。utility：`.ai-text .ai-fill .ai-bar .ai-dot .ai-caret .aura-host`
+- **UI 結構（2026-09 改版）**：主控台 960×640 = 狀態列 chip（可點開 popover）＋逐字稿優先＋右欄「本場設定」卡；兩個譯文視窗純黑＋光暈、字級隨高度自動；右欄「本場設定」卡即每場設定的編輯器（來源／譯文一二／辨識引擎／麥克風直接改，即存 config）；設定 modal 只剩兩分頁（帳號／進階，0.1.29 起拿掉重複的「會議」分頁，辨識延遲與同步口譯移到進階）；onboarding 六步。設計與實作對照見 `docs/UX_REDESIGN_2026-09.md`
 - **網路探測在 Rust**：`netcheck.rs` 每 20 秒 TCP connect 供應商 API host，發 `network:status`；離線時 `translate` / `interp` 立即回 `offline:` 前綴錯誤，前端視為「暫停」不報錯
 
 ## 常用指令
@@ -68,7 +68,7 @@ cd src-tauri && cargo test
 - **Plan before action**：新功能 / 重構先提計畫等使用者確認
 - **One task at a time**：做完驗證再進下一步
 - **延遲第一優先**：架構決策以「降低使用者感知延遲」為標準
-- **STT 預設 local，openai cloud 為使用者選項**：成本與隱私考量
+- **STT 預設 local，openai cloud 為使用者選項**：成本與隱私考量。選擇存 `[stt] backend`（0.1.29 起持久化，之前每次啟動都回 local）
 
 ## 技術棧
 
@@ -79,7 +79,7 @@ cd src-tauri && cargo test
 | STT (local) | mlx-whisper（pin `<0.21`，Sequoia 相容） |
 | STT (cloud) | OpenAI `gpt-live-transcribe` |
 | VAD | silero-vad |
-| 翻譯 / 總結 | Anthropic Claude Haiku 4.5 streaming（總結用 Sonnet 4.6） |
+| 翻譯 / 總結 | OpenAI gpt-5.6-luna streaming（總結 gpt-5.6-sol）預設；可切 Anthropic Haiku 4.5 / Sonnet 4.6 |
 | Python ↔ Rust | Tauri sidecar + line-delimited JSON over stdio |
 | 全域 hotkey | `tauri-plugin-global-shortcut`（⌘+Shift+M） |
 
@@ -116,7 +116,7 @@ macOS 13+（Apple Silicon 強烈推薦） / Python 3.13+ / Node.js 20+ / Rust 1.
 
 ```toml
 [api]                    # ✅ Settings UI 可改
-provider = "anthropic"   # 翻譯+總結的 LLM："anthropic"（預設）| "openai"
+provider = "openai"      # 翻譯+總結的 LLM："openai"（預設，0.1.29 起）| "anthropic"
 anthropic_api_key = "sk-ant-..."
 openai_api_key = ""      # openai 翻譯引擎或 openai 辨識 backend 才需要
 model = "claude-haiku-4-5"
@@ -124,10 +124,10 @@ summary_model = "claude-sonnet-4-6"
 openai_model = "gpt-5.6-luna"           # provider = openai 時的翻譯模型
 openai_summary_model = "gpt-5.6-sol"    # provider = openai 時的總結模型
 
-[audio]                  # ✅ Settings UI 可改
+[audio]                  # ✅ 主控台右欄「本場設定」卡可改
 input_device = ""        # 空 = 系統預設
 
-[language]               # ✅ Settings UI 可改（語言設定區）
+[language]               # ✅ 主控台右欄「本場設定」卡可改
 source = "zh"            # 源語言，zh/en/ja/vi 任選（km 為 target-only 不可當源）
 target_slots = ["en", "vi"]  # 恆長度 2，各槽位一個目標語言（zh/en/ja/vi/km）；"" = 關閉該槽位
 
@@ -141,10 +141,11 @@ vi = "Tử Vi Đẩu Số"
 
 active_glossary = "預設"
 
-[stt]                    # ✅ Settings UI 可改（辨識引擎為 openai 時顯示）
+[stt]                    # ✅ backend 在主控台右欄改；openai_delay 在設定 → 進階（雲端時顯示）
+backend = "local"        # 辨識引擎："local"（mlx-whisper，預設）| "openai"（gpt-live-transcribe）
 openai_delay = "minimal" # gpt-live-transcribe delay 等級：minimal/low/medium/high/xhigh；minimal 比 low 快約 1.4s
 
-[interp]                 # ✅ Settings UI 可改（開啟時跳費用確認框，翻譯費用約 2–3 倍）
+[interp]                 # ✅ 設定 → 進階可改（開啟時跳費用確認框，翻譯費用約 2–3 倍）
 mode = "sentence"        # "sentence"（預設，逐句翻）| "incremental"（同步口譯引擎 src-tauri/src/interp.rs）
 
 [ui]                     # ✅ Settings UI 可改（進階分頁）

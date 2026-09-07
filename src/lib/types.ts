@@ -60,8 +60,9 @@ export type GlossaryBook = {
 
 export type Config = {
   api: {
-    // LLM provider for translation + summary: "anthropic" (default) or
-    // "openai". Any other value degrades to Anthropic backend-side.
+    // LLM provider for translation + summary: "openai" (default) or
+    // "anthropic". Any value other than "openai" is treated as Anthropic
+    // backend-side.
     provider: string;
     anthropic_api_key: string;
     openai_api_key: string;
@@ -90,8 +91,10 @@ export type Config = {
     auto_template: string;
     auto_targets: string[];
   };
-  // gpt-live-transcribe delay level: minimal | low | medium | high | xhigh.
   stt: {
+    // STT engine the console starts with: "local" (mlx-whisper) | "openai".
+    backend: string;
+    // gpt-live-transcribe delay level: minimal | low | medium | high | xhigh.
     openai_delay: string;
   };
   // "sentence" (default, per-utterance translate) | "incremental" (the

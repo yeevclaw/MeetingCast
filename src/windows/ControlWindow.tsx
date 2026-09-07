@@ -10,11 +10,12 @@ import PrewarmChecklist, {
   type StepId,
   type StepStatus,
 } from "@/components/PrewarmChecklist";
+import SessionSetupCard from "@/components/SessionSetupCard";
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
-import { estimateHourlyUsd, formatUsd } from "@/lib/cost";
+import { estimateHourlyUsd } from "@/lib/cost";
 import { friendly, isOfflineError } from "@/lib/errors";
-import { LANGS, nativeName, zhName } from "@/lib/languages";
+import { LANGS, zhName } from "@/lib/languages";
 import type {
   ChunkPayload,
   Config,
@@ -43,7 +44,7 @@ type PrewarmPayload = {
   cached?: boolean | null;
 };
 
-type SettingsTab = "meeting" | "account" | "advanced";
+type SettingsTab = "account" | "advanced";
 type ChipId = "rec" | "mic" | "stt" | "tr" | "net" | "lag";
 type ChipTone = "neutral" | "ok" | "warn" | "bad";
 
@@ -111,7 +112,7 @@ export default function ControlWindow() {
   const latestTrIdRef = useRef<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("meeting");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("account");
   const [showHistory, setShowHistory] = useState(false);
   const [showGlossary, setShowGlossary] = useState(false);
   const [pendingGlossaryTerm, setPendingGlossaryTerm] = useState<string | null>(null);
@@ -198,6 +199,10 @@ export default function ControlWindow() {
       const slots = cfg.language?.target_slots ?? ["en", "vi"];
       langCfgRef.current = { source, slots: [slots[0] ?? "", slots[1] ?? ""] };
       interpModeRef.current = cfg.interp?.mode ?? "sentence";
+      // STT engine + mic device are persisted in config since 0.1.29 and
+      // edited from the 本場設定 card; mirror them into console state.
+      setBackend(cfg.stt?.backend === "openai" ? "openai" : "local");
+      setSelectedDevice(cfg.audio?.input_device ?? "");
       setSourceLang(source);
       setTargets(enabledTargets());
       setCfgSnap(cfg);
@@ -483,7 +488,7 @@ export default function ControlWindow() {
 
   const startInFlightRef = useRef(false);
 
-  const openSettings = useCallback((tab: SettingsTab = "meeting") => {
+  const openSettings = useCallback((tab: SettingsTab = "account") => {
     setSettingsTab(tab);
     setShowSettings(true);
     setOpenChip(null);
@@ -516,8 +521,7 @@ export default function ControlWindow() {
         return;
       }
       if (backendRef.current === "openai" && !onlineRef.current) {
-        showToast("error", "目前沒有網路，雲端辨識無法使用；請改用本機辨識", 6000);
-        openSettings("meeting");
+        showToast("error", "目前沒有網路，雲端辨識無法使用；請在右欄改用本機辨識", 6000);
         return;
       }
       // Snapshot the freshest language selection right before recording so
@@ -1131,7 +1135,7 @@ export default function ControlWindow() {
           <PopTitle>錄音狀態</PopTitle>
           <PopText>
             {running
-              ? `已錄 ${formatElapsed(elapsed)}。逐字稿與譻文會存到這場會議，停止後可在「歷史會議」查看。`
+              ? `已錄 ${formatElapsed(elapsed)}。逐字稿與譯文會存到這場會議，停止後可在「歷史會議」查看。`
               : "按下方「開始」或快捷鍵 ⌘ ⇧ M 開始錄音。"}
           </PopText>
           {activeSessionId && <PopMeta>場次 {activeSessionId}</PopMeta>}
@@ -1167,9 +1171,7 @@ export default function ControlWindow() {
                 {selectedDevice ? `使用「${selectedDevice}」。` : "使用系統預設輸入。"}
                 {running ? "錄音中音量條暫停顯示，避免與辨識引擎搶麥克風。" : "閒置時音量條會隨聲音跳動，可先確認收音。"}
               </PopText>
-              <PopActions>
-                <PopButton onClick={() => openSettings("meeting")}>變更裝置…</PopButton>
-              </PopActions>
+              <PopMeta>要換裝置，用右欄「本場設定」的麥克風選單。</PopMeta>
             </>
           )}
         </Chip>
@@ -1197,16 +1199,13 @@ export default function ControlWindow() {
                 {retryingPrewarm ? "重新啟動中…" : hasPrewarmError ? "重試" : "重新啟動引擎"}
               </PopButton>
             )}
-            <PopButton onClick={() => openSettings("meeting")} disabled={running}>
-              變更…
-            </PopButton>
           </PopActions>
         </Chip>
 
         <Chip id="tr" open={openChip} setOpen={setOpenChip} tone={trTone} label="翻譯" value={trValue}>
           <PopTitle>翻譯</PopTitle>
           {targets.length === 0 ? (
-            <PopText>尚未選擇譯文語言。到「會議設定」選一或兩個語言，各自顯示在一個譯文視窗。</PopText>
+            <PopText>尚未選擇譯文語言。在右欄「本場設定」選一或兩個語言，各自顯示在一個譯文視窗。</PopText>
           ) : (
             <PopText>
               {targets.map(zhName).join("、")}
@@ -1221,9 +1220,6 @@ export default function ControlWindow() {
           <PopActions>
             <PopButton primary onClick={openTranslationWindows} disabled={targets.length === 0}>
               開啟譯文視窗
-            </PopButton>
-            <PopButton onClick={() => openSettings("meeting")} disabled={running}>
-              變更…
             </PopButton>
           </PopActions>
         </Chip>
@@ -1242,7 +1238,7 @@ export default function ControlWindow() {
               ? "可連到翻譯服務。每 20 秒檢查一次。"
               : backend === "openai"
                 ? "連不到翻譯服務。雲端辨識與翻譯都無法使用；請切到本機辨識，至少保留逐字稿。"
-                : "連不到翻譻服務。本機辨識照常，翻譯暫停；恢復後自動繼續。每 5 秒重試。"}
+                : "連不到翻譯服務。本機辨識照常，翻譯暫停；恢復後自動繼續。每 5 秒重試。"}
           </PopText>
           <PopActions>
             <PopButton
@@ -1281,7 +1277,7 @@ export default function ControlWindow() {
       </div>
 
       {/* ---------- Body ---------- */}
-      <div className="grid min-h-0 grid-cols-[1fr_300px]">
+      <div className="grid min-h-0 grid-cols-[1fr_320px]">
         {/* Transcript */}
         <section className="flex min-h-0 flex-col border-r border-paper-200">
           {error && !isOfflineError(error) && (() => {
@@ -1401,57 +1397,18 @@ export default function ControlWindow() {
 
         {/* Side column */}
         <aside className="grid min-h-0 grid-rows-[auto_1fr]">
-          <div className="border-b border-paper-200 bg-white px-[18px] py-4">
-            <h3 className="mb-2.5 text-[11px] font-medium uppercase tracking-[0.12em] text-paper-600">
-              本場設定
-            </h3>
-            <dl className="grid grid-cols-[52px_1fr] gap-x-2.5 gap-y-1.5 text-[13px]">
-              <dt className="text-paper-500">來源</dt>
-              <dd className="flex items-center gap-1.5 text-paper-900">
-                {zhName(sourceLang)}
-                <EditLink onClick={() => openSettings("meeting")} disabled={running} />
-              </dd>
-              <dt className="text-paper-500">譯文</dt>
-              <dd className="flex items-center gap-1.5 text-paper-900">
-                {targets.length ? targets.map(nativeName).join(" · ") : "未設定"}
-                <EditLink onClick={() => openSettings("meeting")} disabled={running} />
-              </dd>
-              <dt className="text-paper-500">引擎</dt>
-              <dd className="flex items-center gap-1.5 text-paper-900">
-                {backend === "openai" ? "雲端（OpenAI）" : "本機（離線可用）"}
-                <EditLink onClick={() => openSettings("meeting")} disabled={running} />
-              </dd>
-              <dt className="text-paper-500">麥克風</dt>
-              <dd className="truncate text-paper-900" title={micValue}>
-                {micValue}
-              </dd>
-              <dt className="text-paper-500">估算</dt>
-              <dd
-                className="font-mono text-[12px] tabular-nums text-paper-900"
-                title="翻譯（＋雲端辨識）費用概估，每小時約 30 分鐘語音"
-              >
-                {formatUsd(costUsd)} / 小時
-              </dd>
-            </dl>
-            <div className="mt-3 flex gap-2">
-              <button
-                className="flex-1 rounded-lg border border-paper-200 bg-white px-2 py-1.5 text-xs text-paper-800 hover:bg-paper-50 disabled:opacity-50"
-                onClick={openTranslationWindows}
-                disabled={targets.length === 0}
-                type="button"
-                title={anySlotClosed ? "重新開啟被關閉的譯文視窗" : "把譯文視窗帶到最前面"}
-              >
-                開啟譯文視窗 ↗
-              </button>
-              <button
-                className="flex-1 rounded-lg border border-paper-200 bg-white px-2 py-1.5 text-xs text-paper-800 hover:bg-paper-50"
-                onClick={() => openSettings("meeting")}
-                type="button"
-              >
-                會議設定…
-              </button>
-            </div>
-          </div>
+          <SessionSetupCard
+            cfg={cfgSnap}
+            running={running}
+            useMic={useMic}
+            micLabel={micValue}
+            costUsd={costUsd}
+            targetCount={targets.length}
+            anySlotClosed={anySlotClosed}
+            onOpenWindows={openTranslationWindows}
+            onOpenAccount={() => openSettings("account")}
+            onError={(m) => showToast("error", m, 5000)}
+          />
           <div className="flex min-h-0 flex-col gap-3 overflow-hidden px-[18px] py-3.5">
             {targets.map((t) => (
               <div key={t} className="grid grid-cols-[26px_1fr] gap-2 text-[13px] leading-normal text-paper-700">
@@ -1460,7 +1417,7 @@ export default function ControlWindow() {
               </div>
             ))}
             {targets.length === 0 && (
-              <p className="text-xs text-paper-500">各語言最近一句譻文會顯示在這裡。</p>
+              <p className="text-xs text-paper-500">各語言最近一句譯文會顯示在這裡。</p>
             )}
           </div>
         </aside>
@@ -1488,7 +1445,7 @@ export default function ControlWindow() {
           <GlossaryIcon />
           術語表
         </TextButton>
-        <TextButton onClick={() => openSettings("meeting")}>
+        <TextButton onClick={() => openSettings("account")}>
           <SettingsIcon />
           設定
         </TextButton>
@@ -1547,7 +1504,6 @@ export default function ControlWindow() {
         <SettingsModal
           onClose={handleCloseSettings}
           backend={backend}
-          setBackend={setBackend}
           useMic={useMic}
           setUseMic={setUseMic}
           running={running}
@@ -1764,20 +1720,6 @@ function PopButton({
       disabled={disabled}
     >
       {children}
-    </button>
-  );
-}
-
-function EditLink({ onClick, disabled }: { onClick: () => void; disabled?: boolean }) {
-  return (
-    <button
-      type="button"
-      className="text-[11px] text-ai-blue hover:underline disabled:cursor-not-allowed disabled:text-paper-400 disabled:no-underline"
-      onClick={onClick}
-      disabled={disabled}
-      title={disabled ? "錄音中無法變更" : undefined}
-    >
-      變更
     </button>
   );
 }
