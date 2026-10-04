@@ -2,7 +2,7 @@
 
 中／英／日／越任一語言會議即時轉寫 + 並行翻譯到兩個可配置譯文槽位視窗（各自選目標語言）供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。源語言可選 zh/en/ja/vi；目標語言可選 zh/en/ja/vi/km（km 柬埔寨文為 target-only，Whisper 對 Khmer 辨識品質不堪用，registry `source_capable: false` 把它從源語言選單隱藏）；單場單向，不同時處理對方發言。
 
-目前 ship 0.1.25 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
+目前 ship 0.1.30 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
 
 ## 關鍵架構決策（不要重新討論）
 
@@ -11,7 +11,7 @@
 - **語言登錄表是單一事實來源**：`shared/languages.json` 一份，Rust `include_str!` + Python 讀 + TS import。source 可選 zh/en/ja/vi，target 可選 zh/en/ja/vi/km；`source_capable: false` 標記 target-only 語言（km），script_profile / prompt 名 / carrier / empty_state 全收斂於此。加語言＝補一筆，見 `docs/ADD_LANGUAGE.md`（UI 元件 registry-driven，零改動）
 - **兩個可配置槽位視窗**：視窗 label 固定 `t1` / `t2`（不再是 en/vi），顯示語言由 config `[language].target_slots[slotIndex]` runtime 解析；事件仍帶語言後綴 `translation:chunk:{lang}`；slot 設 `""` 即關閉
 - **翻譯在 Rust 不在 sidecar**：LLM API（OpenAI 預設／Anthropic 可選，`[api] provider`）由 `src-tauri/src/translator.rs` 處理，sidecar 只負責 STT。0.1.29 起新安裝預設 `provider = "openai"`（gpt-5.6-luna 翻譯、gpt-5.6-sol 總結），Anthropic 走 Haiku 4.5 / Sonnet 4.6；舊 config 沒寫 provider 的也會變 openai，但既有使用者檔案裡都已有明確值
-- **兩種翻譯模式**：`[interp] mode = "sentence"`（預設）由前端 ControlWindow 逐句 `invoke("translate")`；`"incremental"` 由 Rust `interp.rs` 接手：sidecar 送 clause 級片段（`transcript.boundary`），引擎把片段拼成句群、每語言一條序列化隊列、譯文只追加（Anthropic 用 assistant prefill）、句群關閉時自己寫 session。事件名沿用 `translation:chunk/done:{lang}`，id = 句群 id（`transcript.utterance_id`）。設計與基線數字見 `docs/PLAN_INCREMENTAL_INTERP.md`
+- **兩種翻譯模式**：`[interp] mode = "sentence"`（預設）由前端 ControlWindow 逐句 `invoke("translate")`；`"incremental"` 由 Rust `interp.rs` 接手：sidecar 送 clause 級片段（`transcript.boundary`），引擎把片段拼成句群、每語言一條序列化隊列、譯文只追加（已輸出譯文以 `<emitted>` 帶入，`strip_overlap` 保證不重複）、句群關閉時自己寫 session。事件名沿用 `translation:chunk/done:{lang}`，id = 句群 id（`transcript.utterance_id`）。設計與基線數字見 `docs/PLAN_INCREMENTAL_INTERP.md`
 - **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start`（含 `stt: {delay, segmentation}`）/ `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript`（final 帶 `boundary`: clause/forced/sentence/pause）/ `stopped` / `error` / `warning` / `prewarm` / `model_loading` / `model_ready` / `devices`
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
 - **dev sidecar binary 陷阱**：`pnpm tauri dev` 會把 `binaries/stt_engine-<triple>` copy 到 `target/debug/`，sidecar.rs 優先吃這個 stale binary。測 Python 改動前先 `mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`
@@ -60,14 +60,14 @@ cd src-tauri && cargo test
    預期 `flags=0x10002(adhoc,runtime)` + `Sealed Resources version=2` + 5 個 entitlement Key
 7. 收件人裝完務必 `xattr -cr /Applications/MeetingCast.app`（quarantine + ad-hoc 在 Sequoia 直接報 damaged）
 
-**dev 機跑 OK ≠ ship OK**。今天 0.1.6→0.1.14 連 9 個版本的失敗在 dev 機都看不到，只有真實 fresh Mac 會炸。詳細為何見 memory file。
+**dev 機跑 OK ≠ ship OK**：entitlements／簽章缺漏在 dev 機看不到，只有真實 fresh Mac 會炸（0.1.6–0.1.14 都栽在這裡）。詳細見 memory file。
 
 ## 核心原則
 
 - **回應一律繁體中文**
 - **Plan before action**：新功能 / 重構先提計畫等使用者確認
 - **One task at a time**：做完驗證再進下一步
-- **延遲第一優先**：架構決策以「降低使用者感知延遲」為標準
+- **準確性 > 速度 > 成本**：準確性相同時，架構決策以「降低使用者感知延遲」為標準
 - **STT 預設 local，openai cloud 為使用者選項**：成本與隱私考量。選擇存 `[stt] backend`（0.1.29 起持久化，之前每次啟動都回 local）
 
 ## 技術棧
@@ -152,7 +152,7 @@ mode = "sentence"        # "sentence"（預設，逐句翻）| "incremental"（�
 translation_theme = "dark"  # 譯文視窗 "dark"（純黑，投影預設）| "light"
 glow = true              # 譯文視窗外框 AI 漸層光暈
 
-# [vad] / [ui] 暫 hardcoded
+# [vad] 暫 hardcoded
 ```
 
 **API key 載入**：app 啟動讀 `config.toml` → 欄位空時 dev 模式 fallback dotenvy 從 `prototype/.env` seed → Settings UI 改值 persist 回 config.toml。

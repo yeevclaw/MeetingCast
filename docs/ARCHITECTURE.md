@@ -86,7 +86,7 @@ sequenceDiagram
 | STT (本地) | **mlx-whisper** | faster-whisper, whisper.cpp | macOS Metal GPU 加速；ctranslate2 在 macOS 沒 Metal、CPU 4.3s 太慢 |
 | STT (雲端) | **OpenAI `gpt-live-transcribe`** | Deepgram nova-3, Google Chirp 2, Azure | 邊講邊出字；支援繁中／多語提示與 active glossary context + keywords；Deepgram 已於 0.1.20 後移除 |
 | VAD | **silero-vad** | webrtcvad | 中文友善、ONNX 輕量 |
-| 翻譯 LLM | **Claude Haiku 4.5** | Sonnet, GPT-4o | 首 token ~800ms、三語品質好、prompt caching 省 token |
+| 翻譯 LLM | **Claude Haiku 4.5** | Sonnet, GPT-4o | 首 token ~800ms、三語品質好（prompt caching 實際未生效，見 §5） |
 | 跨進程通訊 | **line-delimited JSON over stdio** | WebSocket, gRPC, JSON-RPC | 簡單可靠、無需額外服務 |
 | 全域熱鍵 | **tauri-plugin-global-shortcut** | — | 視窗失焦也能用 ⌘⇧M |
 | 多視窗 | **Tauri WebviewWindow API** | — | 原生多視窗、可拖外接螢幕 |
@@ -129,10 +129,10 @@ flowchart TD
 
 ## 5. 翻譯 Prompt 結構
 
-System + user 結構，system 部分用 **prompt caching** 鎖住術語表與風格，每次 API call 只重送中文逐字稿即可。
+System + user 結構。Anthropic 請求的 system block 帶 `cache_control: ephemeral`，但 **prompt caching 目前實際不生效**：translate / interpret system prompt 約 ~700 token（含術語表區塊），低於 Haiku 4.5 的最小可快取前綴 4096 token（OpenAI 自動快取門檻 1024 token 同樣未達），API 直接當一般輸入計費——`traces.jsonl` 的 `cache_read_input_tokens` 一律為 0。標記保留（無害；system prompt 若長到門檻以上會自動開始命中），但成本估算不要假設有快取折扣。
 
 ```
-System (cached):
+System (cache_control 標記，實際未命中):
   你是專業即時會議口譯員。將使用者輸入的{source_lang}翻譯為 {lang}。（{source_lang}/{lang} 由 registry 依 config 替換）
   規則：
   1. 只輸出譯文，不要任何解釋、引號、標點修飾
@@ -146,7 +146,7 @@ System (cached):
 User: {來源逐字稿}
 ```
 
-省 token：system 約 ~150 token、cache 命中時省下整段，只計 user 端的中文逐字稿（通常 < 50 token）。
+成本：每次呼叫都完整計費 system（~700 token）＋ user（中文逐字稿 + 最近幾句 context）。
 
 ---
 
@@ -160,7 +160,9 @@ User: {來源逐字稿}
 | **Sidecar spawn** | App 啟動時預先 spawn，amortize PyInstaller ~2s cold start |
 | **Whisper 推論** | 用 `large-v3-turbo`（vs `large-v3` 4× 快、品質持平） |
 | **翻譯首 token** | Haiku 4.5（vs Sonnet 約 2× 快） |
-| **Prompt caching** | system 部分快取，僅重送 user 中文逐字稿 |
+| **Prompt caching** | 未生效：system ~700 token 低於 Haiku 4.5 最小快取長度 4096（OpenAI 1024），`cache_control` 標記保留但 inert |
+| **連線保溫** | 共用 reqwest client：HTTP/2、pool idle 300 s、TCP keepalive；`start_stt` 時 fire-and-forget `GET /v1/models` 先把 TLS 建好 |
+| **首 token 期限** | 即時翻譯（逐句 + 同步口譯）8 s 內沒有第一個 content delta 即放棄；逐句模式重送一次，口譯模式由句群最終呼叫的單次重試涵蓋 |
 | **Streaming SSE** | Anthropic 一回 chunk 立即 emit，UI 邊收邊顯示，不等整段譯文 |
 | **並行翻譯** | 中→英 / 中→越 同時送出（兩個 invoke 並行） |
 | **Utterance id** | 譯文 chunk 帶 id，UI 端依 id 對齊；並行翻譯不會交錯 |
@@ -174,12 +176,16 @@ User: {來源逐字稿}
 
 | 機制 | 說明 |
 |---|---|
-| **Sidecar crash watchdog** | Python 子程序異常結束 → emit `stt:crashed` → 2s backoff 重啟 → re-issue last_start → emit `stt:restored`。3 次失敗 emit `stt:fatal`，前端 toast 通知 |
+| **Sidecar crash watchdog** | Python 子程序異常結束 → emit `stt:crashed` → 2s backoff 重啟 → re-issue last_start → emit `stt:restored`。restore 後 transcript 時間軸接續（`SessionClock` 把新程序從 0 起算的 t_start/t_end 加上 crash 前最大 t_end），第一筆 transcript 抵達即重置重啟次數。3 次失敗 emit `stt:fatal`，由前端走停止流程收尾（15 s 內未呼叫 `stop_stt` 則後端 fallback 關閉該場） |
+| **停止收尾** | 前端先呼叫 `stop_capture`：送 `stop` 並等 sidecar 的 `stopped`（≤ 3 s；sidecar 先把緩衝語音吐成 final）；等尾句翻譯（≤ 5 s）寫入 session 後，再呼叫 `stop_stt` flush 口譯引擎、關 session |
+| **非預期停止** | 使用者沒按停止但 sidecar 自己 `stopped`：`reason: "source_ended"`（示範音檔播完）→ emit `stt:source_ended`；`reason: "error"`（雲端重連放棄、麥克風斷流等）→ emit `stt:interrupted`（繁中訊息，附最近 error）。兩者都由前端走同一套停止流程收尾；後端只 arm 15 s fallback，逾時才以 `stop_session_if(id)` 關閉當時那一場並 emit `session:closed` |
+| **離線快速失敗** | LLM 請求遇 transport error 立刻跑一次 netcheck probe；確認離線就回 `offline:` 並發 `network:status`，不再跑完 ~16 s retry 階梯 |
 | **stderr 紀錄** | sidecar crash 時 stderr 最後 50 行寫進 `errors.log` |
 | **錯誤 log** | JSON-lines append-only `errors.log`，每行 `{timestamp, category, message, context}`。記錄 sidecar crash / API error / config save fail |
 | **Whisper hallucination 三層防禦** | 1) 低能量靜音直接跳過（避免「請按讚訂閱」訓練資料外洩）2) 重複片語過濾 3) prompt 強化要求 STT 不胡編 |
 | **翻譯 meta-response 過濾** | LLM 偶爾回覆「我已將...翻譯為...」之類非譯文，translator.rs 用正則過濾（commit fdd750c 加寬 scan-and-match） |
-| **設定持久化** | config.toml 即時 save，dev fallback 從 `prototype/.env` seed |
+| **設定持久化** | config.toml 即時 save（tmp + rename 原子寫入），dev fallback 從 `prototype/.env` seed；既有 config 解析失敗時先備份成 `config.toml.bak-<時間>` 並記 errors.log 才退回預設 |
+| **Session 檔案** | meta.json 原子寫入；meta.json 讀不到時由 transcript.jsonl 重建最小 meta，歷史清單不漏場 |
 | **API key 載入順序** | 1) 讀 config.toml 2) 為空時 dev 模式 fallback 從 `prototype/.env` seed 3) Settings UI 改值 persist 回 config.toml |
 | **React StrictMode 友善** | listener 用 promise-based cleanup，避免 double-mount 留下重複訂閱 |
 
@@ -234,9 +240,9 @@ graph TB
 所有 UI 走 `App.css` 的 `@theme paper-*` token（warm paper / 墨色），狀態色都收斂進暖色家族（`danger-*` / `warn-*` / `recording`）。**不在元件寫 hex 硬編碼**。
 
 ### 命名空間
-- Tauri event：`transcript` / `stt:*` / `translation:chunk:<lang>` / `translation:done:<lang>` / `session:reset` / `hotkey:toggle`
+- Tauri event：`transcript` / `stt:*`（含 `stt:level` = rms 數字、`stt:signal` = `{code, message, device?}`、`stt:interrupted` = 繁中字串）/ `translation:chunk:<lang>` / `translation:done:<lang>` / `translation:error:<lang>`（口譯模式，`{id, message}`）/ `translation:skip:<lang>`（口譯模式，`{id}`，太短不翻）/ `session:reset` / `session:closed` / `hotkey:toggle`
 - Sidecar 命令：`start` / `stop` / `shutdown`
-- Sidecar 事件：`ready` / `started` / `transcript` / `stopped` / `error` / `prewarm` / `model_loading` / `model_ready`
+- Sidecar 事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning`（可帶 `code`）/ `level` / `prewarm` / `model_loading` / `model_ready`
 
 ### 設定檔
 `~/Library/Application Support/MeetingCast/config.toml`
