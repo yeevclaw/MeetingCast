@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LANG_CODES, LANGS, zhName } from "@/lib/languages";
 import type { SessionMeta, StoredUtterance } from "@/lib/types";
+import { friendly } from "@/lib/errors";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 // A summary target is any registry language code; "transcript" is the extra
 // non-summary tab, handled separately from the language tabs.
@@ -298,6 +300,14 @@ export default function HistoryModal({
     setSummaryError(null);
   }, []);
 
+  // Esc closes the innermost thing: a pending confirm first, then the modal.
+  const handleEscape = useCallback(() => {
+    if (confirmDelete) setConfirmDelete(false);
+    else if (pendingRegenerate) setPendingRegenerate(null);
+    else onClose();
+  }, [confirmDelete, pendingRegenerate, onClose]);
+  useEscapeKey(true, handleEscape);
+
   const handleDelete = useCallback(async () => {
     if (!selectedId) return;
     try {
@@ -539,7 +549,7 @@ export default function HistoryModal({
                                 key={code}
                                 className={`text-xs text-paper-600${i === 0 ? " mt-0.5" : ""}`}
                               >
-                                {code.toUpperCase()}｜{text}
+                                {zhName(code)}｜{text}
                               </p>
                             ))}
                           </li>
@@ -668,11 +678,20 @@ function SummaryPane({
   const hasContent = content !== null && content.length > 0;
   const showTemplatePicker = !hasContent && !streaming;
   const selectorDisabled = hasOther;
+  const friendlyError = error ? friendly(error) : null;
 
   return (
     <div className="space-y-3">
-      {error && (
-        <p className="rounded bg-danger-50 px-3 py-2 text-xs text-danger-700">{error}</p>
+      {friendlyError && (
+        <div
+          className="rounded bg-danger-50 px-3 py-2 text-xs text-danger-700"
+          title={friendlyError.raw}
+        >
+          <p>{friendlyError.primary}</p>
+          {friendlyError.secondary && (
+            <p className="mt-0.5 opacity-80">{friendlyError.secondary}</p>
+          )}
+        </div>
       )}
 
       {showTemplatePicker && (

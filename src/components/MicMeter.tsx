@@ -1,15 +1,34 @@
 import { useEffect, useRef, useState } from "react";
+import { useSttLevel } from "@/lib/useSttLevel";
 
 const SEGMENTS = 10;
 
+/** Raw RMS (0..1) → meter fill. Normal speech RMS sits ~0.05–0.2, so ×5
+ *  lights 3 of 4 bars for a moderate voice without clipping immediately. */
+export function rmsToLevel(rms: number): number {
+  return Math.max(0, Math.min(1, rms * 5));
+}
+
+/**
+ * 10-segment input meter. Two modes:
+ * - `active` (idle console): opens its own getUserMedia stream and measures.
+ * - `sttActive` (recording): displays the RMS the sidecar reports via
+ *   `stt:level`, so the meter never competes with the STT engine for the mic.
+ *   The subscription lives here so only this meter re-renders per sample.
+ *   `sttActive` wins when true; `active` should be false then.
+ */
 export default function MicMeter({
   active,
   deviceLabel,
+  sttActive = false,
 }: {
   active: boolean;
   deviceLabel?: string;
+  sttActive?: boolean;
 }) {
-  const [level, setLevel] = useState(0);
+  const [ownLevel, setLevel] = useState(0);
+  const externalLevel = useSttLevel(sttActive);
+  const level = externalLevel != null ? rmsToLevel(externalLevel) : ownLevel;
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -31,10 +50,7 @@ export default function MicMeter({
         const v = (buf[i] - 128) / 128;
         sum += v * v;
       }
-      const rms = Math.sqrt(sum / buf.length);
-      // Normal speech RMS sits ~0.05–0.2 — scale ×5 so a moderate voice
-      // lights 3 of 4 bars without clipping immediately.
-      setLevel(Math.min(1, rms * 5));
+      setLevel(rmsToLevel(Math.sqrt(sum / buf.length)));
       rafRef.current = requestAnimationFrame(tick);
     }
 

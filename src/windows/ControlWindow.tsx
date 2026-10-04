@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import GlossaryModal from "@/components/GlossaryModal";
 import HistoryModal from "@/components/HistoryModal";
@@ -14,18 +14,46 @@ import SessionSetupCard from "@/components/SessionSetupCard";
 import SettingsModal from "@/components/SettingsModal";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { estimateHourlyUsd } from "@/lib/cost";
-import { friendly, isOfflineError } from "@/lib/errors";
+import { friendly, isOfflineError, type FriendlyError } from "@/lib/errors";
 import { LANGS, zhName } from "@/lib/languages";
 import type {
   ChunkPayload,
   Config,
   DonePayload,
   Source,
+  SttSignalPayload,
   TranscriptPayload,
+  TranslationErrorPayload,
 } from "@/lib/types";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 import { isSlotWindowOpen, openSlotWindow, type SlotLabel } from "@/lib/windows";
 
 type Toast = { kind: "info" | "warning" | "error"; message: string };
+
+// The transcript-column error card. `raw` goes through friendly(); `fallback`
+// is the headline when no rule matches; `actions` adds one-click fixes.
+// `headline` (backend-written 繁中 messages such as stt:interrupted / fatal)
+// is shown verbatim — a friendly() rule must not replace it and lose e.g.
+// 「本場已自動保存」; the friendly reading of its detail becomes the second line.
+type ErrorAction = "restart" | "engine" | "log";
+type ErrorCard = { raw: string; fallback?: string; headline?: string; actions?: ErrorAction[] };
+
+function errorView(e: ErrorCard): FriendlyError {
+  if (!e.headline) return friendly(e.raw, e.fallback);
+  // Backend messages quote the technical cause in a trailing （…）.
+  const detail = e.raw.match(/（([^（）]+)）\s*$/)?.[1] ?? e.raw;
+  const f = friendly(detail);
+  const secondary =
+    f.primary !== detail && f.primary !== e.headline ? f.primary : f.secondary;
+  return { primary: e.headline, secondary, raw: e.raw, action: f.action };
+}
+
+// Most recent translate failure (sentence-mode invoke error or an incremental
+// `translation:error:{lang}`). Cleared by the next streamed chunk or 重試.
+type TrFailure = { lang: string; raw: string };
+
+// Within this many px of the bottom counts as "following" the transcript.
+const STICK_PX = 40;
 
 type CrashPayload = { attempt: number; max: number; stderr_tail?: string };
 type RestoredPayload = { attempt: number };
@@ -110,7 +138,16 @@ export default function ControlWindow() {
   // language, independent of the sentence/incremental pending bookkeeping.
   const [latestTr, setLatestTr] = useState<Record<string, string>>({});
   const latestTrIdRef = useRef<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrorCard | null>(null);
+  const [trFailure, setTrFailure] = useState<TrFailure | null>(null);
+  const trFailureRef = useRef<TrFailure | null>(null);
+  // Runtime signals (`stt:signal`). Each is reset when a session starts/ends.
+  const [micStalled, setMicStalled] = useState<string | null>(null);
+  const [fallbackDevice, setFallbackDevice] = useState<string | null>(null);
+  const [reconnecting, setReconnecting] = useState<string | null>(null);
+  // Transcript follow-mode: false once the user scrolls up away from the end.
+  const stickRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("account");
   const [showHistory, setShowHistory] = useState(false);
@@ -171,6 +208,14 @@ export default function ControlWindow() {
   const hasHistoryRef = useRef(false);
   const sessionStartedAtRef = useRef<number | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Deferred plain `stt:warning` toast, and the `stt:signal` message that
+  // suppresses its matching warning for a short window.
+  const pendingWarnRef = useRef<{ msg: string; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const suppressedWarnRef = useRef<{ msg: string; until: number } | null>(null);
+  // Live copies for the global-hotkey listener (subscribed once).
+  const modalOpenRef = useRef(false);
+  // Human reason start is blocked right now, or null when 開始 would work.
+  const startBlockRef = useRef<string | null>(null);
 
   // Live language selection (source + two target slots). Kept in a ref so
   // event handlers read the current value without re-subscribing; the source
@@ -219,9 +264,9 @@ export default function ControlWindow() {
   const restartClearNotice = (): string => {
     const src = zhName(langCfgRef.current.source);
     const ts = enabledTargets();
-    return ts.length === 0
-      ? `繼續會清除目前的${src}逐字稿與譯文。`
-      : `繼續會清除目前的${src}逐字稿與${ts.map(zhName).join("／")}譯文。`;
+    const what =
+      ts.length === 0 ? `${src}逐字稿` : `${src}逐字稿與${ts.map(zhName).join("／")}譯文`;
+    return `畫面上的${what}會清空，不會刪除任何資料——上一場已保存在「歷史會議」。`;
   };
 
   const refreshSlotWindows = useCallback(async () => {
@@ -322,6 +367,12 @@ export default function ControlWindow() {
   useEffect(() => {
     sessionStartedAtRef.current = sessionStartedAt;
   }, [sessionStartedAt]);
+  // The wizard sits above everything (z-30); while it is open the start path
+  // must not open SettingsModal underneath it, and the hotkey stays inert.
+  const wizardOpenRef = useRef(false);
+  useEffect(() => {
+    wizardOpenRef.current = needsWelcome != null;
+  }, [needsWelcome]);
 
   const showToast = useCallback((kind: Toast["kind"], message: string, ms = 4000) => {
     setToast({ kind, message });
@@ -452,6 +503,32 @@ export default function ControlWindow() {
     [tryFinalize],
   );
 
+  // Tell the translation windows to drop the "…" placeholder row they seated
+  // for this utterance (sentence mode: the console decided not to translate).
+  // Incremental mode: Rust emits this itself.
+  const emitSkip = useCallback((id: string, langs: string[]) => {
+    for (const l of langs) emit(`translation:skip:${l}`, { id }).catch(() => {});
+  }, []);
+
+  const noteTrFailure = useCallback(
+    (lang: string, raw: unknown) => {
+      const f: TrFailure = { lang, raw: String(raw) };
+      // One toast on the healthy → failing transition; repeats only update
+      // the chip so a dead key doesn't toast once per sentence.
+      if (!trFailureRef.current) {
+        showToast("error", `${zhName(lang)}翻譯失敗：${friendly(f.raw).primary}（點上方「翻譯」查看）`, 6000);
+      }
+      trFailureRef.current = f;
+      setTrFailure(f);
+    },
+    [showToast],
+  );
+  const clearTrFailure = useCallback(() => {
+    if (!trFailureRef.current) return;
+    trFailureRef.current = null;
+    setTrFailure(null);
+  }, []);
+
   const requestTranslate = useCallback(
     async (id: string, text: string, target: string) => {
       const label = slotLabelFor(target);
@@ -462,23 +539,28 @@ export default function ControlWindow() {
           showToast("warning", `${zhName(target)}譯文視窗已關閉，將不再翻譯該語言`);
         }
         skipTranslation(id, target);
+        emitSkip(id, [target]);
         return;
       }
       // Offline: translation is paused, not broken. The 網路 chip and the
       // window banner already say so — don't bill a call that will fail.
       if (!onlineRef.current) {
         skipTranslation(id, target);
+        emitSkip(id, [target]);
         return;
       }
       invoke("translate", { id, text, target }).catch((err) => {
-        if (!isOfflineError(err)) setError(`translate ${target}: ${err}`);
+        // Failures surface on the 翻譯 chip (bad tone + friendly message),
+        // not as an error card per sentence. Offline is a pause, not a fault.
+        if (!isOfflineError(err)) noteTrFailure(target, err);
+        emitSkip(id, [target]);
         // A terminal API failure must still close this pending branch. Without
         // this, the utterance remains in memory until Stop and disappears from
         // live History. Persist it immediately as incomplete instead.
         skipTranslation(id, target);
       });
     },
-    [showToast, skipTranslation, slotLabelFor],
+    [showToast, skipTranslation, slotLabelFor, emitSkip, noteTrFailure],
   );
 
   const selectedDeviceRef = useRef(selectedDevice);
@@ -487,6 +569,15 @@ export default function ControlWindow() {
   }, [selectedDevice]);
 
   const startInFlightRef = useRef(false);
+  // True for the whole shared stop flow (stop_capture → drain → stop_stt →
+  // UI reset). `stt:stopped` flips `running` false mid-flow, so without this
+  // a quick 開始 would start a new session that the old flow then flushes
+  // into and closes.
+  const stoppingRef = useRef(false);
+  const [stopping, setStopping] = useState(false);
+  // Wall-clock of the newest final transcript; the stop flow waits for this
+  // to go quiet before draining (tail finals may still be in flight).
+  const lastFinalAtRef = useRef(0);
 
   const openSettings = useCallback((tab: SettingsTab = "account") => {
     setSettingsTab(tab);
@@ -499,25 +590,33 @@ export default function ControlWindow() {
     // second invoke during the first's await would surface "already running"
     // from the sidecar as a confusing toast.
     if (startInFlightRef.current) return;
+    // The previous session is still being finalized.
+    if (stoppingRef.current) return;
 
     // Pre-flight key checks. Doing these in JS avoids spinning up the
     // recording pipeline only to have every translate fail with 401, or
     // (for openai STT) the sidecar connect with 401 leaving the UI stuck
     // on "錄音中" with empty transcript.
+    const inWizard = wizardOpenRef.current;
     try {
       const cfg = await invoke<Config>("get_config");
       if (!activeLlmKey(cfg).trim()) {
-        showToast(
-          "error",
-          `請先在設定填入 ${cfg.api.provider === "openai" ? "OpenAI" : "Anthropic"} API key`,
-          5000,
-        );
-        openSettings("account");
+        const name = cfg.api.provider === "openai" ? "OpenAI" : "Anthropic";
+        if (inWizard) {
+          showToast("error", `尚未填入 ${name} API key，請回第 3 步填寫`, 6000);
+        } else {
+          showToast("error", `請先在設定填入 ${name} API key`, 5000);
+          openSettings("account");
+        }
         return;
       }
       if (backendRef.current === "openai" && !cfg.api.openai_api_key.trim()) {
-        showToast("error", "切到雲端辨識需要 OpenAI API key", 5000);
-        openSettings("account");
+        if (inWizard) {
+          showToast("error", "雲端辨識需要 OpenAI API key，請回第 3 步填寫，或回第 1 步改用本機辨識", 6000);
+        } else {
+          showToast("error", "切到雲端辨識需要 OpenAI API key", 5000);
+          openSettings("account");
+        }
         return;
       }
       if (backendRef.current === "openai" && !onlineRef.current) {
@@ -539,6 +638,11 @@ export default function ControlWindow() {
     setLatestTr({});
     latestTrIdRef.current = {};
     setLagSec(null);
+    setMicStalled(null);
+    setFallbackDevice(null);
+    setReconnecting(null);
+    stickRef.current = true;
+    setShowJump(false);
     try {
       let source: Source;
       if (useMicRef.current) {
@@ -564,7 +668,7 @@ export default function ControlWindow() {
         language: langCfgRef.current.source,
       });
     } catch (err) {
-      setError(`start: ${err}`);
+      setError({ raw: String(err), fallback: "無法開始錄音" });
     } finally {
       startInFlightRef.current = false;
     }
@@ -586,6 +690,7 @@ export default function ControlWindow() {
   }, [applyLangCfg, refreshSlotWindows]);
 
   const requestStart = useCallback(() => {
+    if (stoppingRef.current) return;
     if (hasHistoryRef.current) {
       setConfirmRestart(true);
     } else {
@@ -593,57 +698,103 @@ export default function ControlWindow() {
     }
   }, [handleStart]);
 
-  const handleStop = useCallback(async () => {
+  // The one stop flow, shared by 停止, the hotkey, idle timeout and the
+  // backend-ended paths (`stt:source_ended` / `stt:interrupted` /
+  // `stt:fatal`). Rust no longer closes the session itself when capture ends
+  // unexpectedly (it only arms a 15 s fallback), so this flow always runs
+  // stop_capture (no-op once capture already ended) → wait for the tail →
+  // drain → flushPending → stop_stt, then the post-meeting extras.
+  // Returns false when another stop flow is already running.
+  const runStopFlow = useCallback(async (): Promise<boolean> => {
+    if (stoppingRef.current) return false;
+    stoppingRef.current = true;
+    setStopping(true);
+    let sessionId: string | null = null;
     try {
-      // Flush any utterances still waiting on translation BEFORE stop_stt
-      // finalizes meta.json — once stop_session runs the recorder slot is
-      // empty and subsequent appends silently drop on the floor.
+      // Halt capture first: the sidecar flushes the speaker's last sentence
+      // while the session stays open. Give those tail finals a moment to get
+      // their translation, then flush whatever is still pending BEFORE stop_stt
+      // finalizes meta.json — after stop_session, appends drop on the floor.
+      try {
+        await invoke("stop_capture");
+      } catch (err) {
+        // Capture already gone (engine died) — still close the session.
+        console.warn("stop_capture:", err);
+      }
+      // The flushed tail `transcript` events can still be on their way to the
+      // listener after stop_capture resolves. Wait until no final has arrived
+      // for 400 ms (cap 1.5 s) so their pending entries are seated first.
+      const quietFrom = Date.now();
+      const quietCap = quietFrom + 1500;
+      while (Date.now() < quietCap && Date.now() - Math.max(quietFrom, lastFinalAtRef.current) < 400) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const drainUntil = Date.now() + 5000;
+      while (pendingUtterancesRef.current.size > 0 && Date.now() < drainUntil) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
       await flushPending();
-      const sessionId = await invoke<string | null>("stop_stt");
+      sessionId = await invoke<string | null>("stop_stt");
+    } catch (err) {
+      setError({ raw: String(err), fallback: "停止錄音時發生錯誤" });
+    } finally {
       // Drop rolling translation context so a new session doesn't carry
       // pronouns / topic from the previous meeting into its first sentence.
       invoke("clear_translation_context").catch(() => {});
-      if (
-        finalizedThisSessionRef.current > 0 &&
-        localStorage.getItem("mc_history_coach_seen") !== "1"
-      ) {
-        setShowHistoryCoach(true);
+      // `stt:stopped` normally resets these too; repeat here so a dead engine
+      // that never sends it can't leave the console stuck on 錄音中.
+      setRunning(false);
+      runningRef.current = false;
+      setSessionStartedAt(null);
+      sessionStartedAtRef.current = null;
+      setActiveSessionId(null);
+      setMicStalled(null);
+      setReconnecting(null);
+      // The session is closed — a new one may start. The auto-summary below
+      // only touches the closed session, so it doesn't hold the start button.
+      stoppingRef.current = false;
+      setStopping(false);
+    }
+    if (
+      finalizedThisSessionRef.current > 0 &&
+      localStorage.getItem("mc_history_coach_seen") !== "1"
+    ) {
+      setShowHistoryCoach(true);
+    }
+    // Opt-in post-meeting auto-summary. Re-read config (the user may have
+    // just toggled it in Settings) and, only if the session actually
+    // captured something, generate a summary per configured language.
+    if (sessionId && finalizedThisSessionRef.current > 0) {
+      let cfg: Config | null = null;
+      try {
+        cfg = await invoke<Config>("get_config");
+      } catch {
+        cfg = null;
       }
-      // Opt-in post-meeting auto-summary. Re-read config (the user may have
-      // just toggled it in Settings) and, only if the session actually
-      // captured something, generate a summary per configured language. The
-      // recording-stopped UI resets independently via the `stt:stopped`
-      // listener — that event fires during these awaits, so the ~30s of
-      // summary work below never strands the button on 停止.
-      if (sessionId && finalizedThisSessionRef.current > 0) {
-        let cfg: Config | null = null;
-        try {
-          cfg = await invoke<Config>("get_config");
-        } catch {
-          cfg = null;
-        }
-        if (cfg?.summary?.auto_generate && cfg.summary.auto_targets.length > 0) {
-          showToast("info", "會議結束，自動產生總結中…完成後可在歷史會議查看", 6000);
-          // Sequential (not Promise.all) so the per-language calls don't
-          // collide on the Anthropic rate limit. Each target is isolated:
-          // one failure toasts but doesn't abort the rest.
-          for (const target of cfg.summary.auto_targets) {
-            try {
-              await invoke("generate_summary", {
-                sessionId,
-                target,
-                template: cfg.summary.auto_template,
-              });
-            } catch {
-              showToast("error", `自動總結失敗（${target}）`, 5000);
-            }
+      if (cfg?.summary?.auto_generate && cfg.summary.auto_targets.length > 0) {
+        showToast("info", "會議結束，自動產生總結中…完成後可在歷史會議查看", 6000);
+        // Sequential (not Promise.all) so the per-language calls don't
+        // collide on the rate limit. Each target is isolated: one failure
+        // toasts but doesn't abort the rest.
+        for (const target of cfg.summary.auto_targets) {
+          try {
+            await invoke("generate_summary", {
+              sessionId,
+              target,
+              template: cfg.summary.auto_template,
+            });
+          } catch {
+            showToast("error", `自動總結失敗（${zhName(target)}）`, 5000);
           }
         }
       }
-    } catch (err) {
-      setError(`stop: ${err}`);
     }
+    return true;
   }, [flushPending, showToast]);
+
+  const handleStop = useCallback(async () => {
+    await runStopFlow();
+  }, [runStopFlow]);
 
   // Dev-only headless automation. `VITE_MC_AUTOSTART="openai-demo:100"` (or
   // `local-demo:N`) picks the backend + the bundled demo WAV, starts once the
@@ -676,6 +827,7 @@ export default function ControlWindow() {
         const { text, is_final, t_start, t_end } = e.payload;
         if (!text) return;
         if (is_final) {
+          lastFinalAtRef.current = Date.now();
           setLatestSrc("");
           // Lag = wall-clock since recording started minus the audio position
           // of this segment's end. Rounded to 0.1s, floored at 0.
@@ -708,6 +860,11 @@ export default function ControlWindow() {
           // covers the no-target case. Still record the source-only row so
           // the meeting transcript is faithful.
           if (text.trim().length < 2 || ts.length === 0) {
+            // Windows seated a "…" row for this final — release it.
+            emitSkip(
+              id,
+              langCfgRef.current.slots.filter((l, i, a) => l && a.indexOf(l) === i),
+            );
             invoke("session_append_utterance", {
               utterance: {
                 id,
@@ -747,6 +904,8 @@ export default function ControlWindow() {
         const code = l.code;
         return [
           listen<ChunkPayload>(`translation:chunk:${code}`, (e) => {
+            // Text is flowing again → the translate path is healthy.
+            clearTrFailure();
             const t = pendingUtterancesRef.current.get(e.payload.id)?.translations[code];
             if (t) t.text += e.payload.text;
             // Side thumbnail: a new id starts a fresh line, same id appends.
@@ -765,6 +924,11 @@ export default function ControlWindow() {
             if (t) t.text = e.payload.text;
             latestTrIdRef.current[code] = e.payload.id;
             setLatestTr((m) => ({ ...m, [code]: e.payload.text }));
+          }),
+          // Incremental-mode failure for one sentence group (Rust already
+          // persisted / skipped it). Offline = paused, not an error.
+          listen<TranslationErrorPayload>(`translation:error:${code}`, (e) => {
+            if (!isOfflineError(e.payload.message)) noteTrFailure(code, e.payload.message);
           }),
           listen<DonePayload>(`translation:done:${code}`, (e) => {
             const t = pendingUtterancesRef.current.get(e.payload.id)?.translations[code];
@@ -903,10 +1067,16 @@ export default function ControlWindow() {
       }),
       listen("stt:started", () => {
         setRunning(true);
-        const now = Date.now();
-        sessionStartedAtRef.current = now;
-        setSessionStartedAt(now);
-        finalizedThisSessionRef.current = 0;
+        // A sidecar auto-restart re-sends `start` mid-session and Rust offsets
+        // transcript times onto the original clock — keep the original start
+        // (resetting it would make lag negative). `stt:stopped` / the stop
+        // flow clear it, so a genuinely new session always gets a fresh one.
+        if (sessionStartedAtRef.current == null) {
+          const now = Date.now();
+          sessionStartedAtRef.current = now;
+          setSessionStartedAt(now);
+          finalizedThisSessionRef.current = 0;
+        }
         if (modelTimerRef.current) {
           clearTimeout(modelTimerRef.current);
           modelTimerRef.current = null;
@@ -916,7 +1086,59 @@ export default function ControlWindow() {
       listen("stt:stopped", () => {
         setRunning(false);
         setSessionStartedAt(null);
+        sessionStartedAtRef.current = null;
         setActiveSessionId(null);
+        setMicStalled(null);
+        setReconnecting(null);
+        setFallbackDevice(null);
+      }),
+      listen<SttSignalPayload>("stt:signal", (e) => {
+        const { code, message, device } = e.payload;
+        // The plain `stt:warning` carrying the same message is suppressed
+        // (see the warning listener) — the chip state + this one toast
+        // replace it. Unrelated warnings are left alone.
+        if (message) {
+          const pending = pendingWarnRef.current;
+          if (pending && pending.msg === message) {
+            clearTimeout(pending.timer);
+            pendingWarnRef.current = null;
+          }
+          suppressedWarnRef.current = { msg: message, until: Date.now() + 2000 };
+        }
+        switch (code) {
+          case "reconnecting":
+            setReconnecting(message || "重新連線中…");
+            showToast("warning", message || "雲端辨識連線中斷，重新連線中…", 6000);
+            break;
+          case "reconnected":
+            setReconnecting(null);
+            showToast("info", message || "雲端辨識已重新連線", 3000);
+            break;
+          case "mic_stalled":
+            setMicStalled(message || "麥克風沒有送出聲音");
+            showToast("warning", message || "麥克風沒有送出聲音，請檢查裝置", 6000);
+            break;
+          case "mic_resumed":
+            setMicStalled(null);
+            showToast("info", message || "麥克風已恢復收音", 3000);
+            break;
+          case "device_fallback":
+            if (device) setFallbackDevice(device);
+            showToast("warning", message || `找不到指定的麥克風，改用「${device ?? "系統預設"}」`, 6000);
+            break;
+          default:
+            if (message) showToast("warning", message, 6000);
+        }
+      }),
+      // Demo / WAV source played to the end: exactly like pressing 停止.
+      listen("stt:source_ended", () => {
+        runStopFlow();
+      }),
+      // Capture died mid-session. Rust left the session open for us; run the
+      // normal stop flow (keeps the tail + auto-summary), then explain.
+      listen<string>("stt:interrupted", async (e) => {
+        await runStopFlow();
+        setError({ raw: e.payload, headline: e.payload, actions: ["restart"] });
       }),
       listen<string>("session:opened", (e) => {
         setActiveSessionId(e.payload);
@@ -933,8 +1155,30 @@ export default function ControlWindow() {
         }
         setModelLoading(false);
       }),
-      listen<string>("stt:error", (e) => setError(e.payload)),
-      listen<string>("stt:warning", (e) => showToast("warning", e.payload, 6000)),
+      listen<string>("stt:error", (e) => setError({ raw: e.payload, fallback: "辨識發生錯誤" })),
+      listen<string>("stt:warning", (e) => {
+        // Defer briefly: if a structured `stt:signal` with the same message
+        // lands, it owns the toast and this plain warning is dropped.
+        const msg = e.payload;
+        const isSuppressed = () => {
+          const sup = suppressedWarnRef.current;
+          return sup != null && sup.msg === msg && Date.now() < sup.until;
+        };
+        if (isSuppressed()) return;
+        const prev = pendingWarnRef.current;
+        if (prev) {
+          // A different warning still waiting — show it now rather than drop it.
+          clearTimeout(prev.timer);
+          pendingWarnRef.current = null;
+          if (prev.msg !== msg) showToast("warning", prev.msg, 6000);
+        }
+        const timer = setTimeout(() => {
+          if (pendingWarnRef.current?.timer === timer) pendingWarnRef.current = null;
+          if (isSuppressed()) return;
+          showToast("warning", msg, 6000);
+        }, 400);
+        pendingWarnRef.current = { msg, timer };
+      }),
       listen<CrashPayload>("stt:crashed", (e) => {
         const { attempt, max } = e.payload;
         showToast("warning", `辨識引擎崩潰，重啟中 (${attempt}/${max})`);
@@ -942,9 +1186,9 @@ export default function ControlWindow() {
       listen<RestoredPayload>("stt:restored", (e) => {
         showToast("info", `辨識引擎已重啟 (第 ${e.payload.attempt} 次)`);
       }),
-      listen<string>("stt:fatal", (e) => {
-        setRunning(false);
-        showToast("error", e.payload, 0);
+      listen<string>("stt:fatal", async (e) => {
+        await runStopFlow();
+        setError({ raw: e.payload, headline: e.payload, actions: ["engine", "log"] });
       }),
       listen<number>("stt:idle_timeout", (e) => {
         const minutes = e.payload;
@@ -954,11 +1198,25 @@ export default function ControlWindow() {
         }
       }),
       listen("hotkey:toggle", () => {
+        if (stoppingRef.current) {
+          showToast("info", "正在結束上一場，請稍候", 3000);
+          return;
+        }
+        // Stopping is always allowed (it's the safe direction).
         if (runningRef.current) {
           handleStop();
-        } else {
-          requestStart();
+          return;
         }
+        if (modalOpenRef.current) {
+          showToast("info", "請先關閉目前開啟的視窗，再用 ⌘⇧M 開始錄音", 4000);
+          return;
+        }
+        const blocked = startBlockRef.current;
+        if (blocked) {
+          showToast("warning", `無法開始：${blocked}`, 5000);
+          return;
+        }
+        requestStart();
       }),
     ];
 
@@ -969,6 +1227,7 @@ export default function ControlWindow() {
       unlistens.forEach((p) => p.then((u) => u()));
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
       if (modelTimerRef.current) clearTimeout(modelTimerRef.current);
+      if (pendingWarnRef.current) clearTimeout(pendingWarnRef.current.timer);
     };
   }, [
     handleStop,
@@ -978,13 +1237,39 @@ export default function ControlWindow() {
     tryFinalize,
     enabledTargets,
     applyLangCfg,
+    emitSkip,
+    clearTrFailure,
+    noteTrFailure,
+    runStopFlow,
   ]);
 
+  // Follow the newest line only while the user is (near) the bottom; once
+  // they scroll up to reread, new lines raise a 「↓ 回到最新」 button instead
+  // of yanking the view.
   useEffect(() => {
-    if (historyRef.current) {
-      historyRef.current.scrollTop = historyRef.current.scrollHeight;
+    const el = historyRef.current;
+    if (!el) return;
+    if (stickRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else if (history.length > 0 || latestSrc) {
+      setShowJump(true);
     }
   }, [history, latestSrc]);
+
+  const onTranscriptScroll = useCallback(() => {
+    const el = historyRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_PX;
+    stickRef.current = atBottom;
+    if (atBottom) setShowJump(false);
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    const el = historyRef.current;
+    stickRef.current = true;
+    setShowJump(false);
+    el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, []);
 
   useEffect(() => {
     if (sessionStartedAt === null) {
@@ -1001,6 +1286,50 @@ export default function ControlWindow() {
   const prewarmResolved =
     sidecarReady === true &&
     (Object.values(stepStatus) as StepStatus[]).every((s) => s === "done" || s === "error");
+  // Readiness is per backend: cloud STT only needs the sidecar process; local
+  // also needs the Whisper model. The mic prewarm step never blocks — a mic
+  // error is a warning on the mic chip (and irrelevant for the demo WAV).
+  const spawnOk = sidecarReady === true && stepStatus.spawn === "done";
+  const modelNeeded = backend === "local";
+  const engineError =
+    stepStatus.spawn === "error" || (modelNeeded && stepStatus.model === "error");
+  const engineReady = spawnOk && (!modelNeeded || stepStatus.model === "done");
+  const micPrewarmError = useMic && stepStatus.mic === "error" ? stepError.mic ?? "麥克風初始化失敗" : null;
+  // Why 開始 can't run right now (null = it can). Order = what to fix first.
+  const startBlock: "engine_error" | "mic" | "preparing" | null = engineError
+    ? "engine_error"
+    : micMissing
+      ? "mic"
+      : !engineReady
+        ? "preparing"
+        : null;
+  const canStart = startBlock === null;
+  useEffect(() => {
+    startBlockRef.current =
+      startBlock === "engine_error"
+        ? "辨識引擎啟動失敗，點上方「辨識」查看"
+        : startBlock === "mic"
+          ? "麥克風未授權，點上方「麥克風」處理"
+          : startBlock === "preparing"
+            ? "辨識引擎還在準備中"
+            : null;
+  }, [startBlock]);
+  useEffect(() => {
+    modalOpenRef.current =
+      showSettings || showHistory || showGlossary || needsWelcome != null || confirmRestart;
+  }, [showSettings, showHistory, showGlossary, needsWelcome, confirmRestart]);
+
+  // Esc closes chip popovers / the context menu, and the restart confirm.
+  // Inactive while a modal is on top (those handle their own Esc).
+  const anyModal = showSettings || showHistory || showGlossary || needsWelcome != null;
+  useEscapeKey(
+    !anyModal && !confirmRestart && (openChip != null || transcriptMenu != null),
+    useCallback(() => {
+      setOpenChip(null);
+      setTranscriptMenu(null);
+    }, []),
+  );
+  useEscapeKey(confirmRestart && !anyModal, useCallback(() => setConfirmRestart(false), []));
 
   // While the mic is missing, re-probe whenever the window regains focus —
   // the user likely just flipped the toggle in System Settings and came
@@ -1026,7 +1355,7 @@ export default function ControlWindow() {
     try {
       await invoke("restart_sidecar");
     } catch (e) {
-      setError(`restart: ${e}`);
+      setError({ raw: String(e), fallback: "重新啟動辨識引擎失敗", actions: ["log"] });
       // Flip the spawn row back to error so the checklist shows the red row +
       // retry button again instead of spinning on "in_progress" forever.
       setStepStatus((s) => ({ ...s, spawn: "error" }));
@@ -1070,35 +1399,68 @@ export default function ControlWindow() {
     const l = slotLabelFor(t);
     return l ? !slotOpen[l] : false;
   });
-  const sttTone: ChipTone = hasPrewarmError
+  // A non-blocking engine problem (e.g. the local model failed while cloud
+  // STT is selected) still deserves a yellow chip so it's discoverable.
+  const nonBlockingEngineError = !engineError && (stepStatus.spawn === "error" || stepStatus.model === "error");
+  const sttTone: ChipTone = engineError
     ? "bad"
-    : !prewarmResolved || modelLoading
+    : reconnecting
       ? "warn"
-      : backend === "openai" && !online
-        ? "bad"
-        : "neutral";
-  const sttValue = hasPrewarmError
-    ? `${backendLabel} · 啟動失敗`
-    : !prewarmResolved
-      ? `${backendLabel} · 準備中`
-      : modelLoading
-        ? `${backendLabel} · 載入模型`
+      : !engineReady || modelLoading
+        ? "warn"
         : backend === "openai" && !online
-          ? "雲端 · 離線"
-          : backendLabel;
+          ? "bad"
+          : nonBlockingEngineError
+            ? "warn"
+            : "neutral";
+  const sttValue = engineError
+    ? `${backendLabel} · 啟動失敗`
+    : reconnecting
+      ? `${backendLabel} · 重新連線中…`
+      : !engineReady
+        ? `${backendLabel} · 準備中`
+        : modelLoading
+          ? `${backendLabel} · 載入模型`
+          : backend === "openai" && !online
+            ? "雲端 · 離線"
+            : backendLabel;
+  const trFriendly = trFailure ? friendly(trFailure.raw) : null;
   const trTone: ChipTone =
-    targets.length === 0 ? "neutral" : !online ? "warn" : anySlotClosed ? "warn" : "neutral";
+    targets.length === 0
+      ? "neutral"
+      : !online
+        ? "warn"
+        : trFailure
+          ? "bad"
+          : anySlotClosed
+            ? "warn"
+            : "neutral";
+  const targetLabels = targets.join(" · ");
   const trValue =
     targets.length === 0
       ? "未設定"
       : !online
         ? "暫停，恢復後續翻"
-        : anySlotClosed
-          ? `${targets.join(" · ")} · 視窗已關`
-          : targets.join(" · ");
-  const micTone: ChipTone = !useMic ? "neutral" : micAvailable === false ? "bad" : "neutral";
-  const micValue = !useMic ? "示範音檔" : micAvailable === false ? "未授權" : selectedDevice || "系統預設";
-  const canStart = prewarmResolved && !hasPrewarmError;
+        : trFailure
+          ? "翻譯失敗"
+          : anySlotClosed
+            ? `${targetLabels} · 視窗已關`
+            : targetLabels;
+  const micTone: ChipTone = !useMic
+    ? "neutral"
+    : micAvailable === false || micStalled
+      ? "bad"
+      : micPrewarmError || fallbackDevice
+        ? "warn"
+        : "neutral";
+  const micDevice = fallbackDevice ?? (selectedDevice || "系統預設");
+  const micValue = !useMic
+    ? "示範音檔"
+    : micAvailable === false
+      ? "未授權"
+      : micStalled
+        ? "沒有聲音"
+        : micDevice;
 
   const costUsd = cfgSnap
     ? estimateHourlyUsd({
@@ -1147,7 +1509,15 @@ export default function ControlWindow() {
           setOpen={setOpenChip}
           tone={micTone}
           label="麥克風"
-          lead={useMic ? <MicMeter active={!running && useMic} deviceLabel={selectedDevice} /> : null}
+          lead={
+            useMic ? (
+              <MicMeter
+                active={!running && useMic && micAvailable !== false}
+                deviceLabel={selectedDevice}
+                sttActive={running}
+              />
+            ) : null
+          }
           value={micValue}
         >
           <PopTitle>麥克風</PopTitle>
@@ -1167,9 +1537,21 @@ export default function ControlWindow() {
             </>
           ) : (
             <>
+              {micStalled && (
+                <p className="mt-1 rounded-lg bg-danger-50 px-2 py-1.5 text-xs text-danger-900">{micStalled}</p>
+              )}
+              {micPrewarmError && !micStalled && (
+                <p className="mt-1 rounded-lg bg-warn-50 px-2 py-1.5 text-xs text-warn-900">
+                  {friendly(micPrewarmError).primary}；仍可按開始，若沒聲音請換一支麥克風。
+                </p>
+              )}
               <PopText>
-                {selectedDevice ? `使用「${selectedDevice}」。` : "使用系統預設輸入。"}
-                {running ? "錄音中音量條暫停顯示，避免與辨識引擎搶麥克風。" : "閒置時音量條會隨聲音跳動，可先確認收音。"}
+                {fallbackDevice
+                  ? `找不到指定的「${selectedDevice || "裝置"}」，目前改用「${fallbackDevice}」。`
+                  : selectedDevice
+                    ? `使用「${selectedDevice}」。`
+                    : "使用系統預設輸入。"}
+                {running ? "錄音中的音量條是辨識引擎實際收到的聲音。" : "閒置時音量條會隨聲音跳動，可先確認收音。"}
               </PopText>
               <PopMeta>要換裝置，用右欄「本場設定」的麥克風選單。</PopMeta>
             </>
@@ -1183,6 +1565,9 @@ export default function ControlWindow() {
               ? "OpenAI gpt-live-transcribe（雲端）：字更早上螢幕，需要網路與 OpenAI key。"
               : "本機 mlx-whisper：免費、離線可用；句尾才出字。"}
           </PopText>
+          {reconnecting && (
+            <p className="mt-1 rounded-lg bg-warn-50 px-2 py-1.5 text-xs text-warn-900">{reconnecting}</p>
+          )}
           {!prewarmResolved || hasPrewarmError ? (
             <div className="mt-2">
               <PrewarmChecklist
@@ -1195,7 +1580,7 @@ export default function ControlWindow() {
           ) : null}
           <PopActions>
             {(hasPrewarmError || prewarmResolved) && (
-              <PopButton onClick={retryPrewarm} disabled={retryingPrewarm || running}>
+              <PopButton primary={engineError} onClick={retryPrewarm} disabled={retryingPrewarm || running}>
                 {retryingPrewarm ? "重新啟動中…" : hasPrewarmError ? "重試" : "重新啟動引擎"}
               </PopButton>
             )}
@@ -1212,13 +1597,42 @@ export default function ControlWindow() {
               {cfgSnap?.interp?.mode === "incremental" ? " · 同步口譯模式" : " · 逐句翻譯"}。
               {!online
                 ? " 目前沒有網路，翻譯暫停；逐字稿照常進行，網路恢復後新句子會自動翻譯。"
-                : anySlotClosed
-                  ? " 有譯文視窗被關閉，該語言暫不翻譯（不計費）。"
-                  : " 譯文會串流到各自的視窗。"}
+                : trFailure
+                  ? ""
+                  : anySlotClosed
+                    ? " 有譯文視窗被關閉，該語言暫不翻譯（不計費）。"
+                    : " 譯文會串流到各自的視窗。"}
             </PopText>
           )}
+          {trFailure && trFriendly && online && (
+            <div className="mt-2 rounded-lg bg-danger-50 px-2.5 py-2 text-xs text-danger-900">
+              <p className="font-medium">
+                {zhName(trFailure.lang)}：{trFriendly.primary}
+              </p>
+              {trFriendly.secondary && <p className="mt-0.5 text-danger-700">{trFriendly.secondary}</p>}
+              {trFriendly.primary !== trFriendly.raw && (
+                <p className="mt-1 break-all font-mono text-[10px] text-danger-700">{trFriendly.raw}</p>
+              )}
+            </div>
+          )}
           <PopActions>
-            <PopButton primary onClick={openTranslationWindows} disabled={targets.length === 0}>
+            {trFailure && online &&
+              (trFriendly?.action === "account" ? (
+                <PopButton primary onClick={() => openSettings("account")}>
+                  到帳號設定
+                </PopButton>
+              ) : (
+                <PopButton
+                  primary
+                  onClick={() => {
+                    clearTrFailure();
+                    setOpenChip(null);
+                  }}
+                >
+                  重試
+                </PopButton>
+              ))}
+            <PopButton primary={!trFailure} onClick={openTranslationWindows} disabled={targets.length === 0}>
               開啟譯文視窗
             </PopButton>
           </PopActions>
@@ -1279,15 +1693,19 @@ export default function ControlWindow() {
       {/* ---------- Body ---------- */}
       <div className="grid min-h-0 grid-cols-[1fr_320px]">
         {/* Transcript */}
-        <section className="flex min-h-0 flex-col border-r border-paper-200">
-          {error && !isOfflineError(error) && (() => {
-            const f = friendly(error);
+        <section className="relative flex min-h-0 flex-col border-r border-paper-200">
+          {error && !isOfflineError(error.raw) && (() => {
+            const f = errorView(error);
+            const actions = error.actions ?? [];
+            const showAccount = f.action === "account";
             return (
               <div className="mx-5 mt-4 rounded-xl border border-danger-200 bg-danger-50 px-4 py-3 text-sm text-danger-900">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1">
                     <p className="font-medium">{f.primary}</p>
-                    {f.secondary && <p className="mt-0.5 text-xs text-danger-700">{f.secondary}</p>}
+                    {f.secondary && f.secondary !== f.primary && (
+                      <p className="mt-0.5 text-xs text-danger-700">{f.secondary}</p>
+                    )}
                   </div>
                   <button
                     className="text-xs text-danger-700 hover:text-danger-900"
@@ -1297,7 +1715,43 @@ export default function ControlWindow() {
                     ✕
                   </button>
                 </div>
-                {f.primary !== f.raw && (
+                {(actions.length > 0 || showAccount) && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {actions.includes("restart") && (
+                      <ErrorButton
+                        primary
+                        disabled={!canStart}
+                        onClick={() => {
+                          setError(null);
+                          requestStart();
+                        }}
+                      >
+                        重新開始
+                      </ErrorButton>
+                    )}
+                    {actions.includes("engine") && (
+                      <ErrorButton
+                        primary
+                        disabled={retryingPrewarm}
+                        onClick={() => {
+                          setError(null);
+                          retryPrewarm();
+                        }}
+                      >
+                        {retryingPrewarm ? "重新啟動中…" : "重新啟動引擎"}
+                      </ErrorButton>
+                    )}
+                    {showAccount && (
+                      <ErrorButton onClick={() => openSettings("account")}>到帳號設定</ErrorButton>
+                    )}
+                    {actions.includes("log") && (
+                      <ErrorButton onClick={() => invoke("open_errors_log").catch(() => {})}>
+                        打開錯誤紀錄
+                      </ErrorButton>
+                    )}
+                  </div>
+                )}
+                {f.raw !== f.primary && f.raw !== f.secondary && (
                   <details className="mt-1 text-xs text-danger-700">
                     <summary className="cursor-pointer hover:text-danger-900">技術細節</summary>
                     <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-danger-100 p-2 font-mono text-[10px]">
@@ -1317,13 +1771,13 @@ export default function ControlWindow() {
             </span>
           </div>
 
-          <div ref={historyRef} className="flex-1 overflow-y-auto px-6 pb-6">
+          <div ref={historyRef} onScroll={onTranscriptScroll} className="flex-1 overflow-y-auto px-6 pb-6">
             {history.length === 0 && !latestSrc ? (
-              !prewarmResolved || hasPrewarmError ? (
+              !engineReady || engineError ? (
                 <div className="flex h-full flex-col items-center justify-center">
                   <div className="w-[320px] rounded-2xl border border-paper-200 bg-white px-6 py-5 shadow-sm">
                     <p className="mb-4 text-center font-medium text-paper-900">
-                      {hasPrewarmError ? "辨識引擎啟動失敗" : "正在啟動辨識引擎"}
+                      {engineError ? "辨識引擎啟動失敗" : "正在啟動辨識引擎"}
                     </p>
                     <PrewarmChecklist
                       stepStatus={stepStatus}
@@ -1331,7 +1785,7 @@ export default function ControlWindow() {
                       modelProgress={modelProgress}
                       modelCached={modelCached}
                     />
-                    {hasPrewarmError ? (
+                    {engineError ? (
                       <div className="mt-4 flex flex-col items-center gap-2">
                         <button
                           className="rounded-lg bg-paper-900 px-4 py-1.5 text-sm font-medium text-white hover:bg-paper-800 disabled:bg-paper-400"
@@ -1393,6 +1847,15 @@ export default function ControlWindow() {
               </ul>
             )}
           </div>
+          {showJump && (
+            <button
+              type="button"
+              className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-full border border-paper-200 bg-white px-3 py-1 text-xs font-medium text-paper-800 shadow-md transition hover:bg-paper-50"
+              onClick={jumpToLatest}
+            >
+              ↓ 回到最新
+            </button>
+          )}
         </section>
 
         {/* Side column */}
@@ -1411,8 +1874,10 @@ export default function ControlWindow() {
           />
           <div className="flex min-h-0 flex-col gap-3 overflow-hidden px-[18px] py-3.5">
             {targets.map((t) => (
-              <div key={t} className="grid grid-cols-[26px_1fr] gap-2 text-[13px] leading-normal text-paper-700">
-                <span className="pt-0.5 font-mono text-[11px] text-paper-500">{t}</span>
+              <div key={t} className="grid grid-cols-[44px_1fr] gap-2 text-[13px] leading-normal text-paper-700">
+                <span className="truncate pt-0.5 text-[11px] text-paper-500" title={t}>
+                  {zhName(t)}
+                </span>
                 <span className="line-clamp-3">{latestTr[t] || "—"}</span>
               </div>
             ))}
@@ -1427,15 +1892,46 @@ export default function ControlWindow() {
       <div className="flex items-center gap-2.5 border-t border-paper-200 bg-white px-4">
         <button
           className={`inline-flex h-11 items-center gap-2.5 rounded-xl px-7 text-base font-semibold text-white transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 ${
-            running ? "bg-recording" : "ai-fill shadow-[0_6px_18px_-8px_rgba(191,90,242,0.7)]"
+            stopping
+              ? "bg-paper-800"
+              : running
+              ? "bg-recording"
+              : startBlock === "engine_error" || startBlock === "mic"
+                ? "bg-paper-800 text-[15px] hover:bg-paper-900"
+                : "ai-fill shadow-[0_6px_18px_-8px_rgba(191,90,242,0.7)]"
           }`}
-          onClick={running ? handleStop : requestStart}
-          disabled={!running && !canStart}
-          aria-label={running ? "停止錄音" : "開始錄音"}
+          onClick={
+            stopping
+              ? undefined
+              : running
+              ? handleStop
+              : startBlock === "engine_error"
+                ? () => setOpenChip("stt")
+                : startBlock === "mic"
+                  ? () => setOpenChip("mic")
+                  : requestStart
+          }
+          onMouseDown={(e) => {
+            // Keep the window-level "click outside closes popovers" handler
+            // from immediately closing the chip this button opens.
+            if (!stopping && !running && (startBlock === "engine_error" || startBlock === "mic")) e.stopPropagation();
+          }}
+          disabled={stopping || (!running && startBlock === "preparing")}
+          aria-label={stopping ? "正在結束錄音" : running ? "停止錄音" : "開始錄音"}
           type="button"
         >
-          <span className={`inline-block h-2.5 w-2.5 bg-white ${running ? "rounded-[2px]" : "rounded-full"}`} />
-          {running ? "停止" : canStart ? "開始" : "準備中…"}
+          <span className={`inline-block h-2.5 w-2.5 bg-white ${running || stopping ? "rounded-[2px]" : "rounded-full"}`} />
+          {stopping
+            ? "正在結束…"
+            : running
+            ? "停止"
+            : startBlock === "engine_error"
+              ? "無法開始・查看辨識狀態"
+              : startBlock === "mic"
+                ? "麥克風未授權"
+                : startBlock === "preparing"
+                  ? "準備中…"
+                  : "開始"}
         </button>
         <TextButton onClick={() => setShowHistory(true)} highlight={showHistoryCoach}>
           <HistoryIcon />
@@ -1487,7 +1983,7 @@ export default function ControlWindow() {
 
       {toast && (
         <div
-          className={`pointer-events-auto fixed right-4 top-[52px] z-20 max-w-xs rounded-xl border px-4 py-2.5 text-sm shadow-lg ${
+          className={`pointer-events-auto fixed right-4 top-[52px] z-50 max-w-xs rounded-xl border px-4 py-2.5 text-sm shadow-lg ${
             toast.kind === "error"
               ? "border-danger-200 bg-danger-50 text-danger-900"
               : toast.kind === "warning"
@@ -1580,6 +2076,18 @@ export default function ControlWindow() {
           latestTranslations={latestTr}
           lagSec={lagSec}
           online={online}
+          modelLoading={modelLoading}
+          startError={error && !isOfflineError(error.raw) ? errorView(error) : null}
+          clearStartError={() => setError(null)}
+          startBlockedReason={
+            startBlock === "engine_error"
+              ? "辨識引擎啟動失敗，請回第 4 步按「重試」"
+              : startBlock === "mic"
+                ? "麥克風未授權，請回第 2 步處理"
+                : startBlock === "preparing"
+                  ? "辨識引擎還在準備中，請稍候…"
+                  : null
+          }
         />
       )}
 
@@ -1715,6 +2223,33 @@ function PopButton({
         primary
           ? "bg-paper-900 font-medium text-white hover:bg-paper-800"
           : "border border-paper-200 text-paper-800 hover:bg-paper-50"
+      }`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ErrorButton({
+  primary,
+  disabled,
+  onClick,
+  children,
+}: {
+  primary?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className={`rounded-lg px-2.5 py-1 text-xs disabled:opacity-50 ${
+        primary
+          ? "bg-danger-700 font-medium text-white hover:bg-danger-900"
+          : "border border-danger-200 bg-white text-danger-900 hover:bg-danger-100"
       }`}
       onClick={onClick}
       disabled={disabled}

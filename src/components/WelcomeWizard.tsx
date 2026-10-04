@@ -7,7 +7,13 @@ import PrewarmChecklist, {
 } from "@/components/PrewarmChecklist";
 import { LANGS, nativeName, selectLabel, zhName } from "@/lib/languages";
 import { openSlotWindow } from "@/lib/windows";
+import type { FriendlyError } from "@/lib/errors";
 import type { Config } from "@/lib/types";
+import { useSttHeardLatch } from "@/lib/useSttLevel";
+
+// Raw sidecar RMS above this counts as "the mic heard something" in the test
+// step (room noise sits well below; normal speech is ~0.05–0.2).
+const HEARD_RMS = 0.02;
 
 // 0 歡迎 → 1 選擇方式 → 2 麥克風 → 3 金鑰 → 4 語音模型 → 5 語言與視窗 → 6 試講一句
 type StepIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6;
@@ -81,6 +87,10 @@ export default function WelcomeWizard({
   latestTranslations,
   lagSec,
   online,
+  modelLoading,
+  startError,
+  clearStartError,
+  startBlockedReason,
 }: {
   initialConfig: Config;
   onDone: () => void;
@@ -101,6 +111,13 @@ export default function WelcomeWizard({
   latestTranslations: Record<string, string>;
   lagSec: number | null;
   online: boolean;
+  modelLoading?: boolean;
+  /** The console's current start/STT error, shown inside the test step so
+   *  it isn't hidden underneath the wizard. */
+  startError?: FriendlyError | null;
+  clearStartError?: () => void;
+  /** Why the test can't start yet (engine/mic), or null when it can. */
+  startBlockedReason?: string | null;
 }) {
   const [step, setStep] = useState<StepIndex>(0);
   const [provider, setProvider] = useState<"anthropic" | "openai">(
@@ -127,6 +144,10 @@ export default function WelcomeWizard({
   // Set once the user has pressed 開始試講 at least once, so the checklist
   // doesn't show "waiting" rows before the test even began.
   const [testBegun, setTestBegun] = useState(false);
+  // Latched once the sidecar reports real input level during this test run.
+  // Subscribed here as a one-shot latch so 4 Hz level samples never
+  // re-render the wizard.
+  const [heardSound, resetHeardSound] = useSttHeardLatch(running, HEARD_RMS);
   const bodyRef = useRef<HTMLDivElement>(null);
 
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
@@ -294,6 +315,7 @@ export default function WelcomeWizard({
   async function beginTest() {
     setTestStarting(true);
     setTestBegun(true);
+    resetHeardSound();
     try {
       await startTest();
     } finally {
@@ -707,7 +729,7 @@ export default function WelcomeWizard({
                         type="button"
                         className="ai-fill rounded-xl px-5 py-2.5 text-sm font-semibold disabled:opacity-50"
                         onClick={beginTest}
-                        disabled={testStarting}
+                        disabled={testStarting || !!startBlockedReason}
                       >
                         {testStarting ? "啟動中…" : testBegun ? "再試一次" : "開始試講"}
                       </button>
@@ -721,9 +743,38 @@ export default function WelcomeWizard({
                       </button>
                     )}
                     <p className="text-xs text-paper-500">
-                      例如：「大家好，今天我們來討論第三季的業績表現。」
+                      {!running && startBlockedReason
+                        ? startBlockedReason
+                        : "例如：「大家好，今天我們來討論第三季的業績表現。」"}
                     </p>
                   </div>
+                  {startError && (
+                    <div className="rounded-xl border border-danger-200 bg-danger-50 px-4 py-2.5 text-sm text-danger-900">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex-1">
+                          <p className="font-medium">{startError.primary}</p>
+                          {startError.secondary && startError.secondary !== startError.primary && (
+                            <p className="mt-0.5 text-xs text-danger-700">{startError.secondary}</p>
+                          )}
+                        </div>
+                        {clearStartError && (
+                          <button
+                            type="button"
+                            className="text-xs text-danger-700 hover:text-danger-900"
+                            onClick={clearStartError}
+                            aria-label="關閉"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {running && modelLoading && (
+                    <p className="rounded-lg border border-paper-200 bg-paper-50 px-3 py-2 text-xs text-paper-700">
+                      正在準備辨識模型，首次需要多等一下…
+                    </p>
+                  )}
                   <div className="rounded-xl border border-paper-200 bg-paper-50 px-4 py-3">
                     <p className="text-[11px] uppercase tracking-wider text-paper-500">
                       逐字稿 · {zhName(source)}
@@ -755,7 +806,11 @@ export default function WelcomeWizard({
                     )}
                   </div>
                   <div className="grid grid-cols-[auto_1fr_auto] items-center gap-x-3 gap-y-1.5 text-sm">
-                    <CheckRow ok={running || !!lastFinal} pending={testBegun && !running && !lastFinal} label="麥克風收到聲音" />
+                    <CheckRow
+                      ok={heardSound || !!lastFinal}
+                      pending={running && !heardSound && !lastFinal}
+                      label="麥克風收到聲音"
+                    />
                     <CheckRow
                       ok={!!lastFinal}
                       pending={running && !lastFinal}

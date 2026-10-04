@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Config, GlossaryBook, GlossaryEntry } from "@/lib/types";
 import { LANGS, selectLabel, zhName } from "@/lib/languages";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 
 const EXAMPLE_ENTRY: GlossaryEntry = {
   term: "紫微斗數",
@@ -83,6 +84,14 @@ export default function GlossaryModal({
   // this guard, every cfg refresh would re-trigger the initialTerm useEffect
   // and overwrite the user's in-progress edits.
   const [prefillHandled, setPrefillHandled] = useState(false);
+
+  // Esc cancels a pending delete confirm first; otherwise closes the modal
+  // (same as ✕).
+  const handleEscape = useCallback(() => {
+    if (confirmDelete) setConfirmDelete(false);
+    else onClose();
+  }, [confirmDelete, onClose]);
+  useEscapeKey(true, handleEscape);
 
   useEffect(() => {
     invoke<Config>("get_config")

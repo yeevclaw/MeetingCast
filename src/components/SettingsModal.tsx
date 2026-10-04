@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import type { Config } from "@/lib/types";
 import { LANGS, zhName } from "@/lib/languages";
+import { useEscapeKey } from "@/lib/useEscapeKey";
 import {
   INTERP_CALL_MULTIPLIER,
   INTERP_COST_INCREASE,
@@ -48,6 +49,19 @@ const SUMMARY_TARGETS: Array<{ id: string; label: string }> = LANGS.map((l) => (
 }));
 
 type Backend = "local" | "openai";
+
+/** Tri-state result from the Rust validate_*_key commands, plus in-flight. */
+type KeyCheck = "valid" | "invalid" | "unknown" | "checking";
+
+function KeyCheckHint({ check }: { check: KeyCheck | null }) {
+  if (check === "checking") return <p className="mt-1 text-xs text-paper-500">驗證中…</p>;
+  if (check === "valid") return <p className="mt-1 text-xs text-ok-700">✓ 有效</p>;
+  if (check === "invalid")
+    return <p className="mt-1 text-xs text-danger-700">無效：請確認是否複製完整</p>;
+  if (check === "unknown")
+    return <p className="mt-1 text-xs text-warn-700">無法確認（網路問題），仍可儲存</p>;
+  return null;
+}
 // Per-meeting settings (languages, STT engine, mic) live on the console's
 // 本場設定 card (SessionSetupCard); this modal only holds what rarely changes.
 export type SettingsTab = "account" | "advanced";
@@ -97,12 +111,70 @@ export default function SettingsModal({
   // Enabling 同步口譯模式 multiplies translate calls; the toggle only flips
   // after the user reads the cost notice and confirms. Disabling never asks.
   const [confirmInterp, setConfirmInterp] = useState(false);
+  // 使用麥克風 is a draft like every other field: applied on 儲存, dropped
+  // on 取消 (it lives in console state, not config, so it's applied via
+  // setUseMic rather than set_config).
+  const [micDraft, setMicDraft] = useState(useMic);
+  // Snapshot of the config as loaded, for the unsaved-changes check.
+  const loadedJson = useRef<string | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [openaiCheck, setOpenaiCheck] = useState<KeyCheck | null>(null);
+  const [anthropicCheck, setAnthropicCheck] = useState<KeyCheck | null>(null);
+  // Last key value each check ran against, so blur without edits doesn't re-bill a probe.
+  const checkedKey = useRef<{ openai: string | null; anthropic: string | null }>({
+    openai: null,
+    anthropic: null,
+  });
   useEffect(() => {
     invoke<Config>("get_config")
-      .then(setCfg)
+      .then((c) => {
+        loadedJson.current = JSON.stringify(c);
+        setCfg(c);
+      })
       .catch((e) => setError(`load: ${e}`));
     getVersion().then(setVersion).catch(() => {});
   }, []);
+
+  const dirty =
+    micDraft !== useMic ||
+    (cfg != null && loadedJson.current != null && JSON.stringify(cfg) !== loadedJson.current);
+
+  // ✕ / 取消 / Esc all go through here: unsaved edits ask before discarding.
+  const requestClose = useCallback(() => {
+    if (dirty) setConfirmDiscard(true);
+    else onClose();
+  }, [dirty, onClose]);
+  useEscapeKey(
+    true,
+    useCallback(() => {
+      if (confirmDiscard) setConfirmDiscard(false);
+      else requestClose();
+    }, [confirmDiscard, requestClose]),
+  );
+
+  async function validateKey(which: "openai" | "anthropic", value: string) {
+    const key = value.trim();
+    const set = which === "openai" ? setOpenaiCheck : setAnthropicCheck;
+    if (!key) {
+      checkedKey.current[which] = null;
+      set(null);
+      return;
+    }
+    if (checkedKey.current[which] === key) return;
+    checkedKey.current[which] = key;
+    set("checking");
+    try {
+      const r = await invoke<string>(
+        which === "openai" ? "validate_openai_key" : "validate_anthropic_key",
+        { key },
+      );
+      // Ignore a stale answer if the field changed while we waited.
+      if (checkedKey.current[which] !== key) return;
+      set(r === "valid" || r === "invalid" ? r : "unknown");
+    } catch {
+      if (checkedKey.current[which] === key) set("unknown");
+    }
+  }
 
   async function handleSave() {
     if (!cfg) return;
@@ -110,6 +182,7 @@ export default function SettingsModal({
     setError(null);
     try {
       await invoke("set_config", { config: cfg });
+      if (micDraft !== useMic) setUseMic(micDraft);
       onClose();
     } catch (e) {
       setError(`save: ${e}`);
@@ -163,7 +236,7 @@ export default function SettingsModal({
           <h2 className="text-lg font-semibold text-paper-900">設定</h2>
           <button
             className="rounded-md px-2 py-0.5 text-paper-500 hover:bg-paper-100 hover:text-paper-900"
-            onClick={onClose}
+            onClick={requestClose}
             aria-label="關閉"
           >
             ✕
@@ -245,7 +318,12 @@ export default function SettingsModal({
                         type={showOpenai ? "text" : "password"}
                         className={`flex-1 font-mono text-xs ${INPUT}`}
                         value={cfg.api.openai_api_key}
-                        onChange={(e) => update({ openai_api_key: e.target.value })}
+                        onChange={(e) => {
+                          update({ openai_api_key: e.target.value });
+                          checkedKey.current.openai = null;
+                          setOpenaiCheck(null);
+                        }}
+                        onBlur={(e) => validateKey("openai", e.target.value)}
                         placeholder={openaiRequired ? "sk-..." : "（可留空）"}
                       />
                       <button
@@ -256,6 +334,7 @@ export default function SettingsModal({
                         {showOpenai ? "隱藏" : "顯示"}
                       </button>
                     </div>
+                    <KeyCheckHint check={openaiCheck} />
                   </Field>
 
                   <Field
@@ -276,7 +355,12 @@ export default function SettingsModal({
                         type={showAnthropic ? "text" : "password"}
                         className={`flex-1 font-mono text-xs ${INPUT}`}
                         value={cfg.api.anthropic_api_key}
-                        onChange={(e) => update({ anthropic_api_key: e.target.value })}
+                        onChange={(e) => {
+                          update({ anthropic_api_key: e.target.value });
+                          checkedKey.current.anthropic = null;
+                          setAnthropicCheck(null);
+                        }}
+                        onBlur={(e) => validateKey("anthropic", e.target.value)}
                         placeholder="sk-ant-api03-..."
                       />
                       <button
@@ -287,6 +371,7 @@ export default function SettingsModal({
                         {showAnthropic ? "隱藏" : "顯示"}
                       </button>
                     </div>
+                    <KeyCheckHint check={anthropicCheck} />
                   </Field>
 
                   <Field label="翻譯模型" hint="費用為概估：兩個譯文視窗、每小時約 30 分鐘語音">
@@ -368,14 +453,14 @@ export default function SettingsModal({
 
                   <Field
                     label="音源"
-                    hint={running ? lockedHint : "預設使用麥克風；取消勾選則跑內建 weather demo 音檔"}
+                    hint={running ? lockedHint : "預設使用麥克風；取消勾選則跑內建 weather demo 音檔（按「儲存」後生效）"}
                   >
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
                       <input
                         type="checkbox"
                         className={CHECKBOX}
-                        checked={useMic}
-                        onChange={(e) => setUseMic(e.target.checked)}
+                        checked={micDraft}
+                        onChange={(e) => setMicDraft(e.target.checked)}
                         disabled={running}
                       />
                       使用麥克風
@@ -627,7 +712,7 @@ export default function SettingsModal({
             <button
               type="button"
               className="rounded-md px-3 py-1.5 text-sm text-paper-600 hover:bg-paper-100"
-              onClick={onClose}
+              onClick={requestClose}
             >
               取消
             </button>
@@ -642,6 +727,39 @@ export default function SettingsModal({
           </div>
         </footer>
       </div>
+
+      {confirmDiscard && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-paper-900/30 p-4">
+          <div
+            role="alertdialog"
+            aria-label="放棄未儲存的變更"
+            className="w-full max-w-sm rounded-2xl border border-paper-200 bg-white p-5 shadow-xl"
+          >
+            <h2 className="text-base font-semibold text-paper-900">放棄未儲存的變更？</h2>
+            <p className="mt-2 text-sm text-paper-600">這次在設定裡改的內容還沒儲存，關閉後會還原。</p>
+            <footer className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-lg px-3 py-1.5 text-sm text-paper-600 hover:bg-paper-100"
+                onClick={() => setConfirmDiscard(false)}
+                autoFocus
+              >
+                繼續編輯
+              </button>
+              <button
+                type="button"
+                className="rounded-lg bg-danger-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-danger-900"
+                onClick={() => {
+                  setConfirmDiscard(false);
+                  onClose();
+                }}
+              >
+                放棄變更
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

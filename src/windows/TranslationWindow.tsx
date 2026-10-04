@@ -1,11 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emptyState, langInfo, nativeName } from "@/lib/languages";
-import type { ChunkPayload, Config, TranscriptPayload } from "@/lib/types";
+import type { ChunkPayload, Config, DonePayload, TranscriptPayload } from "@/lib/types";
 
 const FADE_WINDOW = 5;
+// Only the most recent rows are rendered (older ones sit at the 0.3 floor
+// anyway; the full record lives in history). State keeps a little more so a
+// late chunk for a just-scrolled-off row still finds its row.
+const RENDER_CAP = 50;
+const STATE_CAP = 200;
+// A placeholder that never received a chunk is dropped after this long, in
+// case its skip/error/done event got lost.
+const PLACEHOLDER_TTL_MS = 20_000;
+// "Stick to bottom" only when the reader is already this close to it.
+const STICK_THRESHOLD_PX = 40;
+// After the session stops, wait before dimming so the last lines stay readable.
+const ENDED_DIM_DELAY_MS = 4_000;
 const FONT_STEP = 4;
 const FONT_MIN = 20;
 const FONT_MAX = 64;
@@ -14,7 +26,60 @@ const FONT_HEIGHT_DIVISOR = 11;
 
 // One displayed line. The source text was never rendered here, so a slot only
 // needs the target-language `text` for its own utterance id.
-type Row = { id: string; text: string };
+// `done` = no more text will arrive (translation finished, skipped or failed).
+type Row = { id: string; text: string; done: boolean; createdAt: number };
+
+type ErrorPayload = { id: string; message: string };
+
+function newRow(id: string, text: string): Row {
+  return { id, text, done: false, createdAt: Date.now() };
+}
+
+/** Immutably apply `fn` to the row with `id` (null = remove it). Rows that
+ *  aren't found are created via `create` when given. Unchanged rows keep their
+ *  identity so the memoized row components skip re-rendering. */
+function patchRow(
+  rows: Row[],
+  id: string,
+  fn: (r: Row) => Row | null,
+  create?: () => Row,
+): Row[] {
+  const idx = rows.findIndex((r) => r.id === id);
+  if (idx === -1) {
+    if (!create) return rows;
+    const next = [...rows, create()];
+    return next.length > STATE_CAP ? next.slice(-STATE_CAP) : next;
+  }
+  const updated = fn(rows[idx]);
+  if (updated === rows[idx]) return rows;
+  if (updated === null) return [...rows.slice(0, idx), ...rows.slice(idx + 1)];
+  return [...rows.slice(0, idx), updated, ...rows.slice(idx + 1)];
+}
+
+/** skip / error: an empty placeholder goes away; partial text stays, frozen. */
+function settleRow(r: Row): Row | null {
+  if (!r.text) return null;
+  return r.done ? r : { ...r, done: true };
+}
+
+const RowItem = memo(function RowItem({
+  text,
+  opacity,
+  fontSize,
+}: {
+  text: string;
+  opacity: number;
+  fontSize: number;
+}) {
+  return (
+    <li
+      className="font-medium leading-snug transition-opacity duration-500"
+      style={{ opacity, fontSize: `${fontSize}px` }}
+    >
+      {text || <span className="text-stage-dim">…</span>}
+    </li>
+  );
+});
 
 type NetworkPayload = { online: boolean };
 
@@ -66,8 +131,13 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
   // Session state driving the aura + banners.
   const [live, setLive] = useState(false);
   const [ended, setEnded] = useState(false);
+  // `ended` lagged by ENDED_DIM_DELAY_MS — drives the post-session dim.
+  const [endedDim, setEndedDim] = useState(false);
   const [online, setOnline] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Whether the reader is at (or near) the bottom. Updated on user scroll only;
+  // content growth doesn't fire scroll events, so it reflects their intent.
+  const stickRef = useRef(true);
 
   // Read language + appearance from config. Called on mount and whenever Rust
   // signals a change; the event payloads are never trusted, only get_config.
@@ -154,35 +224,34 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
         // Incremental mode groups several segments under one utterance id;
         // sentence mode keys by t_start. Either way one row per utterance.
         const id = utterance_id ?? String(t_start);
-        setRows((prev) => {
-          if (prev.some((u) => u.id === id)) return prev; // dedup
-          return [...prev, { id, text: "" }];
-        });
+        // patchRow's identity fn = dedup when the row already exists.
+        setRows((prev) => patchRow(prev, id, (r) => r, () => newRow(id, "")));
       }),
       listen<ChunkPayload>(`translation:chunk:${lang}`, (e) => {
         const { id, text } = e.payload;
-        setRows((us) => {
-          const idx = us.findIndex((u) => u.id === id);
-          if (idx === -1) {
-            // chunk arrived before the transcript event reached this window
-            return [...us, { id, text }];
-          }
-          const updated: Row = { ...us[idx], text: us[idx].text + text };
-          return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
-        });
+        if (!text) return;
+        // A missing row = chunk arrived before the transcript event did.
+        setRows((us) =>
+          patchRow(us, id, (r) => ({ ...r, text: r.text + text }), () => newRow(id, text)),
+        );
       }),
       // Non-streaming retry after a mid-stream break: REPLACE the displayed
       // text for this utterance rather than appending onto the partial.
       listen<ChunkPayload>(`translation:replace:${lang}`, (e) => {
         const { id, text } = e.payload;
-        setRows((us) => {
-          const idx = us.findIndex((u) => u.id === id);
-          if (idx === -1) {
-            return [...us, { id, text }];
-          }
-          const updated: Row = { ...us[idx], text };
-          return [...us.slice(0, idx), updated, ...us.slice(idx + 1)];
-        });
+        setRows((us) => patchRow(us, id, (r) => ({ ...r, text }), () => newRow(id, text)));
+      }),
+      listen<DonePayload>(`translation:done:${lang}`, (e) => {
+        // Done with no text is effectively a skip.
+        setRows((us) => patchRow(us, e.payload.id, settleRow));
+      }),
+      // This row will never be translated (too short / offline / failed).
+      listen<DonePayload>(`translation:skip:${lang}`, (e) => {
+        setRows((us) => patchRow(us, e.payload.id, settleRow));
+      }),
+      // Errors surface in the control window; the projector only settles the row.
+      listen<ErrorPayload>(`translation:error:${lang}`, (e) => {
+        setRows((us) => patchRow(us, e.payload.id, settleRow));
       }),
       listen("session:reset", () => {
         setRows([]);
@@ -197,17 +266,55 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
     };
   }, [lang]);
 
+  // Safety net: drop placeholders that never got a single chunk.
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const t = window.setInterval(() => {
+      const now = Date.now();
+      setRows((us) => {
+        const keep = us.filter((r) => r.text || now - r.createdAt < PLACEHOLDER_TTL_MS);
+        return keep.length === us.length ? us : keep;
+      });
+    }, 5_000);
+    return () => window.clearInterval(t);
+  }, []);
+
+  // Delay the post-session dim; un-dim immediately when a new session starts.
+  useEffect(() => {
+    if (!ended) {
+      setEndedDim(false);
+      return;
     }
-  }, [rows]);
+    const t = window.setTimeout(() => setEndedDim(true), ENDED_DIM_DELAY_MS);
+    return () => window.clearTimeout(t);
+  }, [ended]);
+
+  function onScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+  }
 
   // Auto font size follows the window height; A− / A+ is a persisted offset.
   useEffect(() => {
     const onResize = () => setBaseFont(baseFontSize());
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Fullscreen can be left via the green button / ⌃⌘F without our toggle;
+  // re-read the real state on every resize so the button doesn't desync.
+  useEffect(() => {
+    const w = getCurrentWindow();
+    const sync = () => {
+      w.isFullscreen()
+        .then(setFullscreen)
+        .catch(() => {});
+    };
+    sync();
+    const un = w.onResized(sync);
+    return () => {
+      un.then((u) => u());
+    };
   }, []);
 
   async function togglePin() {
@@ -247,6 +354,29 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
   // Borderless is the "projector only shows words" mode — drop the aura too.
   const auraOff = !glow || borderless;
 
+  // Follow new text only when the reader is already at the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [rows, fontSize]);
+
+  const visible = rows.length > RENDER_CAP ? rows.slice(-RENDER_CAP) : rows;
+  // Fade distance counts only rows with text, so trailing placeholders can't
+  // push real translations into the faded zone. A placeholder takes the
+  // distance of the text row that would follow it.
+  const distances: number[] = new Array(visible.length);
+  {
+    let textAfter = 0;
+    for (let i = visible.length - 1; i >= 0; i--) {
+      if (visible[i].text) {
+        distances[i] = textAfter;
+        textAfter++;
+      } else {
+        distances[i] = Math.max(0, textAfter - 1);
+      }
+    }
+  }
+
   const btn = (active: boolean) =>
     `rounded px-2 py-0.5 transition-colors hover:bg-stage-rule hover:text-stage-fg ${
       active ? "bg-stage-rule text-stage-fg" : ""
@@ -254,22 +384,39 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
 
   return (
     <main
-      className={`aura-host flex h-screen flex-col bg-stage-bg text-stage-fg ${
+      className={`aura-host group flex h-screen flex-col bg-stage-bg text-stage-fg ${
         lightTheme ? "stage-light" : ""
       }`}
       data-aura={auraOff ? "off" : undefined}
       data-live={live ? "true" : undefined}
       data-paused={paused ? "true" : undefined}
     >
-      <header className="flex flex-shrink-0 items-center justify-between border-b border-stage-rule bg-stage-chrome px-4 py-1.5 text-xs text-stage-dim">
-        <span className="flex items-center gap-2">
-          <b className="text-[13px] font-semibold tracking-wide text-stage-fg">
+      {/* Drag handle: Tauri only honours data-tauri-drag-region on the element
+          itself, so the non-interactive children carry it too. */}
+      <header
+        data-tauri-drag-region
+        className="flex flex-shrink-0 items-center justify-between border-b border-stage-rule bg-stage-chrome px-4 py-1.5 text-xs text-stage-dim"
+      >
+        <span data-tauri-drag-region className="flex items-center gap-2">
+          <b
+            data-tauri-drag-region
+            className="text-[13px] font-semibold tracking-wide text-stage-fg"
+          >
             {lang ? nativeName(lang) : "譯文視窗"}
           </b>
-          {ended && !disabled && <span className="text-[11px]">已結束</span>}
+          {ended && !disabled && (
+            <span data-tauri-drag-region className="text-[11px]">
+              已結束
+            </span>
+          )}
         </span>
         {!disabled && (
-          <div className="flex items-center gap-1">
+          // Borderless = projector mode: controls only appear while hovering.
+          <div
+            className={`flex items-center gap-1 transition-opacity duration-300 ${
+              borderless ? "opacity-0 group-hover:opacity-100 focus-within:opacity-100" : ""
+            }`}
+          >
             <button className={btn(false)} onClick={() => bumpFont(-FONT_STEP)} aria-label="字小">
               A−
             </button>
@@ -304,7 +451,7 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
         )}
       </header>
 
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto px-10 py-6">
+      <div ref={scrollRef} onScroll={onScroll} className="relative flex-1 overflow-y-auto px-10 py-6">
         {disabled ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-stage-dim">
             <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
@@ -325,25 +472,19 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
           </div>
         ) : (
           <ul className="space-y-4">
-            {rows.map((u, idx) => {
-              const distanceFromLast = rows.length - 1 - idx;
-              // Last FADE_WINDOW items get a fresh→dim gradient; older items
-              // stay at the 0.3 floor (still readable, scrollable). After the
-              // session ends the whole column dims by half.
+            {visible.map((u, idx) => {
+              const distanceFromLast = distances[idx];
+              // Last FADE_WINDOW text rows get a fresh→dim gradient; older
+              // items stay at the 0.3 floor (still readable, scrollable). A
+              // few seconds after the session ends the column dims by half —
+              // except the newest row while it is still streaming.
               const base =
                 distanceFromLast >= FADE_WINDOW
                   ? 0.3
                   : Math.max(0.3, 1 - distanceFromLast * 0.18);
-              const opacity = ended ? base * 0.5 : base;
-              return (
-                <li
-                  key={u.id}
-                  className="font-medium leading-snug transition-opacity duration-500"
-                  style={{ opacity, fontSize: `${fontSize}px` }}
-                >
-                  {u.text || <span className="text-stage-dim">…</span>}
-                </li>
-              );
+              const streamingLast = idx === visible.length - 1 && !u.done;
+              const opacity = endedDim && !streamingLast ? base * 0.5 : base;
+              return <RowItem key={u.id} text={u.text} opacity={opacity} fontSize={fontSize} />;
             })}
           </ul>
         )}

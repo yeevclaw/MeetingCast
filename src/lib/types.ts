@@ -31,6 +31,27 @@ export type DonePayload = {
   id: string;
 };
 
+// `translation:error:{lang}` (incremental mode). `message` is the raw backend
+// error — run it through friendly(); an "offline:" prefix means paused.
+export type TranslationErrorPayload = {
+  id: string;
+  message: string;
+};
+
+// `stt:signal` — structured runtime state changes from the sidecar. The
+// matching `stt:warning` string still fires; the console prefers this one.
+export type SttSignalCode =
+  | "reconnecting"
+  | "reconnected"
+  | "mic_stalled"
+  | "mic_resumed"
+  | "device_fallback";
+export type SttSignalPayload = {
+  code: SttSignalCode | string;
+  message: string;
+  device?: string;
+};
+
 export type AudioDevice = {
   name: string;
   channels: number;
