@@ -315,7 +315,7 @@ async fn run_target(app: AppHandle, group: SharedGroup, lang: String) {
             if !need {
                 break;
             }
-            if closed && src_chars < MIN_TRANSLATE_CHARS {
+            if closed && (src_chars < MIN_TRANSLATE_CHARS || crate::translator::is_untranslatable(&source)) {
                 ts.finished = true;
                 ts.translated_chars = src_chars;
                 // Source-only row: tell the window to drop its placeholder.

@@ -26,6 +26,7 @@ import type {
   TranslationErrorPayload,
 } from "@/lib/types";
 import { useEscapeKey } from "@/lib/useEscapeKey";
+import { isUntranslatable } from "@/lib/untranslatable";
 import { isSlotWindowOpen, openSlotWindow, type SlotLabel } from "@/lib/windows";
 
 type Toast = { kind: "info" | "warning" | "error"; message: string };
@@ -859,7 +860,7 @@ export default function ControlWindow() {
           // user value (and often produces meta-prefix-filtered junk). Also
           // covers the no-target case. Still record the source-only row so
           // the meeting transcript is faithful.
-          if (text.trim().length < 2 || ts.length === 0) {
+          if (text.trim().length < 2 || isUntranslatable(text) || ts.length === 0) {
             // Windows seated a "…" row for this final — release it.
             emitSkip(
               id,

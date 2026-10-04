@@ -708,10 +708,16 @@ const META_MARKERS: &[&str] = &[
     "don't form coherent",
     "garbled or incomplete",
     "incomplete fragments",
+    "i cannot provide a translation",
+    "<empty",
+    "(empty)",
     // Vietnamese meta
     "vui lòng cung cấp",
     "tôi không thể dịch",
     "tôi xin lỗi nhưng tôi",
+    "tôi không thể đưa ra bản dịch",
+    "không có nội dung để dịch",
+    "không có nội dung tiếng",
     // Chinese meta (Claude responding in Chinese instead of target lang)
     "明白，我",
     "請提供",
@@ -742,6 +748,27 @@ const META_MARKERS: &[&str] = &[
     "សូមផ្តល់អត្ថបទ",
     "អត្ថបទមិនពេញលេញ",
 ];
+
+/// Input that has nothing to translate: no letter or digit at all (pure
+/// punctuation / symbols), or one character repeated 20+ times in a row (the
+/// Whisper silence failure, e.g. 「示示示…」). Decided in code so the model is
+/// never asked — given such input it writes placeholders like 「(空字串)」 or
+/// "<empty string>" instead of nothing (golden eval, both prompt versions).
+pub(crate) fn is_untranslatable(text: &str) -> bool {
+    if !text.chars().any(char::is_alphanumeric) {
+        return true;
+    }
+    let mut run = 0;
+    let mut prev = None;
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        run = if prev == Some(c) { run + 1 } else { 1 };
+        if run >= 20 {
+            return true;
+        }
+        prev = Some(c);
+    }
+    false
+}
 
 /// Detect when Claude breaks character and meta-comments instead of translating.
 /// Scan the first META_SCAN_CHARS characters for any blocklist substring.
@@ -2050,4 +2077,14 @@ mod tests {
         assert!(sys.contains("將中文會議逐字稿轉成投影片大綱"), "{sys}");
         assert!(sys.contains("封面"), "{sys}");
     }
+    #[test]
+    fn untranslatable_inputs_are_decided_in_code() {
+        for s in ["。。。，，，！！？？…………", "◆◆▲▲●●※※§§", "示示示示示示示示示示示示示示示示示示示示示示示示", "啊 啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊"] {
+            assert!(is_untranslatable(s), "{s}");
+        }
+        for s in ["嗯。", "好好好，我們開始", "第二季成長 20%", "API"] {
+            assert!(!is_untranslatable(s), "{s}");
+        }
+    }
+
 }

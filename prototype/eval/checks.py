@@ -54,10 +54,16 @@ META_MARKERS = (
     "don't form coherent",
     "garbled or incomplete",
     "incomplete fragments",
+    "i cannot provide a translation",
+    "<empty",
+    "(empty)",
     # Vietnamese meta
     "vui lòng cung cấp",
     "tôi không thể dịch",
     "tôi xin lỗi nhưng tôi",
+    "tôi không thể đưa ra bản dịch",
+    "không có nội dung để dịch",
+    "không có nội dung tiếng",
     # Chinese meta (Claude responding in Chinese instead of target lang)
     "明白，我",
     "請提供",
