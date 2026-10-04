@@ -16,10 +16,13 @@ Traditional Chinese is sent as `zh-tw`.
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import sys
 import wave
 from collections import deque
+from collections.abc import Callable
 from typing import AsyncIterator
 
 import numpy as np
@@ -28,6 +31,7 @@ import websockets
 from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
+from .vad_tools import ProbTap
 from .openai_transcription_config import (
     DEFAULT_DELAY,
     LIVE_TRANSCRIBE_MODEL,
@@ -44,6 +48,221 @@ MODEL = LIVE_TRANSCRIBE_MODEL
 
 WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 MIN_SPEECH_SEC = 0.25  # drop sub-syllable VAD opens (clicks/keyboard taps)
+
+# ---- Connection resilience --------------------------------------------------
+# Backoff between reconnect attempts (the last value repeats). The outage is
+# abandoned once it has lasted RECONNECT_GIVE_UP_SEC in total.
+RECONNECT_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0)
+RECONNECT_GIVE_UP_SEC = 60.0
+# A connection that stayed up at least this long counts as healthy and resets
+# the outage clock; one that drops sooner (connect → immediate close loop)
+# keeps accumulating toward the give-up limit.
+HEALTHY_CONNECTION_SEC = 5.0
+# `reconnected` is only announced once a new connection has stayed up this
+# long, so a flapping link yields one `reconnecting` + one `reconnected` per
+# outage instead of a toast pair per flap.
+RECONNECT_STABLE_SEC = 5.0
+CONNECT_TIMEOUT_SEC = 10.0
+# Audio captured while disconnected (and during the first handshake) is kept,
+# newest-wins, up to this much and sent once the session is (re)established.
+OUTAGE_BUFFER_SEC = 10.0
+# After the audio source ends (stop / end of file): how long to wait for the
+# transcriptions of already-committed utterances before giving up.
+DRAIN_TIMEOUT_SEC = 2.0
+
+# Forced commit of over-long continuous speech: within the last
+# FORCED_CUT_LOOKBACK_SEC before max_speech_sec, commit early at the first
+# window whose VAD probability dips below this (a breath / word gap) instead
+# of hard-cutting at the cap. Audio is streamed live, so the cut has to be
+# decided online rather than by looking back for the minimum.
+FORCED_CUT_LOOKBACK_SEC = 1.5
+FORCED_CUT_DIP_PROB = 0.35
+
+
+class RealtimeSTTError(RuntimeError):
+    """Unrecoverable cloud-STT failure. `user_message` is 繁體中文 and is
+    surfaced as-is in the sidecar's `error` event."""
+
+    def __init__(self, user_message: str, detail: str = ""):
+        super().__init__(f"{user_message} {detail}".strip())
+        self.user_message = user_message
+
+
+class _Disconnected(Exception):
+    """The session ended (server closed / asked us to reconnect)."""
+
+
+_IGNORABLE_ERROR_HINTS = (
+    "input_audio_buffer_commit_empty",
+    "buffer too small",
+    "buffer_too_small",
+)
+_FATAL_ERROR_HINTS = (
+    "invalid_api_key",
+    "api key",
+    "api_key",
+    "authentication",
+    "unauthorized",
+    "insufficient_quota",
+    "quota",
+    "billing",
+    "permission",
+    "model_not_found",
+    "invalid_model",
+)
+_RECONNECT_ERROR_HINTS = (
+    "server_error",
+    "session_expired",
+    "rate_limit",
+    "overloaded",
+)
+
+
+def classify_server_error(error) -> str:
+    """Classify a Realtime `error` event payload.
+
+    Returns:
+      "ignore"    — harmless, keep the session (e.g. a commit on an empty
+                    buffer after an outage trimmed its audio);
+      "fatal"     — retrying can't help (auth, quota, rejected session
+                    config): stop and tell the user;
+      "reconnect" — transient server-side trouble or an expired session:
+                    drop this connection and reconnect.
+    Unknown errors are logged and ignored; if the server really is broken
+    it will close the socket, which triggers a reconnect anyway."""
+    if not isinstance(error, dict):
+        error = {"message": str(error)}
+    blob = " ".join(
+        str(error.get(k) or "") for k in ("code", "type", "message")
+    ).lower()
+    param = str(error.get("param") or "").lower()
+    if any(h in blob for h in _IGNORABLE_ERROR_HINTS):
+        return "ignore"
+    if any(h in blob for h in _FATAL_ERROR_HINTS):
+        return "fatal"
+    if param.startswith("session"):
+        return "fatal"
+    if any(h in blob for h in _RECONNECT_ERROR_HINTS):
+        return "reconnect"
+    return "ignore"
+
+
+def _handshake_status(exc: BaseException) -> int | None:
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable_connection_error(exc: BaseException) -> bool:
+    """True for transport-level failures worth a reconnect: network errors,
+    timeouts, dropped sockets, 408/429/5xx handshakes. 4xx handshakes (bad
+    key, no access) are not."""
+    status = _handshake_status(exc)
+    if status is not None:
+        return status in (408, 429) or status >= 500
+    return isinstance(
+        exc,
+        (
+            _Disconnected,
+            websockets.ConnectionClosed,
+            websockets.exceptions.WebSocketException,
+            OSError,
+            TimeoutError,
+        ),
+    )
+
+
+class _Outbox:
+    """Ordered queue of messages waiting to go out on the websocket:
+    ("audio", pcm24k_bytes) and ("commit", None). Bounded to
+    `max_audio_bytes` of audio, newest-wins: when an outage overflows it the
+    oldest queued audio is dropped.
+
+    The writer `pop()`s an item BEFORE sending it and `requeue()`s it on a
+    failed send, so a trim running while a send is in flight can never drop
+    the in-flight item (and a later pop can never remove an unsent one —
+    the old peek/send/pop order could lose a commit that way).
+
+    Commits are only dropped when they became redundant: a commit at the head
+    with no audio sent to the server since the last commit (it would only
+    produce `input_audio_buffer_commit_empty`), or a commit directly after
+    another commit once the audio between them was trimmed. A commit whose
+    utterance already has audio on the server is kept."""
+
+    def __init__(self, max_audio_bytes: int):
+        self.max_audio_bytes = max_audio_bytes
+        self.audio_bytes = 0
+        self.dropped_bytes = 0
+        self._items: deque[tuple[str, bytes | None]] = deque()
+        self.event = asyncio.Event()
+        # Audio handed to the socket (in flight or sent) since the last
+        # commit on the current connection — a head commit then still has
+        # something to commit.
+        self.server_has_audio = False
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def push_audio(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        self._items.append(("audio", pcm))
+        self.audio_bytes += len(pcm)
+        if self.audio_bytes > self.max_audio_bytes:
+            self._trim()
+        self.event.set()
+
+    def _trim(self) -> None:
+        items = list(self._items)
+        i = 0
+        while self.audio_bytes > self.max_audio_bytes and i < len(items):
+            kind, payload = items[i]
+            if kind == "audio":
+                self.audio_bytes -= len(payload)
+                self.dropped_bytes += len(payload)
+                items[i] = None
+            i += 1
+        kept: deque[tuple[str, bytes | None]] = deque()
+        # A head commit is redundant unless the server holds uncommitted audio.
+        prev = "audio" if self.server_has_audio else "commit"
+        for item in items:
+            if item is None:
+                continue
+            if item[0] == "commit" and prev == "commit":
+                continue
+            kept.append(item)
+            prev = item[0]
+        self._items = kept
+
+    def push_commit(self) -> None:
+        self._items.append(("commit", None))
+        self.event.set()
+
+    def pop(self) -> tuple[str, bytes | None]:
+        """Take the head item for sending (it leaves the queue now)."""
+        kind, payload = self._items.popleft()
+        if kind == "audio":
+            self.audio_bytes -= len(payload)
+            self.server_has_audio = True
+        else:
+            self.server_has_audio = False
+        return kind, payload
+
+    def requeue(self, kind: str, payload: bytes | None) -> None:
+        """Put back an item whose send failed, at the head, for the next
+        connection."""
+        self._items.appendleft((kind, payload))
+        if kind == "audio":
+            self.audio_bytes += len(payload)
+
+    def connection_reset(self) -> None:
+        """A new connection starts with an empty server-side buffer."""
+        self.server_has_audio = False
 
 SENTENCE_END_CHARS = "。？！?!."
 MIN_SEGMENT_CHARS = 6  # don't early-emit tiny sentences; they ride along with the next one
@@ -278,6 +497,29 @@ class _SentenceSplitter:
             out.append(Transcript(text=tail, is_final=False))
         return out
 
+    def flush_item(self, iid: str) -> Transcript | None:
+        """Close an item that will never complete (transcription failed, or
+        its connection dropped): emit the not-yet-emitted part of the delta
+        text accumulated so far as a final, so text the user already saw as
+        an interim isn't lost."""
+        done = self._emitted.pop(iid, "")
+        accumulated = self._partials.pop(iid, "")
+        remainder = accumulated[len(done):].strip()
+        if not remainder:
+            return None
+        return Transcript(
+            text=remainder, is_final=True, boundary=_closing_boundary(remainder)
+        )
+
+    def flush_all(self) -> list[Transcript]:
+        """flush_item for every open item, in arrival order."""
+        out: list[Transcript] = []
+        for iid in list(self._partials):
+            t = self.flush_item(iid)
+            if t:
+                out.append(t)
+        return out
+
     def on_completed(self, iid: str, text: str) -> Transcript | None:
         done = self._emitted.pop(iid, "")
         accumulated = self._partials.pop(iid, "")
@@ -306,6 +548,7 @@ class OpenAILiveTranscribeSTT:
         keywords: list[str] | None = None,
         delay: str = DEFAULT_DELAY,
         segmentation: str = SEGMENTATION_SENTENCE,
+        on_warning: Callable[[dict], None] | None = None,
     ):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -323,12 +566,24 @@ class OpenAILiveTranscribeSTT:
         # higher = more audio context per emitted word (better WER).
         self.delay = delay
         self.segmentation = segmentation
+        # Sink for structured warnings ({code, message}); the sidecar turns
+        # them into `warning` events. None (CLI) → stderr.
+        self._on_warning = on_warning
         self._vad_model = None
 
     def _vad(self):
         if self._vad_model is None:
             self._vad_model = load_silero_vad()
         return self._vad_model
+
+    def _warn(self, code: str, message: str) -> None:
+        if self._on_warning is not None:
+            try:
+                self._on_warning({"code": code, "message": message})
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        print(f"[openai {code}] {message}", file=sys.stderr, flush=True)
 
     def _auth_headers(self) -> dict:
         return {"Authorization": f"Bearer {self._api_key}"}
@@ -418,10 +673,22 @@ class OpenAILiveTranscribeSTT:
             early finals via _SentenceSplitter, so translation of fast,
             pause-free speech doesn't wait for VAD speech-end or the
             max_speech_sec force-flush.
+
+        Structure: the audio loop (VAD + outbox) runs independently of the
+        websocket, starting before the handshake, so speech during connect
+        or an outage is buffered (last OUTAGE_BUFFER_SEC) instead of lost.
+        The connection loop (re)connects with exponential backoff, resends
+        session.update, drains the outbox and reads events; it reports
+        `reconnecting` / `reconnected` warnings and raises RealtimeSTTError
+        after RECONNECT_GIVE_UP_SEC of continuous outage. When the audio
+        source ends, pending commits get up to DRAIN_TIMEOUT_SEC to complete.
         """
+        loop = asyncio.get_running_loop()
         max_samples = int(self.max_speech_sec * sample_rate)
+        dip_from = max(0, max_samples - int(FORCED_CUT_LOOKBACK_SEC * sample_rate))
+        probe = ProbTap(self._vad())
         vad_iter = VADIterator(
-            self._vad(),
+            probe,
             threshold=0.5,
             sampling_rate=sample_rate,
             min_silence_duration_ms=300,
@@ -429,133 +696,307 @@ class OpenAILiveTranscribeSTT:
         )
 
         out_queue: asyncio.Queue = asyncio.Queue()
-        END = object()  # sentinel — sender finished
+        END = object()  # sentinel — stream finished
+        splitter = _SentenceSplitter(self.language, self.segmentation)
+        outbox = _Outbox(max_audio_bytes=int(OUTAGE_BUFFER_SEC * TARGET_RATE * 2))
+        audio_done = asyncio.Event()
+        commits_idle = asyncio.Event()
+        commits_idle.set()
+        state = {"pending_commits": 0, "audio_done_at": 0.0}
 
-        async with websockets.connect(
-            WS_URL, additional_headers=self._auth_headers()
-        ) as ws:
-            await ws.send(json.dumps(self._session_payload()))
+        def commit_sent():
+            state["pending_commits"] += 1
+            commits_idle.clear()
 
-            async def reader():
-                """Consume WS events, push Transcripts into out_queue."""
-                splitter = _SentenceSplitter(self.language, self.segmentation)
-                try:
-                    async for raw in ws:
-                        event = json.loads(raw)
-                        etype = event.get("type", "")
-                        if etype.endswith("transcription.delta"):
-                            for t in splitter.on_delta(
-                                event.get("item_id", ""), event.get("delta", "")
-                            ):
-                                await out_queue.put(t)
-                        elif etype.endswith("transcription.completed"):
-                            t = splitter.on_completed(
-                                event.get("item_id", ""),
-                                event.get("transcript", ""),
-                            )
-                            if t:
-                                await out_queue.put(t)
-                        elif etype == "error":
-                            await out_queue.put(RuntimeError(
-                                f"OpenAI Realtime: {event.get('error', event)}"
-                            ))
-                            return
-                except (websockets.ConnectionClosed, asyncio.CancelledError):
-                    pass
+        def commit_finished():
+            state["pending_commits"] = max(0, state["pending_commits"] - 1)
+            if state["pending_commits"] == 0:
+                commits_idle.set()
 
-            async def sender():
-                """Forward audio to OpenAI; commit on VAD speech-end."""
-                leftover = b""
-                in_speech = False
-                speech_samples_in_utterance = 0
-                speech_started_buffered = False
+        def commits_lost():
+            state["pending_commits"] = 0
+            commits_idle.set()
 
-                try:
-                    async for chunk in audio_chunks:
-                        # forward to OpenAI (resampled)
-                        if chunk:
-                            up = self._resample_pcm16(chunk, sample_rate, TARGET_RATE)
-                            await ws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": base64.b64encode(up).decode("ascii"),
-                            }))
-
-                        # run silero VAD on the original 16kHz chunk
-                        leftover += chunk
-                        while len(leftover) >= WINDOW_SAMPLES * 2:
-                            window_bytes = leftover[: WINDOW_SAMPLES * 2]
-                            leftover = leftover[WINDOW_SAMPLES * 2 :]
-                            window = (
-                                np.frombuffer(window_bytes, dtype=np.int16)
-                                .astype(np.float32) / 32768.0
-                            )
-
-                            if in_speech:
-                                speech_samples_in_utterance += WINDOW_SAMPLES
-
-                            event = vad_iter(
-                                torch.from_numpy(window), return_seconds=True
-                            )
-
-                            if event and "start" in event:
-                                in_speech = True
-                                speech_started_buffered = True
-                                speech_samples_in_utterance = WINDOW_SAMPLES
-
-                            if event and "end" in event and in_speech:
-                                # ignore micro-blips (clicks, keyboard taps)
-                                dur_sec = speech_samples_in_utterance / sample_rate
-                                if dur_sec >= MIN_SPEECH_SEC and speech_started_buffered:
-                                    await ws.send(json.dumps({
-                                        "type": "input_audio_buffer.commit"
-                                    }))
-                                in_speech = False
-                                speech_started_buffered = False
-                                speech_samples_in_utterance = 0
-
-                            # force-flush on overly long continuous speech
-                            if in_speech and speech_samples_in_utterance >= max_samples:
-                                await ws.send(json.dumps({
-                                    "type": "input_audio_buffer.commit"
-                                }))
-                                # restart counting; we stay in_speech because
-                                # VAD hasn't said end — model gets a new item
-                                # for the next chunk of continuous speech
-                                speech_samples_in_utterance = 0
-
-                    # end of audio: commit any pending utterance
-                    if in_speech and speech_started_buffered:
-                        dur_sec = speech_samples_in_utterance / sample_rate
-                        if dur_sec >= MIN_SPEECH_SEC:
-                            await ws.send(json.dumps({
-                                "type": "input_audio_buffer.commit"
-                            }))
-                except Exception as e:  # noqa: BLE001
-                    await out_queue.put(RuntimeError(f"sender failed: {e}"))
-                finally:
-                    # give reader a moment to drain final transcription events
-                    await asyncio.sleep(2.0)
-                    await out_queue.put(END)
-
-            reader_task = asyncio.create_task(reader())
-            sender_task = asyncio.create_task(sender())
-
+        async def audio_loop():
+            """Consume the audio source: queue resampled audio + VAD commits."""
+            leftover = b""
+            in_speech = False
+            utt_samples = 0
             try:
-                while True:
-                    item = await out_queue.get()
-                    if item is END:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-                    yield item
+                async for chunk in audio_chunks:
+                    if chunk:
+                        outbox.push_audio(
+                            self._resample_pcm16(chunk, sample_rate, TARGET_RATE)
+                        )
+                    # run silero VAD on the original 16kHz chunk
+                    leftover += chunk
+                    while len(leftover) >= WINDOW_SAMPLES * 2:
+                        window_bytes = leftover[: WINDOW_SAMPLES * 2]
+                        leftover = leftover[WINDOW_SAMPLES * 2 :]
+                        window = (
+                            np.frombuffer(window_bytes, dtype=np.int16)
+                            .astype(np.float32) / 32768.0
+                        )
+                        if in_speech:
+                            utt_samples += WINDOW_SAMPLES
+                        event = vad_iter(torch.from_numpy(window), return_seconds=True)
+                        prob = probe.last
+
+                        if event and "start" in event:
+                            in_speech = True
+                            utt_samples = WINDOW_SAMPLES
+
+                        if event and "end" in event and in_speech:
+                            # ignore micro-blips (clicks, keyboard taps)
+                            if utt_samples / sample_rate >= MIN_SPEECH_SEC:
+                                outbox.push_commit()
+                            in_speech = False
+                            utt_samples = 0
+                        elif in_speech and (
+                            utt_samples >= max_samples
+                            or (utt_samples >= dip_from and prob < FORCED_CUT_DIP_PROB)
+                        ):
+                            # Over-long continuous speech: commit at a dip in
+                            # the last FORCED_CUT_LOOKBACK_SEC, or hard at the
+                            # cap. We stay in_speech (VAD hasn't said end) —
+                            # the model gets a new item for what follows.
+                            outbox.push_commit()
+                            utt_samples = 0
+
+                # end of audio: commit any pending utterance
+                if in_speech and utt_samples / sample_rate >= MIN_SPEECH_SEC:
+                    outbox.push_commit()
+            except Exception as e:  # noqa: BLE001
+                await out_queue.put(RuntimeError(f"audio input failed: {e}"))
             finally:
-                sender_task.cancel()
-                reader_task.cancel()
-                for t in (sender_task, reader_task):
+                state["audio_done_at"] = loop.time()
+                audio_done.set()
+                outbox.event.set()
+
+        async def reader(ws):
+            """Consume WS events, push Transcripts into out_queue."""
+            async for raw in ws:
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                etype = event.get("type", "")
+                if etype.endswith("transcription.delta"):
+                    for t in splitter.on_delta(
+                        event.get("item_id", ""), event.get("delta", "")
+                    ):
+                        await out_queue.put(t)
+                elif etype.endswith("transcription.completed"):
+                    commit_finished()
+                    t = splitter.on_completed(
+                        event.get("item_id", ""), event.get("transcript", "")
+                    )
+                    if t:
+                        await out_queue.put(t)
+                elif etype.endswith("transcription.failed"):
+                    commit_finished()
+                    t = splitter.flush_item(event.get("item_id", ""))
+                    if t:
+                        await out_queue.put(t)
+                elif etype == "error":
+                    err = event.get("error", event)
+                    kind = classify_server_error(err)
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    if kind == "fatal":
+                        raise RealtimeSTTError(f"OpenAI 雲端辨識錯誤：{msg}", detail=str(err))
+                    if kind == "reconnect":
+                        raise _Disconnected(f"server error: {err}")
+                    if "commit" in json.dumps(err).lower():
+                        commit_finished()
+                    print(f"[openai realtime] ignored error: {err}", file=sys.stderr, flush=True)
+            # iteration ends when the server closes the socket cleanly
+
+        async def writer(ws):
+            """Drain the outbox to the socket. Returns once the audio source
+            has ended and everything was sent. Each item is popped before its
+            send (so a concurrent trim can't touch it) and requeued at the
+            head if the send fails, so a drop keeps it for the next session."""
+            while True:
+                while len(outbox):
+                    kind, payload = outbox.pop()
+                    if kind == "audio":
+                        msg = json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(payload).decode("ascii"),
+                        })
+                    else:
+                        msg = json.dumps({"type": "input_audio_buffer.commit"})
                     try:
+                        await ws.send(msg)
+                    except BaseException:
+                        outbox.requeue(kind, payload)
+                        raise
+                    if kind == "commit":
+                        commit_sent()
+                if audio_done.is_set():
+                    return
+                outbox.event.clear()
+                if len(outbox):
+                    continue
+                await outbox.event.wait()
+
+        async def run_session(ws):
+            reader_t = asyncio.create_task(reader(ws))
+            writer_t = asyncio.create_task(writer(ws))
+            try:
+                done, _ = await asyncio.wait(
+                    {reader_t, writer_t}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if reader_t in done:
+                    reader_t.result()  # fatal / reconnect errors propagate
+                    raise _Disconnected("server closed the connection")
+                writer_t.result()  # a failed send propagates (ConnectionClosed)
+                # Audio finished and fully sent: give in-flight utterances a
+                # bounded moment to come back.
+                remaining = state["audio_done_at"] + DRAIN_TIMEOUT_SEC - loop.time()
+                if remaining > 0 and not commits_idle.is_set():
+                    idle_t = asyncio.create_task(commits_idle.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {reader_t, idle_t},
+                            timeout=remaining,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        idle_t.cancel()
+                    if reader_t in done:
+                        try:
+                            reader_t.result()
+                        except RealtimeSTTError:
+                            raise
+                        except Exception:  # noqa: BLE001 — stopping anyway
+                            pass
+            finally:
+                for t in (reader_t, writer_t):
+                    t.cancel()
+                for t in (reader_t, writer_t):
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
                         await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+
+        # `announced`: a `reconnecting` went out and its `reconnected` has
+        # not — shared with the stability timer below.
+        conn_state = {"announced": False}
+
+        async def confirm_reconnected():
+            """Announce recovery only after the link held RECONNECT_STABLE_SEC;
+            cancelled if it drops first (the outage — and its single
+            `reconnecting` — continues)."""
+            await asyncio.sleep(RECONNECT_STABLE_SEC)
+            if conn_state["announced"]:
+                conn_state["announced"] = False
+                self._warn("reconnected", "雲端辨識已重新連線")
+
+        async def connection_loop():
+            delays = iter(RECONNECT_DELAYS)
+            outage_since: float | None = None
+            ever_connected = False
+            while True:
+                # Audio already over: stopped while disconnected (the buffered
+                # audio is abandoned), or before anything was captured.
+                if audio_done.is_set() and (
+                    ever_connected or outage_since is not None or not len(outbox)
+                ):
+                    return
+                connected_at: float | None = None
+                confirm_t: asyncio.Task | None = None
+                try:
+                    async with websockets.connect(
+                        WS_URL,
+                        additional_headers=self._auth_headers(),
+                        open_timeout=CONNECT_TIMEOUT_SEC,
+                    ) as ws:
+                        await ws.send(json.dumps(self._session_payload()))
+                        connected_at = loop.time()
+                        ever_connected = True
+                        outbox.connection_reset()
+                        if conn_state["announced"]:
+                            confirm_t = asyncio.create_task(confirm_reconnected())
+                        await run_session(ws)
+                        return
+                except (RealtimeSTTError, asyncio.CancelledError):
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    if not is_retryable_connection_error(e):
+                        status = _handshake_status(e)
+                        if status is not None:
+                            raise RealtimeSTTError(
+                                f"OpenAI 雲端辨識連線被拒（HTTP {status}），"
+                                "請確認 OpenAI API key 是否正確、帳戶是否有額度",
+                                detail=repr(e),
+                            ) from e
+                        raise
+                    print(f"[openai realtime] connection lost: {e!r}", file=sys.stderr, flush=True)
+                finally:
+                    if confirm_t is not None:
+                        confirm_t.cancel()
+
+                # Disconnected (or failed to connect). Close open items so
+                # their interim text isn't lost; their commits never return.
+                for t in splitter.flush_all():
+                    await out_queue.put(t)
+                commits_lost()
+                if audio_done.is_set():
+                    return
+                now = loop.time()
+                if connected_at is not None and now - connected_at >= HEALTHY_CONNECTION_SEC:
+                    outage_since = None
+                    delays = iter(RECONNECT_DELAYS)
+                if outage_since is None:
+                    outage_since = now
+                if now - outage_since >= RECONNECT_GIVE_UP_SEC:
+                    raise RealtimeSTTError(
+                        f"雲端辨識連線中斷超過 {RECONNECT_GIVE_UP_SEC:.0f} 秒，已停止辨識。"
+                        "請檢查網路後重新開始錄音。"
+                    )
+                if not conn_state["announced"]:
+                    self._warn(
+                        "reconnecting",
+                        "雲端辨識連線中斷，正在重新連線…（錄音持續進行，恢復後補送最近 "
+                        f"{OUTAGE_BUFFER_SEC:.0f} 秒）"
+                        if ever_connected
+                        else "無法連線雲端辨識，正在重試…",
+                    )
+                    conn_state["announced"] = True
+                delay = next(delays, RECONNECT_DELAYS[-1])
+                delay = max(0.0, min(delay, outage_since + RECONNECT_GIVE_UP_SEC - now))
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(audio_done.wait(), timeout=delay)
+
+        async def connection_main():
+            try:
+                await connection_loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                for t in splitter.flush_all():
+                    await out_queue.put(t)
+                await out_queue.put(e)
+                return
+            for t in splitter.flush_all():
+                await out_queue.put(t)
+            await out_queue.put(END)
+
+        audio_task = asyncio.create_task(audio_loop())
+        conn_task = asyncio.create_task(connection_main())
+        try:
+            while True:
+                item = await out_queue.get()
+                if item is END:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            for t in (audio_task, conn_task):
+                t.cancel()
+            for t in (audio_task, conn_task):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
 
 
 # Import compatibility for older dev scripts. The production factory below

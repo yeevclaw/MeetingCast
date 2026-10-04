@@ -55,7 +55,11 @@ from checks import (  # noqa: E402
 
 class TestKnownHallucinationPhrases(unittest.TestCase):
     def test_english_outro_matches(self):
-        self.assertTrue(_is_known_hallucination("Thanks for watching, see you soon"))
+        self.assertTrue(_is_known_hallucination("Thanks for watching!"))
+
+    def test_outro_with_short_tail_matches(self):
+        # "see you" (6 alnum chars) is < 25% of the text → still an outro.
+        self.assertTrue(_is_known_hallucination("Thank you for watching. See you!"))
 
     def test_subscribe_ask_matches(self):
         self.assertTrue(_is_known_hallucination("Please subscribe to my channel!"))
@@ -124,10 +128,19 @@ class TestHallucinationBlocklists(unittest.TestCase):
     )
 
     def test_zh_is_legacy_plus_amara(self):
-        # Order changed (COMMON now leads), so compare as sets: item-identical.
-        self.assertEqual(
-            set(hallucination_blocklist("zh")),
-            set(self.LEGACY) | {"amara.org"},
+        # Order changed (COMMON now leads), so compare as sets. Every legacy
+        # marker is kept; the additions are full-length leak phrases needed
+        # since matching became coverage-based (stt.local._markers_cover).
+        zh = set(hallucination_blocklist("zh"))
+        self.assertTrue(set(self.LEGACY) | {"amara.org"} <= zh)
+        self.assertTrue(
+            zh - set(self.LEGACY) <= {
+                "amara.org", "subtitles by the amara.org community",
+                "下次见", "下次見",
+                "由amara.org社区提供的字幕", "由amara.org社群提供的字幕",
+                "请不吝点赞订阅转发打赏支持明镜与点点栏目",
+                "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
+            }
         )
 
     def test_en_is_common_plus_en_only(self):
@@ -180,15 +193,21 @@ class TestSegmentConfidenceFiltering(unittest.TestCase):
                "avg_logprob": -0.3, "compression_ratio": 1.2}
         self.assertEqual(self._run([seg]), "這是一句正常的會議發言")
 
-    def test_high_no_speech_dropped(self):
+    def test_high_no_speech_and_low_logprob_dropped(self):
+        # Whisper's own silence rule: both signals together.
         seg = {"text": "雜訊", "no_speech_prob": SEGMENT_NO_SPEECH_MAX + 0.1,
-               "avg_logprob": -0.3, "compression_ratio": 1.2}
-        self.assertEqual(self._run([seg]), "")
-
-    def test_low_logprob_dropped(self):
-        seg = {"text": "雜訊", "no_speech_prob": 0.1,
                "avg_logprob": SEGMENT_AVG_LOGPROB_MIN - 0.5, "compression_ratio": 1.2}
         self.assertEqual(self._run([seg]), "")
+
+    def test_high_no_speech_alone_kept(self):
+        seg = {"text": "小聲的發言", "no_speech_prob": SEGMENT_NO_SPEECH_MAX + 0.1,
+               "avg_logprob": -0.3, "compression_ratio": 1.2}
+        self.assertEqual(self._run([seg]), "小聲的發言")
+
+    def test_low_logprob_alone_kept(self):
+        seg = {"text": "口音很重的發言", "no_speech_prob": 0.1,
+               "avg_logprob": SEGMENT_AVG_LOGPROB_MIN - 0.5, "compression_ratio": 1.2}
+        self.assertEqual(self._run([seg]), "口音很重的發言")
 
     def test_high_compression_dropped(self):
         seg = {"text": "重複重複", "no_speech_prob": 0.1,
@@ -199,7 +218,7 @@ class TestSegmentConfidenceFiltering(unittest.TestCase):
         good = {"text": "保留這句", "no_speech_prob": 0.1,
                 "avg_logprob": -0.3, "compression_ratio": 1.2}
         bad = {"text": "丟掉這句", "no_speech_prob": 0.95,
-               "avg_logprob": -0.3, "compression_ratio": 1.2}
+               "avg_logprob": -1.5, "compression_ratio": 1.2}
         self.assertEqual(self._run([good, bad]), "保留這句")
 
     def test_falls_back_to_full_text_when_no_segments(self):

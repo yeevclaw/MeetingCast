@@ -6,9 +6,14 @@ The set of leaks is language-dependent: a zh-pinned decode emits 謝謝觀看 /
 amara.org, a ja decode emits ご視聴ありがとうございました, and so on. English
 outros leak under *every* language pin, so they are always included.
 
-Matching is case-insensitive substring (see stt.local._is_known_hallucination),
-so ASCII entries are stored lowercase; CJK / kana have no case, and Vietnamese
-diacritics lower-case cleanly.
+Matching is case-insensitive (see stt.local._is_known_hallucination), so ASCII
+entries are stored lowercase; CJK / kana have no case, and Vietnamese
+diacritics lower-case cleanly. A text is only treated as a hallucination when
+the markers cover nearly all of it, so list the FULL leaked phrase where the
+leak has a stable long form (e.g. ご視聴ありがとうございました) — a short
+marker plus a long polite tail would otherwise read as a real sentence.
+CJK markers are written without spaces; they also match text where Whisper
+put spaces around embedded Latin ("由 Amara.org 社区提供的字幕").
 
 `hallucination_blocklist(language)` = COMMON + EN (always) + per-language.
 The zh result is item-identical to the historical KNOWN_HALLUCINATIONS tuple
@@ -30,6 +35,7 @@ HALLUCINATIONS_EN = (
     "like and subscribe",
     "see you in the next video",
     "see you next time",
+    "subtitles by the amara.org community",
 )
 
 # Chinese training-data leaks (audiobook / video outro) + the classic
@@ -39,12 +45,22 @@ HALLUCINATIONS_ZH = (
     "謝謝觀看",
     "请订阅",
     "請訂閱",
+    # Outro tail that follows 謝謝觀看 (「謝謝觀看，下次見」). Needed since the
+    # CJK residual allowance is 2 chars (stt.local._markers_cover).
+    "下次见",
+    "下次見",
     "amara.org",
+    "由amara.org社区提供的字幕",
+    "由amara.org社群提供的字幕",
+    "请不吝点赞订阅转发打赏支持明镜与点点栏目",
+    "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
 )
 
 # Japanese YouTube outros: "thank you for watching / listening", "subscribe to
 # the channel", "see you in the next video", "thank you for watching to the end".
 HALLUCINATIONS_JA = (
+    "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
     "ご視聴ありがとう",
     "ご清聴ありがとう",
     "チャンネル登録",

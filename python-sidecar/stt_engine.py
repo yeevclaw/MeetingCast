@@ -32,6 +32,7 @@ except ImportError:
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "prototype"))
 
+from audio_pump import pump_audio  # noqa: E402
 from audio_stream import wav_chunks  # noqa: E402
 from stt import get_backend  # noqa: E402
 
@@ -49,6 +50,21 @@ def emit(event: dict) -> None:
     with _emit_lock:
         sys.stdout.write(line)
         sys.stdout.flush()
+
+
+def _emit_warning(warning: dict) -> None:
+    """Structured warning sink for the audio source / cloud backend:
+    {code, message, ...extra} → `warning` event. Safe from any thread."""
+    emit({"type": "warning", **warning})
+
+
+def _emit_level(rms: float) -> None:
+    emit({"type": "level", "rms": round(float(rms), 4)})
+
+
+# Graceful stop: how long `stop` waits for the backend to flush buffered
+# speech before hard-cancelling. Rust waits up to 3 s for `stopped`.
+STOP_FLUSH_TIMEOUT_SEC = 2.5
 
 
 def _emit_diag(gate: str, t_start: float | None, detail: dict) -> None:
@@ -78,7 +94,9 @@ def make_audio_source(source: dict):
         # picks the OS default. A non-empty string is treated as a device name
         # (sounddevice accepts either an int index or a substring of the name).
         device = source.get("device") or None
-        return mic_chunks(sample_rate=16000, chunk_ms=100, device=device)
+        return mic_chunks(
+            sample_rate=16000, chunk_ms=100, device=device, on_warning=_emit_warning
+        )
     if kind == "wav":
         path = source.get("path")
         if not path:
@@ -112,7 +130,66 @@ def list_input_devices() -> list[dict]:
     return out
 
 
-async def run_stt(cmd: dict, cancel_event: asyncio.Event):
+def _default_input_device_name() -> str:
+    try:
+        import sounddevice as sd
+        return str(sd.query_devices(kind="input").get("name", "")).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+STOP_REASON_REQUESTED = "requested"
+STOP_REASON_SOURCE_ENDED = "source_ended"
+STOP_REASON_ERROR = "error"
+
+
+def stop_reason(*, errored: bool, stop_requested: bool, source_type: str) -> str:
+    """Why a run ended, for `stopped.reason`. An error wins (setup failed, stt
+    error, cloud gave up — also when the user's stop then hard-cancelled the
+    broken run). Otherwise a stop command → `requested`; a demo / WAV file
+    played to the end → `source_ended`; a mic stream ending on its own is not
+    a normal end → `error`."""
+    if errored:
+        return STOP_REASON_ERROR
+    if stop_requested:
+        return STOP_REASON_REQUESTED
+    if source_type == "wav":
+        return STOP_REASON_SOURCE_ENDED
+    return STOP_REASON_ERROR
+
+
+async def run_stt(cmd: dict, cancel_event: asyncio.Event, stop_event: asyncio.Event):
+    """Run one session and emit `stopped` exactly once when it ends, however
+    it ends (setup failure, stt error, cloud give-up, graceful or hard stop) —
+    always after any `error`, with a `reason` (see `stop_reason`). Rust uses
+    an un-requested `stopped` to detect interruptions / the end of a demo
+    file and waits for it on user stop."""
+    errored = False
+    try:
+        errored = not await _run_stt_session(cmd, cancel_event, stop_event)
+    except asyncio.CancelledError:
+        # Hard cancel: user stop overran its flush budget, or shutdown.
+        raise
+    except Exception as e:  # noqa: BLE001 — unexpected bug: still report it
+        errored = True
+        emit({"type": "error", "message": f"stt error: {e}"})
+    finally:
+        source_type = (cmd.get("source") or {}).get("type", "mic")
+        reason = stop_reason(
+            errored=errored,
+            stop_requested=stop_event.is_set() or cancel_event.is_set(),
+            source_type=source_type,
+        )
+        emit({"type": "stopped", "reason": reason})
+
+
+async def _run_stt_session(
+    cmd: dict, cancel_event: asyncio.Event, stop_event: asyncio.Event
+) -> bool:
+    """One recording session. `stop_event` = graceful stop (the audio source
+    ends, the backend flushes buffered speech, then `stopped`); `cancel_event`
+    = hard cancel (set only when the graceful flush overran its budget).
+    Returns False when it ended on an error (an `error` event was emitted)."""
     backend_name = cmd.get("backend", "local")
     language = cmd.get("language", "zh")
     source_cfg = cmd.get("source", {"type": "mic"})
@@ -143,9 +220,13 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                     dtype="float32",
                 )
             except Exception as e:
+                fallback_name = _default_input_device_name()
                 emit({
                     "type": "warning",
-                    "message": f"麥克風「{device_pref}」無法使用（{e}），已改用系統預設",
+                    "code": "device_fallback",
+                    "message": f"麥克風「{device_pref}」無法使用（{e}），已改用系統預設"
+                               + (f"「{fallback_name}」" if fallback_name else ""),
+                    "device": fallback_name,
                 })
                 source_cfg = {**source_cfg, "device": ""}
 
@@ -169,6 +250,8 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 backend_kwargs["delay"] = str(stt_opts["delay"])
             if stt_opts.get("segmentation"):
                 backend_kwargs["segmentation"] = str(stt_opts["segmentation"])
+            # reconnecting / reconnected warnings → `warning` events
+            backend_kwargs["on_warning"] = _emit_warning
         stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on
@@ -177,10 +260,15 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
             emit({"type": "model_loading"})
             await asyncio.to_thread(stt.ensure_loaded)
             emit({"type": "model_ready"})
-        chunks = make_audio_source(source_cfg)
+        source = make_audio_source(source_cfg)
     except Exception as e:
         emit({"type": "error", "message": f"setup failed: {e}"})
-        return
+        return False
+
+    # Read the source on its own task from here on (mic opens now — before a
+    # cloud handshake), meter its level every ~250 ms, and end it cleanly on
+    # a graceful stop so the backend can flush what it has buffered.
+    chunks = pump_audio(source, stop_event, on_level=_emit_level, sample_rate=16000)
 
     emit({"type": "started"})
     session_clock = asyncio.get_running_loop().time
@@ -223,6 +311,13 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        user_message = getattr(e, "user_message", None)
+        if user_message:
+            # Backend already phrased it for the user (繁中); the raw detail
+            # goes to stderr for the log.
+            print(f"stt error detail: {e!r}", file=sys.stderr, flush=True)
+            emit({"type": "error", "message": user_message})
+            return False
         # Extract any nested detail the SDK may have attached so we don't
         # lose useful diagnostics inside the exception's __str__.
         detail = []
@@ -232,8 +327,8 @@ async def run_stt(cmd: dict, cancel_event: asyncio.Event):
                 detail.append(f"{attr}={v!r}")
         suffix = f" [{type(e).__name__}: {'; '.join(detail)}]" if detail else f" [{type(e).__name__}]"
         emit({"type": "error", "message": f"stt error: {e}{suffix}"})
-    finally:
-        emit({"type": "stopped"})
+        return False
+    return True
 
 
 def _prewarm_mic():
@@ -436,6 +531,7 @@ async def main():
     emit({"type": "ready"})
     stt_task: asyncio.Task | None = None
     cancel_event: asyncio.Event | None = None
+    stop_event: asyncio.Event | None = None
 
     try:
         async for raw in stdin_lines():
@@ -453,18 +549,34 @@ async def main():
                     emit({"type": "error", "message": "already running"})
                     continue
                 cancel_event = asyncio.Event()
-                stt_task = asyncio.create_task(run_stt(cmd, cancel_event))
+                stop_event = asyncio.Event()
+                stt_task = asyncio.create_task(run_stt(cmd, cancel_event, stop_event))
             elif cmd_type == "stop":
                 if stt_task and not stt_task.done():
-                    cancel_event.set()
-                    stt_task.cancel()
+                    # Graceful: end the audio source and let the backend
+                    # flush buffered speech (finals still go out), bounded by
+                    # STOP_FLUSH_TIMEOUT_SEC; run_stt emits `stopped` itself.
+                    stop_event.set()
                     try:
-                        await stt_task
-                    except (asyncio.CancelledError, Exception):
+                        await asyncio.wait_for(
+                            asyncio.shield(stt_task), timeout=STOP_FLUSH_TIMEOUT_SEC
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
+                    if not stt_task.done():
+                        cancel_event.set()
+                        stt_task.cancel()
+                        try:
+                            await stt_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
                 stt_task = None
             elif cmd_type == "shutdown":
+                # run_stt emits `stopped` itself when a session is running;
+                # only emit one here when nothing was running.
+                had_session = bool(stt_task and not stt_task.done())
                 if stt_task and not stt_task.done():
+                    stop_event.set()  # → stopped.reason = "requested"
                     stt_task.cancel()
                     try:
                         await stt_task
@@ -476,7 +588,8 @@ async def main():
                 # never returns, so the process would outlive the `shutdown`
                 # and keep emitting stale prewarm/progress events while Rust
                 # waits to respawn. Nothing here needs graceful teardown.
-                emit({"type": "stopped"})
+                if not had_session:
+                    emit({"type": "stopped", "reason": STOP_REASON_REQUESTED})
                 sys.stdout.flush()
                 os._exit(0)
             elif cmd_type == "list_devices":

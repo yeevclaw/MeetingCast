@@ -12,6 +12,8 @@ from silero_vad import VADIterator, load_silero_vad
 
 from .base import Transcript
 from .lang_resources import hallucination_blocklist
+from .openai_transcription_config import ZH_TW_SCRIPT_PROMPT
+from .vad_tools import ProbTap, pick_cut_index, segment_joiner
 
 
 # asyncio cancellation cannot stop a function already running in `to_thread`.
@@ -52,6 +54,44 @@ WINDOW_SAMPLES = 512  # silero VAD requires 512-sample windows at 16kHz
 
 HALLUCINATION_MIN_CHARS = 20
 HALLUCINATION_DOMINANCE = 0.5
+
+# A blocklist marker only makes the text a hallucination when the markers
+# cover (almost) all of it: at most this many alphanumeric characters left
+# once every marker occurrence is removed, or less than this fraction of the
+# text. Plain substring matching dropped real sentences ("an exodus of
+# customers", "Please subscribe to our newsletter").
+HALLUCINATION_RESIDUAL_MAX_CHARS = 6
+HALLUCINATION_RESIDUAL_MAX_RATIO = 0.25
+# CJK carries a word or more per character, so 6 leftover han / kana is a
+# whole clause of real speech (「請訂閱我們的電子報」 minus 「請訂閱」). When
+# the residual contains CJK, allow at most this many leftover characters.
+HALLUCINATION_RESIDUAL_MAX_CHARS_CJK = 2
+
+
+def _is_cjk_char(c: str) -> bool:
+    o = ord(c)
+    return (
+        0x3040 <= o <= 0x30FF      # hiragana + katakana
+        or 0x3400 <= o <= 0x4DBF   # CJK ext A
+        or 0x4E00 <= o <= 0x9FFF   # CJK unified
+        or 0xAC00 <= o <= 0xD7AF   # hangul
+        or 0xF900 <= o <= 0xFAFF   # CJK compatibility
+        or 0x20000 <= o <= 0x2FFFF  # CJK ext B+
+    )
+
+# Pre-roll: audio kept from just before silero declares speech start and
+# prepended to the utterance, so soft word onsets (unvoiced consonants that
+# silero scores low) aren't clipped. ~300 ms.
+PREROLL_SEC = 0.3
+
+# Forced cut at max_speech_sec: instead of cutting exactly at the cap, pick
+# the most pause-like window (lowest VAD probability) within this lookback
+# and carry the rest into the next utterance.
+FORCED_CUT_LOOKBACK_SEC = 1.5
+
+# End-of-stream (stop / end of demo file) flush: transcribe the speech still
+# buffered only when it holds at least this much speech.
+STOP_FLUSH_MIN_SEC = 0.5
 
 # Float32 audio is in [-1, 1]. Conversational speech RMS ≈ 0.05–0.15;
 # fans / aircon hum / keyboard ≈ 0.001–0.005. The fixed floor is used at
@@ -100,15 +140,56 @@ NOISE_MARGIN = 3.0
 # test call sites that import the name.
 KNOWN_HALLUCINATIONS = hallucination_blocklist("zh")
 
+# Fragments of ZH_TW_SCRIPT_PROMPT that Whisper may echo back on silence.
+_ZH_PROMPT_ECHO_MARKERS = ("以下為繁體中文的會議內容", "請以繁體中文輸出")
+
 
 def _is_known_hallucination(
     text: str, blocklist: tuple[str, ...] = KNOWN_HALLUCINATIONS
 ) -> bool:
-    """Whisper sometimes outputs known training-data phrases on silence."""
-    head = text.strip().lower()
-    if not head:
+    """Whisper sometimes outputs known training-data phrases on silence.
+
+    True only when blocklist markers make up (almost) the whole text: after
+    masking every (possibly overlapping) marker occurrence, the remaining
+    alphanumeric characters are at most HALLUCINATION_RESIDUAL_MAX_CHARS
+    or under HALLUCINATION_RESIDUAL_MAX_RATIO of the text's alphanumerics.
+    A marker embedded in a real sentence ("an exodus of customers") is kept."""
+    low = text.strip().lower()
+    if not low:
         return False
-    return any(marker in head for marker in blocklist)
+    # Score both the text as-is (English markers contain spaces) and with
+    # whitespace removed (CJK markers vs "由 Amara.org 社区…"); the better
+    # coverage wins.
+    variants = (low, "".join(low.split()))
+    return any(_markers_cover(v, blocklist) for v in variants)
+
+
+def _markers_cover(low: str, blocklist: tuple[str, ...]) -> bool:
+    covered = [False] * len(low)
+    hit = False
+    for marker in blocklist:
+        if not marker:
+            continue
+        start = low.find(marker)
+        while start != -1:
+            hit = True
+            for i in range(start, start + len(marker)):
+                covered[i] = True
+            start = low.find(marker, start + 1)
+    if not hit:
+        return False
+    total = sum(1 for c in low if c.isalnum())
+    left = [c for c, cov in zip(low, covered) if not cov and c.isalnum()]
+    residual = len(left)
+    max_chars = (
+        HALLUCINATION_RESIDUAL_MAX_CHARS_CJK
+        if any(_is_cjk_char(c) for c in left)
+        else HALLUCINATION_RESIDUAL_MAX_CHARS
+    )
+    return (
+        residual <= max_chars
+        or residual < HALLUCINATION_RESIDUAL_MAX_RATIO * total
+    )
 
 
 def _is_hallucination(
@@ -126,6 +207,31 @@ def _is_hallucination(
         return False
     most_common = Counter(chars).most_common(1)[0][1]
     return most_common / len(chars) > HALLUCINATION_DOMINANCE
+
+
+def _compose_initial_prompt(language: str, glossary_prompt: str | None) -> str | None:
+    """Whisper initial_prompt for the local backend. For a zh source the
+    Traditional-Chinese script carrier (same text the cloud path uses) always
+    leads, so mlx-whisper doesn't drift into Simplified output; the glossary
+    context, if any, follows. Whisper keeps the LAST ~223 prompt tokens, and
+    the Rust config layer caps the glossary at 30 terms, so the carrier fits."""
+    glossary = (glossary_prompt or "").strip()
+    if (language or "").strip().lower().split("-")[0] == "zh":
+        return ZH_TW_SCRIPT_PROMPT + glossary
+    return glossary or None
+
+
+def _segment_drop_reason(no_speech: float, avg_logprob: float, compression: float) -> str | None:
+    """Gate 3 decision for one Whisper segment: None to keep, else the drop
+    reason. Mirrors Whisper's own silence rule — a segment is non-speech only
+    when no_speech_prob is high AND the decode was low-confidence; either
+    signal alone is common on real (accented / quiet / fast) speech. The
+    repetition-loop guard (compression ratio) stands on its own."""
+    if no_speech > SEGMENT_NO_SPEECH_MAX and avg_logprob < SEGMENT_AVG_LOGPROB_MIN:
+        return "no_speech"
+    if compression > SEGMENT_COMPRESSION_RATIO_MAX:
+        return "compression"
+    return None
 
 
 def _segment_rms(audio: np.ndarray) -> float:
@@ -152,7 +258,13 @@ class MLXWhisperSTT:
         self._blocklist = hallucination_blocklist(language)
         self.model_repo = model_repo or self.MODEL_REPO
         self.max_speech_sec = max_speech_sec
-        self.initial_prompt = initial_prompt
+        self.initial_prompt = _compose_initial_prompt(language, initial_prompt)
+        if language.strip().lower().split("-")[0] == "zh":
+            # Whisper can echo its prompt on silence; with the script carrier
+            # now always present, treat an output that is just the carrier as
+            # a hallucination (coverage rule keeps real sentences).
+            self._blocklist = self._blocklist + _ZH_PROMPT_ECHO_MARKERS
+        self._joiner = segment_joiner(language)
         # Optional sink for gate-skip diagnostics. When wired (by the sidecar)
         # each skip is reported as a structured event; when None (CLI / tests)
         # the legacy stderr lines are printed instead, so behavior is unchanged.
@@ -176,6 +288,14 @@ class MLXWhisperSTT:
         utterance for 1–2 minutes."""
         from huggingface_hub import snapshot_download
 
+        # Cache hit must not touch the network: a plain snapshot_download
+        # does an HF API round-trip on every start (slow on bad Wi-Fi, and
+        # an error offline). Only go online when the files aren't local.
+        try:
+            snapshot_download(self.model_repo, local_files_only=True)
+            return
+        except Exception:  # noqa: BLE001 — LocalEntryNotFoundError & co.
+            pass
         snapshot_download(self.model_repo)
 
     def _update_noise_floor(self, window_rms: float) -> None:
@@ -205,11 +325,16 @@ class MLXWhisperSTT:
         else:
             print(stderr_msg, file=sys.stderr)
 
-    def _transcribe_audio(self, audio) -> str:
+    def _transcribe_audio(self, audio, gate_offset: int = 0) -> str:
+        # `gate_offset`: leading samples (the pre-roll) excluded from the
+        # energy gates below — they are pre-speech silence by construction
+        # and would only dilute the RMS / consistency measurements. Whisper
+        # still gets the full buffer.
         # Gate 1a: segment-mean RMS. Skip segments quieter than the adaptive
         # noise floor without ever calling Whisper. Cheapest possible drop.
         if isinstance(audio, np.ndarray):
-            rms = _segment_rms(audio)
+            gated = audio[gate_offset:] if 0 < gate_offset < len(audio) else audio
+            rms = _segment_rms(gated)
             if rms < self._dynamic_threshold:
                 self._diag(
                     "rms_floor", None,
@@ -224,9 +349,9 @@ class MLXWhisperSTT:
             # chunks and require >= CONSISTENCY_MIN_ACTIVE_RATIO to be above
             # the dynamic floor — i.e. the speech is *distributed* through the
             # segment, not localized in one spike.
-            n_chunks = len(audio) // CONSISTENCY_WINDOW_SAMPLES
+            n_chunks = len(gated) // CONSISTENCY_WINDOW_SAMPLES
             if n_chunks >= 3:  # below 300 ms there's nothing to be consistent about
-                trimmed = audio[: n_chunks * CONSISTENCY_WINDOW_SAMPLES]
+                trimmed = gated[: n_chunks * CONSISTENCY_WINDOW_SAMPLES]
                 chunks = trimmed.astype(np.float64).reshape(n_chunks, CONSISTENCY_WINDOW_SAMPLES)
                 chunk_rms = np.sqrt(np.mean(chunks ** 2, axis=1))
                 active_ratio = float((chunk_rms >= self._dynamic_threshold).mean())
@@ -276,22 +401,26 @@ class MLXWhisperSTT:
                 no_speech = float(seg.get("no_speech_prob", 0.0))
                 avg_logprob = float(seg.get("avg_logprob", 0.0))
                 compression = float(seg.get("compression_ratio", 0.0))
-                if no_speech > SEGMENT_NO_SPEECH_MAX:
-                    dropped_reasons.append(f"no_speech={no_speech:.2f}")
-                    dropped_details.append({"no_speech_prob": round(no_speech, 3)})
+                reason = _segment_drop_reason(no_speech, avg_logprob, compression)
+                if reason == "no_speech":
+                    dropped_reasons.append(
+                        f"no_speech={no_speech:.2f}+logprob={avg_logprob:.2f}"
+                    )
+                    dropped_details.append({
+                        "no_speech_prob": round(no_speech, 3),
+                        "avg_logprob": round(avg_logprob, 3),
+                    })
                     continue
-                if avg_logprob < SEGMENT_AVG_LOGPROB_MIN:
-                    dropped_reasons.append(f"logprob={avg_logprob:.2f}")
-                    dropped_details.append({"avg_logprob": round(avg_logprob, 3)})
-                    continue
-                if compression > SEGMENT_COMPRESSION_RATIO_MAX:
+                if reason == "compression":
                     dropped_reasons.append(f"compress={compression:.2f}")
                     dropped_details.append({"compression_ratio": round(compression, 3)})
                     continue
                 t = str(seg.get("text", "")).strip()
                 if t:
                     kept_texts.append(t)
-            text = " ".join(kept_texts).strip()
+            # zh / ja are written without spaces — a " " join would insert
+            # stray spaces mid-sentence that leak into the translation.
+            text = self._joiner.join(kept_texts).strip()
             if not text and dropped_reasons:
                 self._diag(
                     "segment_confidence", None,
@@ -334,6 +463,14 @@ class MLXWhisperSTT:
 
         Force-flushes after max_speech_sec to handle continuous speech
         (e.g. broadcasters, fast presenters) where VAD never sees a pause.
+        The forced cut lands on the most pause-like window of the last
+        FORCED_CUT_LOOKBACK_SEC (lowest VAD probability) and the audio after
+        it is carried into the next utterance; such finals carry boundary
+        "forced". ~PREROLL_SEC of audio before each VAD start is prepended.
+
+        When `audio_chunks` ends (stop command / end of the demo file) any
+        buffered speech of at least STOP_FLUSH_MIN_SEC is transcribed and
+        emitted with boundary "pause".
 
         Each Whisper call runs via asyncio.to_thread so a slow inference
         (notably the first one on a cold Mac, where Metal kernels compile on
@@ -342,18 +479,36 @@ class MLXWhisperSTT:
         the inference finished — which surfaced as a 5–10 s freeze on 停止錄音.
         """
         max_samples = int(self.max_speech_sec * sample_rate)
+        max_windows = max(1, -(-max_samples // WINDOW_SAMPLES))
+        preroll_windows = max(0, round(PREROLL_SEC * sample_rate / WINDOW_SAMPLES))
+        lookback_windows = max(1, round(FORCED_CUT_LOOKBACK_SEC * sample_rate / WINDOW_SAMPLES))
+        probe = ProbTap(self._vad())
         vad_iter = VADIterator(
-            self._vad(),
+            probe,
             threshold=0.5,
             sampling_rate=sample_rate,
             min_silence_duration_ms=300,
             speech_pad_ms=30,
         )
         leftover = b""
+        # Parallel per-window lists for the current utterance: audio, VAD
+        # speech probability, RMS (the latter two feed the forced-cut picker).
         speech_buffer: list[np.ndarray] = []
+        speech_probs: list[float] = []
+        speech_rms: list[float] = []
+        # Number of leading pre-roll windows in speech_buffer (excluded from
+        # the min-speech duration and the energy gates).
+        utt_preroll = 0
+        preroll: deque[tuple[np.ndarray, float, float]] = deque(maxlen=preroll_windows or 1)
         in_speech = False
         speech_start_sec: float = 0.0
         samples_processed = 0
+
+        def reset_utterance():
+            nonlocal speech_buffer, speech_probs, speech_rms, utt_preroll, in_speech
+            speech_buffer, speech_probs, speech_rms = [], [], []
+            utt_preroll = 0
+            in_speech = False
 
         async for chunk in audio_chunks:
             leftover += chunk
@@ -361,6 +516,7 @@ class MLXWhisperSTT:
                 window_bytes = leftover[: WINDOW_SAMPLES * 2]
                 leftover = leftover[WINDOW_SAMPLES * 2 :]
                 window = np.frombuffer(window_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                win_rms = _segment_rms(window)
 
                 # Sample the ambient noise floor whenever silero says we're
                 # not in speech. The threshold is then computed from the
@@ -368,64 +524,88 @@ class MLXWhisperSTT:
                 # Done before the VAD event check so a window that starts
                 # speech still counts as silence at this point.
                 if not in_speech:
-                    self._update_noise_floor(_segment_rms(window))
+                    self._update_noise_floor(win_rms)
+
+                event = vad_iter(torch.from_numpy(window), return_seconds=True)
+                prob = probe.last
+                samples_processed += WINDOW_SAMPLES
 
                 if in_speech:
                     speech_buffer.append(window)
-
-                event = vad_iter(torch.from_numpy(window), return_seconds=True)
-                samples_processed += WINDOW_SAMPLES
+                    speech_probs.append(prob)
+                    speech_rms.append(win_rms)
 
                 if event and "start" in event:
-                    speech_start_sec = float(event["start"])
+                    pre = list(preroll) if preroll_windows else []
+                    preroll.clear()
+                    utt_preroll = len(pre)
+                    speech_buffer = [w for w, _, _ in pre] + [window]
+                    speech_probs = [p for _, p, _ in pre] + [prob]
+                    speech_rms = [r for _, _, r in pre] + [win_rms]
+                    speech_start_sec = max(
+                        0.0, float(event["start"]) - utt_preroll * WINDOW_SAMPLES / sample_rate
+                    )
                     in_speech = True
-                    speech_buffer = [window]
+                elif not in_speech and preroll_windows:
+                    preroll.append((window, prob, win_rms))
 
                 if event and "end" in event and speech_buffer:
                     full_audio = np.concatenate(speech_buffer)
                     # Gate 0: minimum speech duration. silero occasionally
                     # opens-and-closes within ~100 ms on a sharp click; a real
                     # syllable can't fit in that window. Drop pre-Whisper.
-                    dur = len(full_audio) / sample_rate
+                    # The pre-roll doesn't count as speech.
+                    dur = (len(speech_buffer) - utt_preroll) * WINDOW_SAMPLES / sample_rate
                     if dur < MIN_SPEECH_SEC:
                         self._diag(
                             "min_speech", speech_start_sec,
                             {"duration_sec": round(dur, 3), "min_sec": MIN_SPEECH_SEC},
                             f"[short-speech skipped] {dur:.2f}s < {MIN_SPEECH_SEC}s",
                         )
-                        speech_buffer = []
-                        in_speech = False
+                        reset_utterance()
                         continue
-                    text = await asyncio.to_thread(self._transcribe_audio, full_audio)
+                    text = await asyncio.to_thread(
+                        self._transcribe_audio, full_audio, utt_preroll * WINDOW_SAMPLES
+                    )
                     if text:
                         yield Transcript(
                             text=text, is_final=True, boundary="sentence",
                             t_start=speech_start_sec, t_end=float(event["end"]),
                         )
-                    speech_buffer = []
-                    in_speech = False
+                    reset_utterance()
                     continue
 
-                # Force-flush long continuous speech (no VAD-detected pause)
-                if in_speech and len(speech_buffer) * WINDOW_SAMPLES >= max_samples:
-                    full_audio = np.concatenate(speech_buffer)
+                # Force-cut long continuous speech (no VAD-detected pause) at
+                # the most pause-like recent window; carry the rest forward.
+                if in_speech and len(speech_buffer) >= max_windows:
+                    cut = pick_cut_index(speech_probs, lookback_windows, speech_rms)
+                    head = speech_buffer[: cut + 1]
+                    full_audio = np.concatenate(head)
                     cut_at = speech_start_sec + len(full_audio) / sample_rate
-                    text = await asyncio.to_thread(self._transcribe_audio, full_audio)
+                    gate_offset = utt_preroll * WINDOW_SAMPLES
+                    speech_buffer = speech_buffer[cut + 1 :]
+                    speech_probs = speech_probs[cut + 1 :]
+                    speech_rms = speech_rms[cut + 1 :]
+                    utt_preroll = 0
+                    text = await asyncio.to_thread(self._transcribe_audio, full_audio, gate_offset)
                     if text:
                         yield Transcript(
-                            text=text, is_final=True, boundary="sentence",
+                            text=text, is_final=True, boundary="forced",
                             t_start=speech_start_sec, t_end=cut_at,
                         )
-                    speech_buffer = []
-                    speech_start_sec = cut_at  # next force-cut continues from here
+                    speech_start_sec = cut_at  # next utterance continues from here
 
+        # End of input (graceful stop / end of file): flush buffered speech.
         if in_speech and speech_buffer:
-            full_audio = np.concatenate(speech_buffer)
-            if len(full_audio) / sample_rate < MIN_SPEECH_SEC:
+            dur = (len(speech_buffer) - utt_preroll) * WINDOW_SAMPLES / sample_rate
+            if dur < STOP_FLUSH_MIN_SEC:
                 return
-            text = await asyncio.to_thread(self._transcribe_audio, full_audio)
+            full_audio = np.concatenate(speech_buffer)
+            text = await asyncio.to_thread(
+                self._transcribe_audio, full_audio, utt_preroll * WINDOW_SAMPLES
+            )
             if text:
                 yield Transcript(
-                    text=text, is_final=True, boundary="sentence",
+                    text=text, is_final=True, boundary="pause",
                     t_start=speech_start_sec, t_end=samples_processed / sample_rate,
                 )
