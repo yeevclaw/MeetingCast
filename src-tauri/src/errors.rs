@@ -108,7 +108,62 @@ pub fn record(category: &str, message: &str, context: Option<Value>) {
         let _ = std::fs::create_dir_all(parent);
     }
     maybe_rotate(&path);
+    // One pre-built buffer, one `write_all`: `writeln!` formats in pieces and
+    // can issue several writes, which interleave when two tasks log at once.
+    let mut buf = line;
+    buf.push('\n');
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(buf.as_bytes());
+    }
+}
+
+/// Write `contents` to `path` atomically: write a sibling temp file, fsync it,
+/// then rename over the target. A crash or a concurrent reader mid-write sees
+/// either the old file or the new one — never a truncated half. The temp name
+/// is unique per call so two writers to the same file can't clobber each
+/// other's temp.
+pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("meetingcast-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name() != "meta.json")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

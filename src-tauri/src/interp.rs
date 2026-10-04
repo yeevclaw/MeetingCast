@@ -35,8 +35,10 @@ use crate::config::SharedConfig;
 use crate::errors;
 use crate::languages;
 use crate::session::{SharedRecorder, StoredUtterance};
+use crate::netcheck;
 use crate::translator::{
-    self, Provider, StreamAction, TraceGuard, TranslationContext, CONTEXT_PAIRS,
+    self, Provider, StreamAction, TraceGuard, TranslationContext, FIRST_TOKEN_DEADLINE,
+    FIRST_TOKEN_TIMEOUT_ERR,
 };
 
 const INTERPRET_TEMPLATE: &str = include_str!("../prompts/interpret_system.txt");
@@ -52,9 +54,26 @@ const MAX_TOKENS: u32 = 300;
 /// How long `flush` waits for in-flight final calls at stop before giving up
 /// and letting the session close with whatever was persisted.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(6);
-/// Buffer this many chars of a continuation before emitting anything, so the
-/// meta-leak check and the repeated-prefix strip see enough text to decide.
-const HEAD_SCAN_CHARS: usize = 32;
+/// Rolling context pairs per target for interp calls. Higher than sentence
+/// mode's `CONTEXT_PAIRS` (2): a group is often a clause-sized fragment, so
+/// two pairs cover only a sentence or so of history — too little for the
+/// model to resolve pronouns and keep terms consistent mid-thought.
+const INTERP_CONTEXT_PAIRS: usize = 5;
+
+/// Whether the head buffer can be released: it holds at least the target's
+/// meta-scan length (`translator::meta_scan_chars` — 14 for CJK, 32 for
+/// Latin) AND is not still a prefix of what was already emitted. The second
+/// condition matters once the buffer is short: a model re-reading `<emitted>`
+/// back verbatim would otherwise get decided mid-repeat, before
+/// `strip_overlap` can see the whole duplicated span.
+fn head_ready(head: &str, emitted: &str, scan_chars: usize) -> bool {
+    if head.chars().count() < scan_chars {
+        return false;
+    }
+    let h = head.trim_start();
+    let e = emitted.trim();
+    !(e.len() > h.len() && e.starts_with(h))
+}
 
 #[derive(Debug, Default)]
 struct TargetState {
@@ -66,6 +85,9 @@ struct TargetState {
     in_flight: bool,
     /// Set after the call that saw `closed == true` completed (or failed).
     finished: bool,
+    /// The final state is incomplete: the last call for the closed group
+    /// failed (after its one retry). A failed mid-group call that a later
+    /// call covers doesn't count — a later success clears it.
     failed: bool,
 }
 
@@ -296,6 +318,10 @@ async fn run_target(app: AppHandle, group: SharedGroup, lang: String) {
             if closed && src_chars < MIN_TRANSLATE_CHARS {
                 ts.finished = true;
                 ts.translated_chars = src_chars;
+                // Source-only row: tell the window to drop its placeholder.
+                if ts.emitted.trim().is_empty() {
+                    let _ = app.emit(&format!("translation:skip:{lang}"), json!({ "id": id }));
+                }
                 break;
             }
             ts.in_flight = true;
@@ -308,28 +334,55 @@ async fn run_target(app: AppHandle, group: SharedGroup, lang: String) {
             }
         };
 
-        let result = call_llm(&app, &job, &lang).await;
+        let mut job = job;
+        let mut result = call_llm(&app, &job, &lang).await;
+        // Text a failed first attempt already put on screen; carried into
+        // `emitted` so neither the retry nor later continuations repeat it.
+        let mut carried = String::new();
+        // The final call of a closed group gets one retry: nothing later
+        // would cover it, so a single blip would otherwise leave the row
+        // permanently incomplete.
+        if job.closed {
+            if let Err(f) = &result {
+                if retryable(&f.error) {
+                    carried.push_str(&f.shown);
+                    job.emitted.push_str(&f.shown);
+                    result = call_llm(&app, &job, &lang).await;
+                }
+            }
+        }
 
         {
             let mut g = group.lock().await;
             if let Some(ts) = g.targets.get_mut(&lang) {
                 ts.in_flight = false;
                 ts.translated_chars = ts.translated_chars.max(job.src_chars);
+                ts.emitted.push_str(&carried);
                 match result {
                     Ok(cont) => {
                         ts.emitted.push_str(&cont);
+                        ts.failed = false;
                     }
-                    Err(e) => {
-                        ts.failed = true;
-                        errors::record(
-                            "interp_api",
-                            &e,
-                            Some(json!({
-                                "target": lang,
-                                "id": job.id,
-                                "closed": job.closed,
-                                "text_excerpt": job.source.chars().take(60).collect::<String>(),
-                            })),
+                    Err(f) => {
+                        ts.emitted.push_str(&f.shown);
+                        if job.closed {
+                            ts.failed = true;
+                        }
+                        if !f.error.starts_with(netcheck::OFFLINE_ERR) {
+                            errors::record(
+                                "interp_api",
+                                &f.error,
+                                Some(json!({
+                                    "target": lang,
+                                    "id": job.id,
+                                    "closed": job.closed,
+                                    "text_excerpt": job.source.chars().take(60).collect::<String>(),
+                                })),
+                            );
+                        }
+                        let _ = app.emit(
+                            &format!("translation:error:{lang}"),
+                            json!({ "id": job.id, "message": f.error }),
                         );
                     }
                 }
@@ -416,7 +469,7 @@ async fn maybe_finish(app: &AppHandle, group: &SharedGroup) {
             .position(|(k, _, _)| *k > t_start)
             .unwrap_or(entry.len());
         entry.insert(pos, (t_start, source.clone(), text));
-        while entry.len() > CONTEXT_PAIRS {
+        while entry.len() > INTERP_CONTEXT_PAIRS {
             entry.pop_front();
         }
     }
@@ -470,7 +523,6 @@ fn build_user(
     source_label: &str,
     lang_label: &str,
     job: &Job,
-    tag_emitted: bool,
 ) -> String {
     let mut s = String::new();
     if !history.is_empty() {
@@ -493,7 +545,7 @@ fn build_user(
     if job.closed {
         s.push_str("<final/>");
     }
-    if tag_emitted && !job.emitted.trim().is_empty() {
+    if !job.emitted.trim().is_empty() {
         s.push_str("\n<emitted>");
         s.push_str(job.emitted.trim());
         s.push_str("</emitted>");
@@ -501,53 +553,75 @@ fn build_user(
     s
 }
 
-/// Request body. Anthropic gets the emitted translation as an assistant
-/// prefill (the model can only continue it — append-only by construction;
-/// trailing whitespace is trimmed because the API rejects it). OpenAI has no
-/// prefill, so the emitted text rides in the user message as `<emitted>`.
+/// Request body. The emitted translation rides in the user message as
+/// `<emitted>` for both providers (assistant prefill 400s on Sonnet 4.6 and
+/// later); append-only is enforced by `strip_overlap` on the way out.
+/// `reasoning_effort` is OpenAI-only (see `translator::reasoning_effort_param`).
 fn build_body(
     provider: Provider,
     model: &str,
     system: &str,
     user: &str,
-    prefill: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> Value {
     match provider {
-        Provider::Anthropic => {
-            let mut messages = vec![json!({"role": "user", "content": user})];
-            if let Some(p) = prefill.map(str::trim_end).filter(|p| !p.is_empty()) {
-                messages.push(json!({"role": "assistant", "content": p}));
-            }
-            json!({
-                "model": model,
-                "max_tokens": MAX_TOKENS,
-                "stream": true,
-                "system": [{
-                    "type": "text",
-                    "text": system,
-                    "cache_control": {"type": "ephemeral"}
-                }],
-                "messages": messages
-            })
-        }
-        Provider::OpenAi => json!({
+        Provider::Anthropic => json!({
             "model": model,
-            "max_completion_tokens": MAX_TOKENS,
+            "max_tokens": MAX_TOKENS,
             "stream": true,
-            "stream_options": {"include_usage": true},
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ]
+            "system": [{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": user}]
         }),
+        Provider::OpenAi => {
+            let mut body = json!({
+                "model": model,
+                "max_completion_tokens": MAX_TOKENS,
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ]
+            });
+            if let Some(effort) = reasoning_effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+            body
+        }
     }
+}
+
+/// A failed continuation call: the error, plus whatever part of the
+/// continuation already reached the UI before it broke (append-only — the
+/// caller folds it into `emitted`).
+struct CallFailure {
+    error: String,
+    shown: String,
+}
+
+impl CallFailure {
+    fn new(error: impl Into<String>) -> Self {
+        Self { error: error.into(), shown: String::new() }
+    }
+}
+
+/// Whether a failed final call is worth its one retry: not when offline or
+/// misconfigured — the same answer would come back.
+fn retryable(error: &str) -> bool {
+    !(error.starts_with(netcheck::OFFLINE_ERR)
+        || error.contains("API key not configured")
+        || error.starts_with("invalid target"))
 }
 
 /// One streaming continuation call. Emits `translation:chunk:{lang}` deltas
 /// as they arrive (after the head buffer clears the meta / overlap checks)
 /// and returns the full continuation exactly as shown to the UI.
-async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, String> {
-    let (provider, api_key, model, source_code, glossary_block) = {
+async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, CallFailure> {
+    let (provider, api_key, model, source_code, glossary_block, effort) = {
         let cfg = app.state::<SharedConfig>();
         let cfg = cfg.lock().await;
         let provider = Provider::from_config(&cfg.api.provider);
@@ -561,16 +635,22 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Stri
             model,
             cfg.language.source.clone(),
             cfg.render_glossary_section(lang),
+            translator::reasoning_effort_param(&cfg.api.openai_reasoning_effort),
         )
     };
     if api_key.is_empty() {
-        return Err(format!("{} API key not configured", provider.label()));
+        // Same wording as sentence mode so the frontend's error rules match.
+        let name = match provider {
+            Provider::Anthropic => "Anthropic",
+            Provider::OpenAi => "OpenAI",
+        };
+        return Err(CallFailure::new(format!("{name} API key not configured (open Settings)")));
     }
-    if !crate::netcheck::is_online(app) {
-        return Err(crate::netcheck::OFFLINE_ERR.into());
+    if !netcheck::is_online(app) {
+        return Err(CallFailure::new(netcheck::OFFLINE_ERR));
     }
     let Some(target_name) = languages::get(lang).map(|l| l.prompt_name.as_str()) else {
-        return Err(format!("invalid target: {lang}"));
+        return Err(CallFailure::new(format!("invalid target: {lang}")));
     };
     let source_name = languages::get(&source_code)
         .map(|l| l.zh_ui_name.as_str())
@@ -585,38 +665,65 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Stri
         .replace("{source_lang}", source_name)
         .replace("{lang}", target_name)
         .replace("{glossary_section}", &glossary_block);
-    let tag_emitted = provider == Provider::OpenAi;
-    let user = build_user(&history, &source_code, lang, job, tag_emitted);
-    let prefill = if provider == Provider::Anthropic {
-        Some(job.emitted.as_str())
-    } else {
-        None
-    };
-    let body = build_body(provider, &model, &system, &user, prefill);
+    let user = build_user(&history, &source_code, lang, job);
+    let body = build_body(provider, &model, &system, &user, effort);
 
     let mut guard = TraceGuard::new("translate_inc", job.id.clone(), lang.to_string(), model.clone());
-    let resp = translator::post_llm_with_retry(provider, &api_key, &body, &mut guard.retries).await?;
+    // First-token deadline covers the whole call up to the first content
+    // delta (headers, retry ladder, stream lead-in). No re-issue here: a
+    // mid-group call is covered by the next one, and `run_target` retries
+    // a group's final call once.
+    let deadline = tokio::time::Instant::now() + FIRST_TOKEN_DEADLINE;
+    let resp = translator::post_llm_with_retry(
+        app,
+        provider,
+        &api_key,
+        &body,
+        &mut guard.retries,
+        Some(deadline),
+    )
+    .await
+    .map_err(CallFailure::new)?;
 
     let chunk_event = format!("translation:chunk:{lang}");
+    let scan_chars = translator::meta_scan_chars(lang);
     let mut stream = resp.bytes_stream().eventsource();
     let mut head = String::new();
     let mut decided = false;
+    let mut got_first = false;
     let mut shown = String::new();
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let next = if got_first {
+            stream.next().await
+        } else {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    guard.outcome = "timeout";
+                    return Err(CallFailure::new(FIRST_TOKEN_TIMEOUT_ERR));
+                }
+            }
+        };
+        let Some(event) = next else { break };
         let ev = match event {
             Ok(ev) => ev,
-            Err(e) => return Err(format!("sse stream: {e}")),
+            Err(e) => return Err(CallFailure { error: format!("sse stream: {e}"), shown }),
         };
         match translator::parse_stream_event(provider, ev.event.as_str(), &ev.data, &mut guard) {
             StreamAction::Delta(delta) => {
                 guard.mark_ttft();
+                got_first = true;
                 if decided {
                     shown.push_str(&delta);
                     let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": delta }));
                 } else {
                     head.push_str(&delta);
-                    if head.chars().count() >= HEAD_SCAN_CHARS {
+                    if head_ready(
+                        &head,
+                        &job.emitted,
+                        translator::effective_scan_chars(&head, scan_chars),
+                    ) {
                         decided = true;
                         if translator::is_meta_prefix(&head) {
                             errors::record(
@@ -636,7 +743,7 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Stri
                 }
             }
             StreamAction::Stop => break,
-            StreamAction::Error(err) => return Err(err),
+            StreamAction::Error(err) => return Err(CallFailure { error: err, shown }),
             StreamAction::Ignore => {}
         }
     }
@@ -790,47 +897,79 @@ mod tests {
         let empty = VecDeque::new();
         let j = job("我們今天要討論的第一個議題是關於，", "", false);
         assert_eq!(
-            build_user(&empty, "zh", "en", &j, false),
+            build_user(&empty, "zh", "en", &j),
             "<source>我們今天要討論的第一個議題是關於，</source>"
         );
-        let j = job("我們今天要討論的第一個議題是關於預算。", "The first topic", true);
-        let anthropic = build_user(&empty, "zh", "en", &j, false);
-        assert!(anthropic.ends_with("</source><final/>"));
-        assert!(!anthropic.contains("<emitted>"));
-        let openai = build_user(&empty, "zh", "en", &j, true);
-        assert!(openai.ends_with("<final/>\n<emitted>The first topic</emitted>"));
+        let j = job("我們今天要討論的第一個議題是關於預算。", "The first topic ", true);
+        let user = build_user(&empty, "zh", "en", &j);
+        assert!(user.ends_with("</source><final/>\n<emitted>The first topic</emitted>"));
 
         let mut hist = VecDeque::new();
         hist.push_back((1.0, "上一句。".to_string(), "Previous sentence.".to_string()));
-        let with_ctx = build_user(&hist, "zh", "en", &j, false);
+        let with_ctx = build_user(&hist, "zh", "en", &j);
         assert!(with_ctx.starts_with("<context>\nzh: 上一句。\nen: Previous sentence.\n\n</context>\n\n<source>"));
     }
 
     #[test]
-    fn anthropic_body_uses_prefill_and_trims_trailing_space() {
-        let body = build_body(Provider::Anthropic, "m", "SYS", "USER", Some("The first topic "));
+    fn anthropic_body_is_single_user_message() {
+        let body = build_body(Provider::Anthropic, "m", "SYS", "USER", Some("none"));
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[1]["content"], "The first topic");
+        assert_eq!(msgs.len(), 1, "no trailing assistant prefill");
+        assert_eq!(msgs[0]["role"], "user");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["max_tokens"], MAX_TOKENS);
-
-        let body = build_body(Provider::Anthropic, "m", "SYS", "USER", Some("   "));
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "blank prefill is omitted");
-        let body = build_body(Provider::Anthropic, "m", "SYS", "USER", None);
-        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert!(body.get("reasoning_effort").is_none(), "OpenAI-only field");
     }
 
     #[test]
-    fn openai_body_has_no_prefill() {
-        let body = build_body(Provider::OpenAi, "gpt", "SYS", "USER", Some("ignored"));
+    fn openai_body_shape() {
+        let body = build_body(Provider::OpenAi, "gpt", "SYS", "USER", Some("none"));
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(body["max_completion_tokens"], MAX_TOKENS);
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["reasoning_effort"], "none");
+        let body = build_body(Provider::OpenAi, "gpt", "SYS", "USER", None);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn head_ready_waits_for_scan_length_and_for_repeats_to_finish() {
+        // Below the script's scan length: keep buffering.
+        assert!(!head_ready("Good", "", 32));
+        assert!(head_ready("我們今天要討論的第一個議題是關於", "", 14));
+        // Model is reading the emitted text back verbatim: hold until the
+        // repeat ends so strip_overlap sees all of it.
+        let emitted = "我們今天要討論的第一個議題是關於預算與人力的分配";
+        assert!(!head_ready("我們今天要討論的第一個議題是關", emitted, 14));
+        assert!(head_ready("我們今天要討論的第一個議題是關於預算與人力的分配，接著", emitted, 14));
+        // Diverged from emitted: release.
+        assert!(head_ready("預算的部分我們下週再決定細節吧", emitted, 14));
+    }
+
+    #[test]
+    fn english_meta_head_on_zh_target_waits_for_latin_threshold() {
+        let zh = translator::meta_scan_chars("zh");
+        let head = "This input appears to be incomplete";
+        // 14 chars of an ASCII head is not decided yet on a zh target…
+        let h14: String = head.chars().take(zh).collect();
+        assert!(!head_ready(&h14, "", translator::effective_scan_chars(&h14, zh)));
+        // …only at 32, where the meta marker is visible.
+        let h32: String = head.chars().take(32).collect();
+        assert!(head_ready(&h32, "", translator::effective_scan_chars(&h32, zh)));
+        assert!(translator::is_meta_prefix(&h32));
+    }
+
+    #[test]
+    fn retryable_skips_offline_and_config_errors() {
+        assert!(retryable("request failed: connection reset"));
+        assert!(retryable(FIRST_TOKEN_TIMEOUT_ERR));
+        assert!(retryable("openai 503 Service Unavailable: busy"));
+        assert!(!retryable(netcheck::OFFLINE_ERR));
+        assert!(!retryable("OpenAI API key not configured (open Settings)"));
+        assert!(!retryable("invalid target: xx"));
     }
 
     #[test]

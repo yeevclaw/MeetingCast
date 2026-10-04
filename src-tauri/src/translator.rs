@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
 use crate::config::SharedConfig;
@@ -34,6 +34,7 @@ pub(crate) struct TraceGuard {
     output_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
     pub(crate) stop_reason: Option<String>,
     pub(crate) retries: u32,
     pub(crate) outcome: &'static str,
@@ -53,6 +54,7 @@ impl TraceGuard {
             output_tokens: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            reasoning_tokens: None,
             stop_reason: None,
             retries: 0,
             outcome: "error",
@@ -83,9 +85,14 @@ impl TraceGuard {
     /// streaming chunk under `stream_options.include_usage`, or the
     /// non-streaming response body). Field mapping: `prompt_tokens` →
     /// input, `completion_tokens` → output, `prompt_tokens_details.
-    /// cached_tokens` → cache_read. `cache_creation_input_tokens` stays
+    /// cached_tokens` → cache_read, `completion_tokens_details.
+    /// reasoning_tokens` → reasoning. `cache_creation_input_tokens` stays
     /// None — OpenAI has no explicit cache-write counter.
     fn absorb_openai_usage(&mut self, usage: &Value) {
+        self.reasoning_tokens = usage
+            .get("completion_tokens_details")
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64());
         self.input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
         self.output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
         self.cache_read_input_tokens = usage
@@ -127,6 +134,7 @@ impl Drop for TraceGuard {
             output_tokens: self.output_tokens,
             cache_creation_input_tokens: self.cache_creation_input_tokens,
             cache_read_input_tokens: self.cache_read_input_tokens,
+            reasoning_tokens: self.reasoning_tokens,
             stop_reason: self.stop_reason.clone(),
             retries: self.retries,
             outcome: self.outcome.to_string(),
@@ -214,6 +222,13 @@ impl Provider {
 /// is a between-chunk idle cap that trips only when the stream stalls for that
 /// long — safe for long summaries. Deliberately NO total `.timeout()`: it would
 /// abort a legitimately long streaming summary mid-flight.
+///
+/// Connection reuse across a meeting's quiet stretches: reqwest's default
+/// 90 s pool idle timeout dropped the warm connection whenever nobody spoke
+/// for a minute and a half, so the next sentence paid DNS + TCP + TLS again
+/// (~150–300 ms). Keep idle connections 5 min, TCP keepalive so NAT boxes
+/// don't silently drop them, and HTTP/2 (negotiated via ALPN; both providers
+/// speak it) so parallel t1/t2 calls multiplex onto one connection.
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 fn http_client() -> &'static Client {
@@ -221,10 +236,54 @@ fn http_client() -> &'static Client {
         Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .read_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(300))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true)
             .build()
             .unwrap_or_else(|_| Client::new())
     })
 }
+
+/// Best-effort connection warm-up at session start: one free `GET /v1/models`
+/// on the shared client so DNS + TCP + TLS are done before the first sentence
+/// needs translating. Fire-and-forget — never blocks `start_stt`, never
+/// surfaces an error, skipped when no key is configured or the probe says
+/// offline. The body is drained so an HTTP/1.1 connection returns to the pool.
+pub(crate) fn warm_up(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let (provider, api_key) = {
+            let cfg = app.state::<SharedConfig>();
+            let cfg = cfg.lock().await;
+            let provider = Provider::from_config(&cfg.api.provider);
+            let key = match provider {
+                Provider::Anthropic => cfg.api.anthropic_api_key.clone(),
+                Provider::OpenAi => cfg.api.openai_api_key.clone(),
+            };
+            (provider, key)
+        };
+        if api_key.is_empty() || !crate::netcheck::is_online(&app) {
+            return;
+        }
+        let url = match provider {
+            Provider::Anthropic => "https://api.anthropic.com/v1/models",
+            Provider::OpenAi => "https://api.openai.com/v1/models",
+        };
+        let req = apply_auth(http_client().get(url), provider, &api_key);
+        if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(10), req.send()).await {
+            let _ = tokio::time::timeout(Duration::from_secs(5), resp.bytes()).await;
+        }
+    });
+}
+
+/// Live translation (sentence + interp, never summary) gives up on a call
+/// that hasn't produced its first content delta this long after the request
+/// started — headers, retries and the stream's lead-in all count. A sentence
+/// that hasn't started rendering after 8 s is stale for the room anyway.
+pub(crate) const FIRST_TOKEN_DEADLINE: Duration = Duration::from_secs(8);
+/// Error string for a blown first-token deadline. The `timeout:` prefix is
+/// what the frontend keys off (src/lib/errors.ts).
+pub(crate) const FIRST_TOKEN_TIMEOUT_ERR: &str = "timeout: no translation output within 8 s";
 
 /// Backoff between retries. Two retries (250 ms then 750 ms) catches the
 /// transient blips that surface as `request failed` (DNS hiccup, captive-
@@ -254,17 +313,29 @@ fn apply_auth(req: reqwest::RequestBuilder, provider: Provider, api_key: &str) -
 /// header with an integer-seconds value, the next backoff is
 /// `max(fixed_backoff, retry_after)` capped at 10s so we respect the server's
 /// pacing without stalling the UI indefinitely.
+///
+/// `deadline` (live translation only) bounds the whole ladder: no backoff
+/// sleeps past it (the last HTTP error is returned instead) and a `send()`
+/// still waiting for headers at the deadline yields `FIRST_TOKEN_TIMEOUT_ERR`.
+///
+/// A transport failure (or a header timeout) triggers one immediate
+/// reachability probe; if the link is down the call returns `OFFLINE_ERR`
+/// at once — the UI shows "paused" — instead of walking the ladder into DNS
+/// timeouts.
 pub(crate) async fn post_llm_with_retry(
+    app: &AppHandle,
     provider: Provider,
     api_key: &str,
     body: &Value,
     retries: &mut u32,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<Response, String> {
     let client = http_client();
     let mut last_err: String = "no attempts made".into();
     // Set by a retryable response carrying Retry-After; consumed by the next
     // iteration's sleep (max'd against the fixed backoff, capped at 10s).
     let mut pending_delay_ms: Option<u64> = None;
+    let mut probed = false;
     for attempt in 0..=RETRY_BACKOFF_MS.len() {
         // Report attempts performed regardless of eventual success/failure so
         // the caller's trace records the true retry count on every exit path.
@@ -275,13 +346,28 @@ pub(crate) async fn post_llm_with_retry(
                 .take()
                 .map(|ra| ra.max(backoff))
                 .unwrap_or(backoff);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            let delay = Duration::from_millis(delay);
+            if deadline.is_some_and(|d| tokio::time::Instant::now() + delay >= d) {
+                break;
+            }
+            tokio::time::sleep(delay).await;
         }
-        let resp = apply_auth(client.post(provider.url()), provider, api_key)
+        let send = apply_auth(client.post(provider.url()), provider, api_key)
             .header("content-type", "application/json")
             .json(body)
-            .send()
-            .await;
+            .send();
+        let resp = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, send).await {
+                Ok(r) => r,
+                Err(_) => {
+                    if !probed && !crate::netcheck::probe_now(app).await {
+                        return Err(crate::netcheck::OFFLINE_ERR.into());
+                    }
+                    return Err(FIRST_TOKEN_TIMEOUT_ERR.into());
+                }
+            },
+            None => send.await,
+        };
         match resp {
             Ok(r) => {
                 let status = r.status();
@@ -321,6 +407,14 @@ pub(crate) async fn post_llm_with_retry(
             }
             Err(e) => {
                 last_err = format!("request failed: {e}");
+                // Probe once per call: a dead link fails fast as "paused"; a
+                // live one (transient reset, TLS blip) keeps retrying.
+                if !probed {
+                    probed = true;
+                    if !crate::netcheck::probe_now(app).await {
+                        return Err(crate::netcheck::OFFLINE_ERR.into());
+                    }
+                }
                 continue;
             }
         }
@@ -334,7 +428,9 @@ pub(crate) async fn post_llm_with_retry(
 /// `max_completion_tokens` (OpenAI deprecated `max_tokens`), system prompt as
 /// the leading message, and `stream_options.include_usage` so the final
 /// stream chunk carries token usage. `stream_options` is only legal when
-/// streaming — the non-streaming fallback strips it.
+/// streaming — the non-streaming fallback strips it. `reasoning_effort` is
+/// OpenAI-only (live translation passes it, summary passes `None`); the
+/// Anthropic arm ignores it.
 fn build_chat_body(
     provider: Provider,
     model: &str,
@@ -342,6 +438,7 @@ fn build_chat_body(
     user: &str,
     max_tokens: u32,
     stream: bool,
+    reasoning_effort: Option<&str>,
 ) -> Value {
     match provider {
         Provider::Anthropic => json!({
@@ -368,9 +465,32 @@ fn build_chat_body(
             if stream {
                 body["stream_options"] = json!({"include_usage": true});
             }
+            if let Some(effort) = reasoning_effort {
+                body["reasoning_effort"] = json!(effort);
+            }
             body
         }
     }
+}
+
+/// Values gpt-5.6-luna accepts for `reasoning_effort` (`minimal` 400s).
+const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+
+/// Normalize the configured `openai_reasoning_effort` for the request body:
+/// empty → omit the field (model default); an unsupported value → "none"
+/// rather than sending something that 400s every live call.
+pub(crate) fn reasoning_effort_param(configured: &str) -> Option<&'static str> {
+    let v = configured.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(
+        REASONING_EFFORTS
+            .iter()
+            .copied()
+            .find(|e| e.eq_ignore_ascii_case(v))
+            .unwrap_or("none"),
+    )
 }
 
 /// Provider-neutral meaning of one SSE event, extracted so both stream
@@ -516,7 +636,41 @@ fn target_lang_name(target: &str) -> Option<&'static str> {
 // streaming). 32 covers the longest marker ("based on the specific rule",
 // "please provide the chinese" = 26 chars) with a small safety margin and
 // cuts ~50 chars / ~200ms of perceived latency vs. the old 80.
+//
+// That 32 is the Latin-script value. CJK carries ~2–3× the meaning per char,
+// so 32 chars of a zh/ja target is a whole short sentence held back — most
+// zh/ja translations finished under the buffer and only appeared at stream
+// end. Han/kana targets buffer 14 (longest ja marker 「翻訳することができません」
+// = 12) and Khmer 18 code points (its markers are 14–17 code points: the
+// script spends a code point per subscript / vowel sign). See
+// `meta_scan_chars`; a unit test pins every marker under its script's cap.
 const META_SCAN_CHARS: usize = 32;
+const META_SCAN_CHARS_CJK: usize = 14;
+const META_SCAN_CHARS_KHMER: usize = 18;
+
+/// Pre-emit buffer length for a target language, by registry script profile.
+pub(crate) fn meta_scan_chars(target: &str) -> usize {
+    match languages::get(target).map(|l| l.script_profile.as_str()) {
+        Some("han") | Some("japanese") => META_SCAN_CHARS_CJK,
+        Some("khmer") => META_SCAN_CHARS_KHMER,
+        _ => META_SCAN_CHARS,
+    }
+}
+/// Effective buffer length for the head collected so far. A CJK / Khmer
+/// target normally buffers its short threshold, but when the model's reply
+/// opens with ASCII letters it is most likely an English meta reply ("This
+/// input appears to be incomplete…") whose markers run past 14 chars — so
+/// fall back to the 32-char Latin threshold for that head.
+pub(crate) fn effective_scan_chars(head: &str, base: usize) -> usize {
+    if base >= META_SCAN_CHARS {
+        return base;
+    }
+    match head.trim_start().chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => META_SCAN_CHARS,
+        _ => base,
+    }
+}
+
 /// Substrings that almost never appear in legit meeting translations but do
 /// appear when Claude breaks character to comment on the input. Match anywhere
 /// in the first META_SCAN_CHARS characters (case-insensitive).
@@ -606,6 +760,9 @@ enum StreamOutcome {
     /// Stream finished cleanly. `full_text` includes the buffered meta-scan
     /// prefix; `is_meta` is set when the response was dropped as a meta-leak.
     Completed { full_text: String, is_meta: bool },
+    /// No content delta arrived before the first-token deadline. Nothing was
+    /// emitted to the UI, so the caller can re-issue cleanly.
+    FirstTokenTimeout,
     /// Stream broke mid-flight (transport error or an `error` SSE event).
     /// `partial_emitted` records whether any chunk already reached the UI.
     Broken { partial_emitted: bool, err: String },
@@ -615,7 +772,10 @@ enum StreamOutcome {
 /// `translation:chunk` deltas, accumulate the full text, and feed usage /
 /// stop_reason / ttft into `guard`. Returns `Completed` on a clean finish or
 /// `Broken` the moment the connection errors — the caller decides whether to
-/// retry non-streaming.
+/// retry non-streaming. Until the first content delta, every read is bounded
+/// by `deadline` (→ `FirstTokenTimeout`); after it, only reqwest's idle
+/// `read_timeout` applies.
+#[allow(clippy::too_many_arguments)]
 async fn consume_translation_stream(
     resp: Response,
     app: &AppHandle,
@@ -624,8 +784,11 @@ async fn consume_translation_stream(
     target: &str,
     provider: Provider,
     guard: &mut TraceGuard,
+    deadline: tokio::time::Instant,
 ) -> StreamOutcome {
     let mut stream = resp.bytes_stream().eventsource();
+    let scan_chars = meta_scan_chars(target);
+    let mut got_first = false;
 
     // Buffer the first META_SCAN_CHARS chars before emitting anything. If those
     // leading chars match a meta-response blocklist (Claude breaking character
@@ -638,11 +801,21 @@ async fn consume_translation_stream(
     let mut full_translation = String::new();
     let mut emitted_any = false;
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let next = if got_first {
+            stream.next().await
+        } else {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(n) => n,
+                Err(_) => return StreamOutcome::FirstTokenTimeout,
+            }
+        };
+        let Some(event) = next else { break };
         match event {
             Ok(ev) => match parse_stream_event(provider, ev.event.as_str(), &ev.data, guard) {
                 StreamAction::Delta(delta) => {
                     guard.mark_ttft();
+                    got_first = true;
                     if decided {
                         full_translation.push_str(&delta);
                         if !is_meta {
@@ -654,7 +827,7 @@ async fn consume_translation_stream(
                         }
                     } else {
                         buffer.push_str(&delta);
-                        if buffer.chars().count() >= META_SCAN_CHARS {
+                        if buffer.chars().count() >= effective_scan_chars(&buffer, scan_chars) {
                             decided = true;
                             is_meta = is_meta_prefix(&buffer);
                             if is_meta {
@@ -799,7 +972,7 @@ pub async fn translate(
     text: String,
     target: String,
 ) -> Result<(), String> {
-    let (provider, api_key, model, source_code, glossary_block, glossary_entries) = {
+    let (provider, api_key, model, source_code, glossary_block, glossary_entries, effort) = {
         let cfg = config.lock().await;
         // Only feed glossary entries into the observe-only check when the active
         // book applies to the current source language (empty otherwise).
@@ -820,6 +993,7 @@ pub async fn translate(
             cfg.language.source.clone(),
             cfg.render_glossary_section(&target),
             glossary_entries,
+            reasoning_effort_param(&cfg.api.openai_reasoning_effort),
         )
     };
     if api_key.is_empty() {
@@ -844,9 +1018,13 @@ pub async fn translate(
         .map(|l| l.zh_ui_name.as_str())
         .unwrap_or("中文");
 
+    // Only the newest CONTEXT_PAIRS: the shared deque may hold more if the
+    // incremental engine (which keeps INTERP_CONTEXT_PAIRS) wrote it earlier.
     let history_snapshot: VecDeque<(f64, String, String)> = {
         let map = ctx.lock().await;
-        map.get(&target).cloned().unwrap_or_default()
+        map.get(&target)
+            .map(|d| d.iter().skip(d.len().saturating_sub(CONTEXT_PAIRS)).cloned().collect())
+            .unwrap_or_default()
     };
     let user_message = build_user_message(&text, &source_code, &target, &history_snapshot);
 
@@ -854,22 +1032,21 @@ pub async fn translate(
         .replace("{source_lang}", source_name)
         .replace("{lang}", target_name)
         .replace("{glossary_section}", &glossary_block);
-    let body = build_chat_body(provider, &model, &system, &user_message, 1024, true);
+    let body = build_chat_body(provider, &model, &system, &user_message, 1024, true, effort);
 
     let mut guard = TraceGuard::new("translate", id.clone(), target.clone(), model.clone());
-    let resp = match post_llm_with_retry(provider, &api_key, &body, &mut guard.retries).await {
-        Ok(r) => r,
-        Err(msg) => {
+    let record_api_err = |msg: &str| {
+        // Offline is a pause, not a fault — keep it out of errors.log.
+        if !msg.starts_with(crate::netcheck::OFFLINE_ERR) {
             errors::record(
                 "translation_api",
-                &msg,
+                msg,
                 Some(serde_json::json!({
                     "target": target,
                     "id": id,
                     "text_excerpt": text.chars().take(60).collect::<String>(),
                 })),
             );
-            return Err(msg);
         }
     };
 
@@ -877,9 +1054,53 @@ pub async fn translate(
     let done_event = format!("translation:done:{}", target);
     let replace_event = format!("translation:replace:{}", target);
 
+    // First-token deadline: each attempt gets FIRST_TOKEN_DEADLINE from its
+    // own start; a timed-out attempt (nothing emitted yet) is re-issued once,
+    // so the worst case before giving up is ~2 × 8 s.
+    let mut outcome = None;
+    for attempt in 0..2 {
+        let deadline = tokio::time::Instant::now() + FIRST_TOKEN_DEADLINE;
+        let mut tries = 0;
+        let posted =
+            post_llm_with_retry(&app, provider, &api_key, &body, &mut tries, Some(deadline)).await;
+        guard.retries += tries + attempt;
+        let resp = match posted {
+            Ok(r) => r,
+            Err(msg) if msg == FIRST_TOKEN_TIMEOUT_ERR && attempt == 0 => continue,
+            Err(msg) => {
+                record_api_err(&msg);
+                return Err(msg);
+            }
+        };
+        match consume_translation_stream(
+            resp, &app, &chunk_event, &id, &target, provider, &mut guard, deadline,
+        )
+        .await
+        {
+            // `consume_translation_stream` took `resp` by value and returned,
+            // so its body stream is already dropped here: reqwest aborts the
+            // in-flight request (HTTP/2 RST_STREAM / HTTP/1.1 connection not
+            // returned to the pool), the server stops generating, and only
+            // then is the request re-issued. The header-timeout arm above
+            // likewise drops the pending `send` future inside
+            // `post_llm_with_retry` before returning.
+            StreamOutcome::FirstTokenTimeout if attempt == 0 => continue,
+            other => {
+                outcome = Some(other);
+                break;
+            }
+        }
+    }
+    let outcome = outcome.unwrap_or(StreamOutcome::FirstTokenTimeout);
+
     let (full_text, is_meta) =
-        match consume_translation_stream(resp, &app, &chunk_event, &id, &target, provider, &mut guard).await {
+        match outcome {
             StreamOutcome::Completed { full_text, is_meta } => (full_text, is_meta),
+            StreamOutcome::FirstTokenTimeout => {
+                guard.outcome = "timeout";
+                record_api_err(FIRST_TOKEN_TIMEOUT_ERR);
+                return Err(FIRST_TOKEN_TIMEOUT_ERR.into());
+            }
             StreamOutcome::Broken { partial_emitted, err } => {
                 // The connection dropped mid-stream but the request was accepted.
                 // Retry once WITHOUT streaming, then replace whatever partial the
@@ -1047,7 +1268,7 @@ fn template_section_rules(template: &str) -> Option<&'static str> {
     match template {
         "exec_brief" => Some(
             "\n各段落要求：\n\
-            - 第 1 段（摘要）：3–5 句陳述會議要點，連續散文不要列點\n\
+            - 第 1 段（摘要）：以簡短連續散文陳述會議要點，讓主管一眼掌握，不要列點\n\
             - 第 2 段（決議事項）：bullet list；沒有則寫「（無）」/「(none)」/「(không có)」/「（なし）」\n\
             - 第 3 段（Action items）：`- [ ] 任務 — 負責人（期限）`；資訊缺漏寫「未明」\n\
             - 第 4 段（待澄清議題）：bullet list；沒有則寫「（無）」/「（なし）」"
@@ -1056,7 +1277,7 @@ fn template_section_rules(template: &str) -> Option<&'static str> {
             "\n各段落要求：\n\
             - 與會者：從逐字稿可識別的稱謂列點；無法識別整段寫「（未明確識別）」\n\
             - 議題清單：bullet list 列出本次討論到的所有主題\n\
-            - 討論摘要：依時間先後段落式撰寫，每議題 2–4 句\n\
+            - 討論摘要：依時間先後段落式撰寫，每議題一小段，篇幅隨討論深度\n\
             - 決議事項：bullet list 明確達成的決議\n\
             - 行動方案：`- [ ] 任務 — 負責人（期限）`，缺漏寫「未明」\n\
             - 後續事項：未結論議題、待安排會議、需追蹤事項\n\
@@ -1320,7 +1541,9 @@ pub async fn generate_summary(
         "以下是 {duration_min} 分鐘的會議逐字稿（{source_label}）：\n\n---\n{transcript_body}\n---\n\n請輸出 {target_label} 的會議總結。"
     );
 
-    let body = build_chat_body(provider, &summary_model, &system, &user_text, 4096, true);
+    // 16k: the long templates (minutes / decision_log) on an hour-long meeting
+    // were hitting 4096 and getting truncated mid-section.
+    let body = build_chat_body(provider, &summary_model, &system, &user_text, 16000, true, None);
 
     let mut guard = TraceGuard::new(
         "summary",
@@ -1328,7 +1551,7 @@ pub async fn generate_summary(
         target.clone(),
         summary_model.clone(),
     );
-    let resp = match post_llm_with_retry(provider, &api_key, &body, &mut guard.retries).await {
+    let resp = match post_llm_with_retry(&app, provider, &api_key, &body, &mut guard.retries, None).await {
         Ok(r) => r,
         Err(msg) => {
             errors::record(
@@ -1355,7 +1578,7 @@ pub async fn generate_summary(
                 json!({ "session_id": session_id, "target": target }),
             );
             let mut retry_attempts: u32 = 0;
-            match post_llm_with_retry(provider, &api_key, &body, &mut retry_attempts).await {
+            match post_llm_with_retry(&app, provider, &api_key, &body, &mut retry_attempts, None).await {
                 Ok(resp2) => {
                     guard.retries += 1 + retry_attempts;
                     match consume_summary_stream(resp2, &app, &session_id, &target, provider, &mut guard).await
@@ -1524,7 +1747,10 @@ mod tests {
     fn build_chat_body_anthropic_is_byte_compatible() {
         // Must reproduce the pre-provider request JSON exactly — system array
         // with ephemeral cache_control, `max_tokens`, single user message.
-        let body = build_chat_body(Provider::Anthropic, "claude-haiku-4-5", "SYS", "USER", 1024, true);
+        // reasoning_effort is OpenAI-only — the Anthropic arm must ignore it.
+        let body = build_chat_body(
+            Provider::Anthropic, "claude-haiku-4-5", "SYS", "USER", 1024, true, Some("none"),
+        );
         let expected = json!({
             "model": "claude-haiku-4-5",
             "max_tokens": 1024,
@@ -1541,7 +1767,7 @@ mod tests {
 
     #[test]
     fn build_chat_body_openai_shape() {
-        let body = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, true);
+        let body = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, true, None);
         assert_eq!(body["model"], "gpt-5.6-terra");
         assert_eq!(body["max_completion_tokens"], 4096);
         assert!(body.get("max_tokens").is_none());
@@ -1552,11 +1778,89 @@ mod tests {
         assert_eq!(body["messages"][1]["content"], "USER");
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(!body.to_string().contains("cache_control"));
+        // Summary path passes None → field omitted (model default).
+        assert!(body.get("reasoning_effort").is_none());
 
         // stream_options is only legal on streaming calls.
-        let nb = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, false);
+        let nb = build_chat_body(Provider::OpenAi, "gpt-5.6-terra", "SYS", "USER", 4096, false, None);
         assert!(nb.get("stream_options").is_none());
         assert_eq!(nb["stream"], false);
+    }
+
+    #[test]
+    fn build_chat_body_openai_live_carries_reasoning_effort() {
+        let body = build_chat_body(Provider::OpenAi, "gpt-5.6-luna", "SYS", "USER", 1024, true, Some("none"));
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["max_completion_tokens"], 1024);
+    }
+
+    #[test]
+    fn reasoning_effort_param_normalizes() {
+        assert_eq!(reasoning_effort_param("none"), Some("none"));
+        assert_eq!(reasoning_effort_param(" High "), Some("high"));
+        assert_eq!(reasoning_effort_param("xhigh"), Some("xhigh"));
+        // `minimal` 400s on gpt-5.6-luna → never sent.
+        assert_eq!(reasoning_effort_param("minimal"), Some("none"));
+        assert_eq!(reasoning_effort_param(""), None);
+    }
+
+    #[test]
+    fn openai_usage_records_reasoning_tokens() {
+        let mut guard = test_guard();
+        let chunk = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"completion_tokens_details":{"reasoning_tokens":3}}}"#;
+        parse_stream_event(Provider::OpenAi, "message", chunk, &mut guard);
+        assert_eq!(guard.reasoning_tokens, Some(3));
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn meta_scan_chars_by_script() {
+        assert_eq!(meta_scan_chars("en"), META_SCAN_CHARS);
+        assert_eq!(meta_scan_chars("vi"), META_SCAN_CHARS);
+        assert_eq!(meta_scan_chars("zh"), META_SCAN_CHARS_CJK);
+        assert_eq!(meta_scan_chars("ja"), META_SCAN_CHARS_CJK);
+        assert_eq!(meta_scan_chars("km"), META_SCAN_CHARS_KHMER);
+        assert_eq!(meta_scan_chars("fr"), META_SCAN_CHARS, "unknown → Latin default");
+    }
+
+    #[test]
+    fn ascii_head_on_cjk_target_uses_latin_threshold() {
+        let zh = meta_scan_chars("zh");
+        let reply = "This input appears to be incomplete. Please provide the full sentence.";
+        let n = effective_scan_chars(reply, zh);
+        assert_eq!(n, META_SCAN_CHARS);
+        // At the old 14-char CJK cut the marker was not yet visible…
+        let short: String = reply.chars().take(zh).collect();
+        assert!(!is_meta_prefix(&short));
+        // …at the Latin threshold it is caught.
+        let head: String = reply.chars().take(n).collect();
+        assert!(is_meta_prefix(&head));
+        // Real zh output keeps the short buffer; Latin targets are unchanged.
+        assert_eq!(effective_scan_chars("我們今天要討論預算", zh), zh);
+        assert_eq!(effective_scan_chars("  API 的部分", zh), META_SCAN_CHARS);
+        assert_eq!(effective_scan_chars("ការប្រជុំ", meta_scan_chars("km")), meta_scan_chars("km"));
+        assert_eq!(effective_scan_chars("Hello", meta_scan_chars("en")), META_SCAN_CHARS);
+    }
+
+    #[test]
+    fn every_meta_marker_fits_its_scripts_scan_window() {
+        // A marker longer than the buffer for its script could never be seen
+        // whole at the decision point, so it would silently stop filtering.
+        for m in META_MARKERS {
+            let khmer = m.chars().any(|c| ('\u{1780}'..='\u{17FF}').contains(&c));
+            let cjk = m.chars().any(|c| {
+                ('\u{3040}'..='\u{30FF}').contains(&c) || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+            });
+            let limit = if khmer {
+                META_SCAN_CHARS_KHMER
+            } else if cjk {
+                META_SCAN_CHARS_CJK
+            } else {
+                META_SCAN_CHARS
+            };
+            let len = m.chars().count();
+            assert!(len <= limit, "marker {m:?} is {len} chars > {limit}");
+        }
     }
 
     #[test]

@@ -93,18 +93,24 @@ pub async fn network_status(state: tauri::State<'_, NetworkState>) -> Result<boo
     Ok(state.online.load(Ordering::Relaxed))
 }
 
+/// Probe the active provider right now, update the cached state and publish
+/// `network:status` on a change. Used by the 重新檢查 button and by
+/// `translator::post_llm_with_retry` the moment a request fails at the
+/// transport level, so a dropped link flips the UI to "paused" within one
+/// probe instead of after the whole retry ladder plus the next 20 s tick.
+pub async fn probe_now(app: &AppHandle) -> bool {
+    let cfg: SharedConfig = app.state::<SharedConfig>().inner().clone();
+    let host = provider_host(&cfg).await;
+    let online = probe(host).await;
+    let prev = app.state::<NetworkState>().online.swap(online, Ordering::Relaxed);
+    if prev != online {
+        publish(app, online);
+    }
+    online
+}
+
 /// Probe right now (e.g. the user pressed 重新檢查) and publish the result.
 #[tauri::command]
-pub async fn network_probe_now(
-    app: AppHandle,
-    state: tauri::State<'_, NetworkState>,
-    cfg: tauri::State<'_, SharedConfig>,
-) -> Result<bool, String> {
-    let host = provider_host(cfg.inner()).await;
-    let online = probe(host).await;
-    let prev = state.online.swap(online, Ordering::Relaxed);
-    if prev != online {
-        publish(&app, online);
-    }
-    Ok(online)
+pub async fn network_probe_now(app: AppHandle) -> Result<bool, String> {
+    Ok(probe_now(&app).await)
 }

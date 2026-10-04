@@ -37,11 +37,18 @@ pub struct TraceRecord {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
+    /// OpenAI `usage.completion_tokens_details.reasoning_tokens` — hidden
+    /// reasoning the model billed as output. Should stay 0 with
+    /// `reasoning_effort = "none"`; a non-zero value explains a slow TTFT.
+    /// Absent for Anthropic and for older trace lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// Number of retries performed (0 = succeeded on first attempt).
     pub retries: u32,
-    /// "ok" | "error" | "filtered" | "empty".
+    /// "ok" | "error" | "filtered" | "empty" | "timeout" (live translation
+    /// produced no first token within the 8 s deadline).
     pub outcome: String,
     /// Glossary terms present in the source whose required target translation
     /// was missing from the delivered output. Observe-only — recorded for
@@ -120,13 +127,17 @@ pub fn record_diag(gate: &str, t_start: Option<f64>, detail: Option<serde_json::
 /// Shared append path used by both record writers: ensure dir, rotate if
 /// oversized, append one line. Best-effort — any IO failure is dropped.
 fn append_line(line: &str) {
+    // Single `write_all` of the whole line + newline (see errors::record).
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
     let path = trace_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     maybe_rotate(&path);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(buf.as_bytes());
     }
 }
 
@@ -147,6 +158,7 @@ mod tests {
             output_tokens: Some(18),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(96),
+            reasoning_tokens: None,
             stop_reason: Some("end_turn".into()),
             retries: 1,
             outcome: "ok".into(),
@@ -172,6 +184,7 @@ mod tests {
             output_tokens: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            reasoning_tokens: None,
             stop_reason: None,
             ..sample()
         };
@@ -180,6 +193,7 @@ mod tests {
         assert!(!json.contains("ttft_ms"));
         assert!(!json.contains("stop_reason"));
         assert!(!json.contains("glossary_violations"));
+        assert!(!json.contains("reasoning_tokens"));
         // Required fields always present.
         assert!(json.contains("\"total_ms\":640"));
         let back: TraceRecord = serde_json::from_str(&json).unwrap();

@@ -35,6 +35,13 @@ pub struct ApiConfig {
     pub openai_model: String,
     #[serde(default = "default_openai_summary_model")]
     pub openai_summary_model: String,
+    /// `reasoning_effort` sent with OpenAI *live* translation calls (sentence
+    /// + interp; never the summary). "none" keeps first-token latency flat —
+    /// the GPT-5.x default spends hidden reasoning tokens before the first
+    /// visible one. Accepted: none / low / medium / high / xhigh (`minimal` is
+    /// rejected with a 400 by gpt-5.6-luna). No UI; hand-edit config.toml.
+    #[serde(default = "default_openai_reasoning_effort")]
+    pub openai_reasoning_effort: String,
 }
 
 fn default_provider() -> String {
@@ -59,6 +66,10 @@ fn default_openai_summary_model() -> String {
     "gpt-5.6-sol".into()
 }
 
+fn default_openai_reasoning_effort() -> String {
+    "none".into()
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -69,6 +80,7 @@ impl Default for ApiConfig {
             summary_model: default_summary_model(),
             openai_model: default_openai_model(),
             openai_summary_model: default_openai_summary_model(),
+            openai_reasoning_effort: default_openai_reasoning_effort(),
         }
     }
 }
@@ -676,10 +688,30 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    let mut cfg: Config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| toml::from_str::<Config>(&s).ok())
-        .unwrap_or_default();
+    let mut cfg: Config = match std::fs::read_to_string(&path) {
+        Ok(s) => match toml::from_str::<Config>(&s) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // An unparseable config (hand-edit typo, truncated write from an
+                // older build) falls back to defaults — and the next set_config
+                // would overwrite it, silently losing the user's API keys and
+                // glossaries. Keep a timestamped copy first.
+                let backup = backup_path(&path);
+                let copied = std::fs::copy(&path, &backup);
+                errors::record(
+                    "config_parse_failed",
+                    &format!("{e}"),
+                    Some(serde_json::json!({
+                        "backup": backup.to_string_lossy(),
+                        "backup_ok": copied.is_ok(),
+                    })),
+                );
+                Config::default()
+            }
+        },
+        // Missing file = first launch; defaults are the intended state.
+        Err(_) => Config::default(),
+    };
     cfg.migrate_legacy_glossary();
     cfg.migrate_glossary_entries();
     cfg.sanitize_language();
@@ -692,8 +724,21 @@ pub fn save(cfg: &Config) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
     let content = toml::to_string_pretty(cfg).map_err(|e| format!("toml encode: {e}"))?;
-    std::fs::write(&path, content).map_err(|e| format!("write: {e}"))?;
+    // tmp + rename: a crash mid-save must never leave a truncated config.toml
+    // (which `load` would then have to discard).
+    errors::write_atomic(&path, content.as_bytes()).map_err(|e| format!("write: {e}"))?;
     Ok(())
+}
+
+/// `config.toml.bak-<YYYYmmdd-HHMMSS>` next to the config, for the copy kept
+/// when an existing config fails to parse.
+fn backup_path(path: &std::path::Path) -> PathBuf {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.toml".into());
+    path.with_file_name(format!("{name}.bak-{ts}"))
 }
 
 /// On first launch, seed empty fields from prototype/.env so dev mode "just works".
@@ -998,6 +1043,26 @@ mod tests {
         let serialized = toml::to_string(&cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.api.summary_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_to_none_and_round_trips() {
+        let old: Config = toml::from_str("[api]\nprovider = \"openai\"\n").unwrap();
+        assert_eq!(old.api.openai_reasoning_effort, "none");
+        let mut cfg = Config::default();
+        cfg.api.openai_reasoning_effort = "low".into();
+        let reparsed: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(reparsed.api.openai_reasoning_effort, "low");
+    }
+
+    #[test]
+    fn backup_path_is_timestamped_sibling() {
+        let p = std::path::Path::new("/tmp/x/config.toml");
+        let b = backup_path(p);
+        assert_eq!(b.parent(), p.parent());
+        let name = b.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("config.toml.bak-"), "{name}");
+        assert_eq!(name.len(), "config.toml.bak-".len() + "20260101-120000".len());
     }
 
     #[test]

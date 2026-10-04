@@ -53,6 +53,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             sidecar::start_stt,
             sidecar::stop_stt,
+            sidecar::stop_capture,
             sidecar::prewarm_sidecar,
             sidecar::restart_sidecar,
             sidecar::sidecar_ready,

@@ -26,6 +26,19 @@ use crate::translator::TranslationContext;
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
 const STDERR_TAIL_LINES: usize = 50;
+/// How long `stop_stt` waits for the sidecar's `stopped` after sending
+/// `stop`. The sidecar flushes buffered speech into final transcripts before
+/// acknowledging, and those finals must reach interp / the frontend while
+/// the session is still open.
+const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// An `error` this recent is quoted in the `stt:interrupted` message when the
+/// sidecar then stops on its own.
+const INTERRUPT_ERROR_WINDOW: Duration = Duration::from_secs(10);
+/// After recognition ends without a user stop (`stopped` not requested,
+/// `stt:fatal`), the frontend gets this long to drain pending translations
+/// and call `stop_stt` itself. If it hasn't, Rust closes the session it
+/// captured when the timer was armed (never a newer one).
+const UNREQUESTED_STOP_CLOSE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AudioDevice {
@@ -39,7 +52,14 @@ pub struct AudioDevice {
 pub enum SidecarEvent {
     Ready,
     Started,
-    Stopped,
+    /// Exactly once per run. `reason`: `requested` (stop command),
+    /// `source_ended` (demo / WAV file finished normally) or `error` (setup
+    /// failed, stt error, cloud gave up). Absent on old sidecars → treated
+    /// as `error` when un-requested.
+    Stopped {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     ModelLoading,
     ModelReady,
     /// Per-stage progress for startup prewarm (model load + mic init etc.)
@@ -92,6 +112,20 @@ pub enum SidecarEvent {
     /// `Error` so the UI can render it as a non-fatal toast.
     Warning {
         message: String,
+        /// Machine-readable kind for warnings the UI reacts to (status chip,
+        /// banner) rather than just toasting: `reconnecting` / `reconnected`
+        /// / `mic_stalled` / `mic_resumed` / `device_fallback`. Absent on
+        /// plain warnings. Forwarded as `stt:signal`.
+        #[serde(default)]
+        code: Option<String>,
+        /// `device_fallback` only: the device actually opened.
+        #[serde(default)]
+        device: Option<String>,
+    },
+    /// Input level (RMS, 0..1) about every 250 ms while capturing. Forwarded
+    /// as `stt:level` with the bare number; never logged — it's a meter feed.
+    Level {
+        rms: f64,
     },
     Error {
         message: String,
@@ -140,6 +174,80 @@ pub struct SidecarManager {
     /// doesn't keep ticking after the session ends and then auto-stop a
     /// session that's already finished.
     idle_watcher: Option<JoinHandle<()>>,
+    /// Session time base across auto-restarts (see `SessionClock`).
+    clock: SessionClock,
+    /// Fulfilled by the stdout reader on the sidecar's `stopped`, so a
+    /// user stop can wait for the flush of buffered speech. Its presence
+    /// also marks a `stopped` as requested; dropped by the watchdog when the
+    /// child dies so the waiter never hangs on a corpse.
+    stop_waiter: Option<oneshot::Sender<()>>,
+    /// Most recent sidecar `error` message, quoted in `stt:interrupted`.
+    last_error: Option<(String, Instant)>,
+    /// Pending backend close after an un-requested stop / fatal (see
+    /// `arm_close_fallback`). Aborted by `start_stt` / `stop_stt`; the task
+    /// itself is also generation-safe (captured session id).
+    close_fallback: Option<JoinHandle<()>>,
+}
+
+/// How an un-requested `stopped` is surfaced to the frontend.
+#[derive(Debug, PartialEq, Eq)]
+enum UnrequestedStop {
+    /// Demo / WAV file played to the end — `stt:source_ended`, not an error.
+    SourceEnded,
+    /// Recognition broke (`error` or no reason from an old sidecar) —
+    /// `stt:interrupted` with a 繁中 message.
+    Interrupted,
+    /// Sidecar says it was asked to stop although no waiter was armed —
+    /// nothing to tell the user beyond `stt:stopped`.
+    Quiet,
+}
+
+fn classify_unrequested_stop(reason: Option<&str>) -> UnrequestedStop {
+    match reason {
+        Some("source_ended") => UnrequestedStop::SourceEnded,
+        Some("requested") => UnrequestedStop::Quiet,
+        _ => UnrequestedStop::Interrupted,
+    }
+}
+
+/// Session-relative time base across sidecar restarts. A respawned sidecar
+/// starts its clock at 0, which made post-restore transcripts reuse
+/// `t_start` values (the utterance / group id) of rows already on screen and
+/// on disk. On restore the offset jumps to the furthest `t_end` seen, and
+/// every later transcript is shifted by it.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct SessionClock {
+    offset: f64,
+    max_t_end: f64,
+    /// Set on restore, cleared by the first transcript after it — proof the
+    /// respawned sidecar actually works, so the crash budget can reset.
+    awaiting_stable: bool,
+}
+
+/// Gap added on top of the last `t_end` at a restore, so a first post-restore
+/// segment starting at 0.0 can't land on the exact id of a pre-crash one
+/// whose `t_start == t_end` (synthetic cloud timestamps).
+const RESTORE_EPSILON: f64 = 0.01;
+
+impl SessionClock {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn on_restore(&mut self) {
+        self.offset = self.max_t_end + RESTORE_EPSILON;
+        self.awaiting_stable = true;
+    }
+
+    /// Shift one transcript's times onto the session clock. Returns the
+    /// shifted pair and whether this is the first transcript since a restore.
+    fn apply(&mut self, t_start: f64, t_end: f64) -> (f64, f64, bool) {
+        let (s, e) = (t_start + self.offset, t_end + self.offset);
+        if e > self.max_t_end {
+            self.max_t_end = e;
+        }
+        (s, e, std::mem::take(&mut self.awaiting_stable))
+    }
 }
 
 impl SidecarManager {
@@ -156,6 +264,10 @@ impl SidecarManager {
             pending_devices: None,
             last_activity_at: None,
             idle_watcher: None,
+            clock: SessionClock::default(),
+            stop_waiter: None,
+            last_error: None,
+            close_fallback: None,
         }
     }
 
@@ -345,7 +457,32 @@ async fn spawn_inner_body(
                         // be paid for output the user barely sees, and a partial
                         // alias inside an interim might trigger a wrong rewrite
                         // that stabilizes once the full word is recognized.
-                        SidecarEvent::Transcript { text, is_final, t_start, t_end, boundary, .. } if is_final => {
+                        SidecarEvent::Transcript { text, is_final, t_start, t_end, boundary, .. } => {
+                            // Session clock: shift onto the pre-restore time
+                            // base; the first transcript after a restore also
+                            // proves the respawn healthy → reset the budget.
+                            let (t_start, t_end) = {
+                                let mut m = mgr_o.lock().await;
+                                let (s, e, stable) = m.clock.apply(t_start, t_end);
+                                if stable {
+                                    m.restart_attempts = 0;
+                                }
+                                (s, e)
+                            };
+                            if !is_final {
+                                emit_event(
+                                    &app_o,
+                                    SidecarEvent::Transcript {
+                                        text,
+                                        is_final,
+                                        t_start,
+                                        t_end,
+                                        boundary,
+                                        utterance_id: None,
+                                    },
+                                );
+                                continue;
+                            }
                             let (rewritten, incremental) = {
                                 let cfg = cfg_o.lock().await;
                                 (cfg.apply_glossary_aliases(&text), cfg.incremental_enabled())
@@ -396,6 +533,58 @@ async fn spawn_inner_body(
                         SidecarEvent::Diag { gate, t_start, detail } => {
                             traces::record_diag(&gate, t_start, detail);
                         }
+                        SidecarEvent::Error { message } => {
+                            mgr_o.lock().await.last_error = Some((message.clone(), Instant::now()));
+                            emit_event(&app_o, SidecarEvent::Error { message });
+                        }
+                        // `stopped` either acknowledges a user stop (wake the
+                        // waiter in stop_stt) or — with no stop requested and
+                        // a session running — means the run ended on its own:
+                        // the demo file finished (`source_ended`) or the
+                        // sidecar gave up (`error`: cloud out of reconnects,
+                        // audio device gone). Tell the frontend, which drains
+                        // pending translations and calls `stop_stt`; a 15 s
+                        // fallback closes the session if it doesn't.
+                        SidecarEvent::Stopped { reason } => {
+                            let (waiter, unexpected, last_err) = {
+                                let mut m = mgr_o.lock().await;
+                                let waiter = m.stop_waiter.take();
+                                let unexpected = waiter.is_none()
+                                    && !m.intentional_stop
+                                    && m.last_start.is_some();
+                                if unexpected {
+                                    m.last_start = None;
+                                    m.last_activity_at = None;
+                                    if let Some(h) = m.idle_watcher.take() {
+                                        h.abort();
+                                    }
+                                }
+                                let last_err = m
+                                    .last_error
+                                    .take()
+                                    .filter(|(_, at)| at.elapsed() < INTERRUPT_ERROR_WINDOW)
+                                    .map(|(msg, _)| msg);
+                                (waiter, unexpected, last_err)
+                            };
+                            if let Some(tx) = waiter {
+                                let _ = tx.send(());
+                            }
+                            emit_event(&app_o, SidecarEvent::Stopped { reason: reason.clone() });
+                            if unexpected {
+                                match classify_unrequested_stop(reason.as_deref()) {
+                                    UnrequestedStop::SourceEnded => {
+                                        let _ = app_o.emit("stt:source_ended", ());
+                                    }
+                                    UnrequestedStop::Interrupted => {
+                                        let msg = interrupted_message(last_err.as_deref());
+                                        errors::record("stt_interrupted", &msg, None);
+                                        let _ = app_o.emit("stt:interrupted", msg);
+                                    }
+                                    UnrequestedStop::Quiet => {}
+                                }
+                                arm_close_fallback(&app_o, &mgr_o, "unrequested_stop").await;
+                            }
+                        }
                         other => emit_event(&app_o, other),
                     }
                 }
@@ -439,6 +628,8 @@ async fn spawn_inner_body(
             if let Some(h) = m.idle_watcher.take() {
                 h.abort();
             }
+            // Wake a stop_stt waiting for `stopped` — it won't come now.
+            m.stop_waiter = None;
             (
                 m.intentional_stop,
                 m.restart_attempts,
@@ -478,10 +669,17 @@ async fn spawn_inner_body(
                 "max restart attempts reached",
                 Some(serde_json::json!({ "attempts": next_attempt })),
             );
+            {
+                let mut m = mgr_w.lock().await;
+                m.restart_attempts = 0;
+                m.starting = false;
+                m.last_start = None;
+            }
+            // Don't leave the session "recording" with no engine behind it:
+            // the frontend stops it on `stt:fatal`; the fallback covers a
+            // frontend that can't.
             let _ = app_w.emit("stt:fatal", "辨識引擎連續崩潰，請檢查 errors.log");
-            let mut m = mgr_w.lock().await;
-            m.restart_attempts = 0;
-            m.starting = false;
+            arm_close_fallback(&app_w, &mgr_w, "fatal").await;
             return;
         }
 
@@ -504,6 +702,9 @@ async fn spawn_inner_body(
                 // Re-issue last start command so user picks up where they left off
                 if let Some(cmd) = last_start {
                     let mut m = mgr_w.lock().await;
+                    // The new child's clock starts at 0 — continue the
+                    // session's time base instead (see SessionClock).
+                    m.clock.on_restore();
                     if let Some(stdin) = m.stdin.as_mut() {
                         let line = format!("{cmd}\n");
                         let _ = stdin.write_all(line.as_bytes()).await;
@@ -519,9 +720,11 @@ async fn spawn_inner_body(
                 {
                     let mut m = mgr_w.lock().await;
                     m.starting = false;
+                    m.last_start = None;
                 }
                 errors::record("sidecar_respawn_failed", &e, None);
                 let _ = app_w.emit("stt:fatal", e);
+                arm_close_fallback(&app_w, &mgr_w, "fatal").await;
             }
         }
     });
@@ -533,7 +736,7 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
     let _ = match &event {
         SidecarEvent::Transcript { .. } => app.emit("transcript", &event),
         SidecarEvent::Started => app.emit("stt:started", ()),
-        SidecarEvent::Stopped => app.emit("stt:stopped", ()),
+        SidecarEvent::Stopped { .. } => app.emit("stt:stopped", ()),
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
@@ -557,7 +760,14 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
             }),
         )
         }
-        SidecarEvent::Warning { message } => app.emit("stt:warning", message),
+        SidecarEvent::Warning { message, code, device } => {
+            let r = app.emit("stt:warning", message);
+            if let Some(payload) = signal_payload(message, code.as_deref(), device.as_deref()) {
+                let _ = app.emit("stt:signal", payload);
+            }
+            r
+        }
+        SidecarEvent::Level { rms } => app.emit("stt:level", rms),
         SidecarEvent::Error { message } => {
             errors::record("sidecar_protocol_error", message, None);
             app.emit("stt:error", message)
@@ -567,6 +777,116 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         // Recorded to traces.jsonl in the stdout reader — never emitted.
         SidecarEvent::Diag { .. } => Ok(()),
     };
+}
+
+/// `stt:signal` payload for a coded warning: `{code, message}` plus
+/// `device` when the sidecar named one. `None` for a plain (uncoded) warning.
+fn signal_payload(message: &str, code: Option<&str>, device: Option<&str>) -> Option<Value> {
+    let code = code?;
+    let mut payload = serde_json::json!({ "code": code, "message": message });
+    if let Some(d) = device {
+        payload["device"] = Value::String(d.to_string());
+    }
+    Some(payload)
+}
+
+/// User-facing text for `stt:interrupted`, quoting the sidecar's last error
+/// when one arrived just before it stopped.
+fn interrupted_message(last_error: Option<&str>) -> String {
+    let base = "辨識連線中斷，本場已自動保存。可按開始重新接續。";
+    match last_error.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{base}（{e}）"),
+        None => base.to_string(),
+    }
+}
+
+/// Arm the backend close after recognition ended without a user stop. The
+/// session id is captured NOW; when the grace period runs out the task closes
+/// that session only if it is still the active one and the frontend never
+/// called `stop_stt` (which closes it and aborts this task). A newer meeting
+/// started in between is never touched.
+async fn arm_close_fallback(app: &AppHandle, mgr: &SharedManager, why: &'static str) {
+    let recorder = app.state::<SharedRecorder>().inner().clone();
+    let Some(captured) = session::active_session_id(&recorder).await else {
+        return;
+    };
+    let app_f = app.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(UNREQUESTED_STOP_CLOSE_GRACE).await;
+        if close_session_if(&app_f, &captured).await {
+            errors::record(
+                "session_close_fallback",
+                "frontend did not call stop_stt within 15 s; Rust closed the session",
+                Some(serde_json::json!({ "session_id": captured, "why": why })),
+            );
+        }
+    });
+    if let Some(prev) = mgr.lock().await.close_fallback.replace(handle) {
+        prev.abort();
+    }
+}
+
+/// Abort a pending close fallback (user stop / new start owns teardown now).
+fn abort_close_fallback(m: &mut SidecarManager) {
+    if let Some(h) = m.close_fallback.take() {
+        h.abort();
+    }
+}
+
+/// Flush the incremental engine and finalize `session_id` — only if it is
+/// still the active session (generation check before the flush and again,
+/// atomically, at the close). Emits `session:closed` when it closed one.
+async fn close_session_if(app: &AppHandle, session_id: &str) -> bool {
+    let recorder = app.state::<SharedRecorder>().inner().clone();
+    if session::active_session_id(&recorder).await.as_deref() != Some(session_id) {
+        return false;
+    }
+    interp::flush(app).await;
+    match session::stop_session_if(&recorder, session_id).await {
+        Some(id) => {
+            let _ = app.emit("session:closed", id);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Send `stop` and wait — bounded by `STOP_DRAIN_TIMEOUT` — for the
+/// sidecar's `stopped`. The sidecar flushes buffered speech first, so late
+/// finals are processed by the stdout reader (interp / frontend) before the
+/// caller closes the session. Only waits when a session was actually
+/// running; the idle watcher handle is left to the caller (the idle fallback
+/// runs *inside* that task and must not abort itself).
+async fn send_stop_and_wait(mgr: &SharedManager) {
+    let rx = {
+        let mut m = mgr.lock().await;
+        let running = m.last_start.is_some() && m.stdin.is_some();
+        m.intentional_stop = true;
+        m.last_start = None;
+        m.last_activity_at = None;
+        let rx = if running {
+            let (tx, rx) = oneshot::channel();
+            m.stop_waiter = Some(tx);
+            Some(rx)
+        } else {
+            None
+        };
+        if let Some(stdin) = m.stdin.as_mut() {
+            let _ = stdin.write_all(b"{\"type\":\"stop\"}\n").await;
+            let _ = stdin.flush().await;
+        }
+        rx
+    };
+    if let Some(rx) = rx {
+        if tokio::time::timeout(STOP_DRAIN_TIMEOUT, rx).await.is_err() {
+            errors::record(
+                "sidecar_stop_timeout",
+                "no `stopped` within 3 s of `stop`; closing the session anyway",
+                None,
+            );
+        }
+        mgr.lock().await.stop_waiter = None;
+    }
 }
 
 #[tauri::command]
@@ -604,10 +924,17 @@ pub async fn start_stt(
         }
     }
 
+    // Warm the LLM connection while the sidecar spins up (fire-and-forget).
+    crate::translator::warm_up(app.clone());
+
     let need_spawn = {
         let mut m = state.lock().await;
         m.restart_attempts = 0;
         m.intentional_stop = false;
+        abort_close_fallback(&mut m);
+        m.clock.reset();
+        m.last_error = None;
+        m.stop_waiter = None;
         if m.stdin.is_none() {
             if m.starting {
                 return Err("sidecar is starting".into());
@@ -814,6 +1141,22 @@ pub async fn sidecar_ready(state: tauri::State<'_, SharedManager>) -> Result<boo
     Ok(state.lock().await.ready)
 }
 
+/// First half of a user stop: halt capture and wait (≤ 3 s) for the sidecar
+/// to flush its last finals, but keep the session open. Sentence mode needs
+/// this split — the frontend persists each utterance only after its
+/// translation lands, so it drains those before calling `stop_stt`.
+#[tauri::command]
+pub async fn stop_capture(state: tauri::State<'_, SharedManager>) -> Result<(), String> {
+    {
+        let mut m = state.lock().await;
+        if let Some(h) = m.idle_watcher.take() {
+            h.abort();
+        }
+    }
+    send_stop_and_wait(state.inner()).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn stop_stt(
     app: AppHandle,
@@ -822,19 +1165,14 @@ pub async fn stop_stt(
 ) -> Result<Option<String>, String> {
     {
         let mut m = state.lock().await;
-        m.intentional_stop = true;
-        m.last_start = None;
-        m.last_activity_at = None;
         if let Some(h) = m.idle_watcher.take() {
             h.abort();
         }
-        let cmd = serde_json::json!({"type": "stop"});
-        if let Some(stdin) = m.stdin.as_mut() {
-            let line = format!("{cmd}\n");
-            let _ = stdin.write_all(line.as_bytes()).await;
-            let _ = stdin.flush().await;
-        }
+        abort_close_fallback(&mut m);
     }
+    // Wait (≤ 3 s) for the sidecar to flush buffered speech and ack with
+    // `stopped`, so those last finals land while the session is open.
+    send_stop_and_wait(state.inner()).await;
     // Finalize meta.json on stop. The frontend may still flush a few
     // pending utterances after this — those are silently dropped because
     // the recorder slot is already empty (see session_append_utterance).
@@ -877,6 +1215,9 @@ async fn idle_watch_loop(
             }
         };
         if elapsed >= threshold {
+            // Generation guard: the fallback below may only close the session
+            // that was idle, never a meeting started after this fired.
+            let captured = session::active_session_id(&recorder).await;
             let _ = app.emit("stt:idle_timeout", idle_minutes);
             {
                 // Clear our own clock so a late-arriving final can't re-arm
@@ -889,23 +1230,12 @@ async fn idle_watch_loop(
             // gone, enforce the cost-safety guarantee in Rust instead of
             // leaving a cloud/realtime session running indefinitely.
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let fallback_stop = {
-                let mut m = mgr.lock().await;
-                if m.last_start.is_none() {
-                    false
-                } else {
-                    m.intentional_stop = true;
-                    m.last_start = None;
-                    if let Some(stdin) = m.stdin.as_mut() {
-                        let _ = stdin.write_all(b"{\"type\":\"stop\"}\n").await;
-                        let _ = stdin.flush().await;
-                    }
-                    true
-                }
-            };
-            if fallback_stop {
-                interp::flush(&app).await;
-                let _ = session::stop_session(&recorder).await;
+            let fallback_stop = mgr.lock().await.last_start.is_some()
+                && captured.is_some()
+                && session::active_session_id(&recorder).await == captured;
+            if let (true, Some(captured)) = (fallback_stop, captured) {
+                send_stop_and_wait(&mgr).await;
+                close_session_if(&app, &captured).await;
                 errors::record(
                     "idle_timeout_fallback",
                     "frontend did not stop the session within 5 seconds; Rust forced stop",
@@ -976,5 +1306,114 @@ pub async fn list_audio_devices(
         Ok(Ok(devices)) => Ok(devices),
         Ok(Err(_)) => Err("sidecar dropped response".into()),
         Err(_) => Err("list_devices timeout".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_is_identity_until_a_restore() {
+        let mut c = SessionClock::default();
+        assert_eq!(c.apply(1.0, 2.5), (1.0, 2.5, false));
+        assert_eq!(c.apply(3.0, 7.25), (3.0, 7.25, false));
+        assert_eq!(c.max_t_end, 7.25);
+    }
+
+    #[test]
+    fn clock_continues_time_base_after_restore() {
+        let mut c = SessionClock::default();
+        c.apply(0.0, 4.0);
+        c.apply(4.5, 9.0);
+        c.on_restore();
+        // Respawned sidecar restarts at 0 → shifted past everything seen.
+        let (s, e, stable) = c.apply(0.0, 1.5);
+        assert!(s > 9.0 && (s - 9.0 - RESTORE_EPSILON).abs() < 1e-9, "{s}");
+        assert!((e - (9.0 + RESTORE_EPSILON + 1.5)).abs() < 1e-9, "{e}");
+        assert!(stable, "first transcript after restore marks it stable");
+        let (_, _, again) = c.apply(2.0, 3.0);
+        assert!(!again, "only the first one");
+    }
+
+    #[test]
+    fn clock_offsets_accumulate_across_two_restores() {
+        let mut c = SessionClock::default();
+        c.apply(0.0, 10.0);
+        c.on_restore();
+        c.apply(0.0, 5.0); // → ~15.01
+        c.on_restore();
+        let (s, _, _) = c.apply(0.0, 1.0);
+        assert!((s - (15.0 + 2.0 * RESTORE_EPSILON)).abs() < 1e-9, "{s}");
+        c.reset();
+        assert_eq!(c, SessionClock::default());
+    }
+
+    #[test]
+    fn restore_with_no_transcripts_yet_still_avoids_zero_collision() {
+        let mut c = SessionClock::default();
+        c.on_restore();
+        let (s, _, stable) = c.apply(0.0, 0.0);
+        assert!(s > 0.0);
+        assert!(stable);
+    }
+
+    #[test]
+    fn parses_level_and_coded_warnings() {
+        let ev: SidecarEvent = serde_json::from_str(r#"{"type":"level","rms":0.42}"#).unwrap();
+        assert!(matches!(ev, SidecarEvent::Level { rms } if (rms - 0.42).abs() < 1e-9));
+
+        let plain: SidecarEvent =
+            serde_json::from_str(r#"{"type":"warning","message":"hi"}"#).unwrap();
+        assert!(matches!(plain, SidecarEvent::Warning { code: None, device: None, .. }));
+
+        let coded: SidecarEvent = serde_json::from_str(
+            r#"{"type":"warning","message":"fell back","code":"device_fallback","device":"MacBook Mic"}"#,
+        )
+        .unwrap();
+        let SidecarEvent::Warning { message, code, device } = coded else { panic!() };
+        let payload = signal_payload(&message, code.as_deref(), device.as_deref()).unwrap();
+        assert_eq!(payload["code"], "device_fallback");
+        assert_eq!(payload["message"], "fell back");
+        assert_eq!(payload["device"], "MacBook Mic");
+    }
+
+    #[test]
+    fn signal_payload_only_for_coded_warnings() {
+        assert!(signal_payload("x", None, None).is_none());
+        let p = signal_payload("重新連線中", Some("reconnecting"), None).unwrap();
+        assert!(p.get("device").is_none());
+        assert_eq!(p["code"], "reconnecting");
+    }
+
+    #[test]
+    fn interrupted_message_quotes_last_error() {
+        let base = interrupted_message(None);
+        assert!(base.contains("本場已自動保存"));
+        assert_eq!(interrupted_message(Some("  ")), base);
+        let with = interrupted_message(Some("stt error: ws closed"));
+        assert!(with.starts_with(&base) && with.contains("stt error: ws closed"));
+    }
+
+    #[test]
+    fn stopped_reason_parses_and_defaults() {
+        let ev: SidecarEvent = serde_json::from_str(r#"{"type":"stopped"}"#).unwrap();
+        assert!(matches!(ev, SidecarEvent::Stopped { reason: None }));
+        let ev: SidecarEvent =
+            serde_json::from_str(r#"{"type":"stopped","reason":"source_ended"}"#).unwrap();
+        match ev {
+            SidecarEvent::Stopped { reason } => assert_eq!(reason.as_deref(), Some("source_ended")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrequested_stop_classification() {
+        assert_eq!(classify_unrequested_stop(Some("source_ended")), UnrequestedStop::SourceEnded);
+        assert_eq!(classify_unrequested_stop(Some("error")), UnrequestedStop::Interrupted);
+        // Old sidecar without a reason → treated as an interruption.
+        assert_eq!(classify_unrequested_stop(None), UnrequestedStop::Interrupted);
+        assert_eq!(classify_unrequested_stop(Some("weird")), UnrequestedStop::Interrupted);
+        assert_eq!(classify_unrequested_stop(Some("requested")), UnrequestedStop::Quiet);
     }
 }

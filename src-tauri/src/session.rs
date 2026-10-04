@@ -280,7 +280,8 @@ impl SessionRecorder {
         meta.set_summaries(scan_summaries(&self.dir));
         let json =
             serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize meta: {e}"))?;
-        std::fs::write(self.dir.join("meta.json"), json).map_err(|e| format!("write meta: {e}"))?;
+        errors::write_atomic(&self.dir.join("meta.json"), json.as_bytes())
+            .map_err(|e| format!("write meta: {e}"))?;
         Ok(())
     }
 }
@@ -290,11 +291,69 @@ impl SessionRecorder {
 pub fn read_meta(session_id: &str) -> Result<SessionMeta, String> {
     validate_session_id(session_id)?;
     let path = session_dir(session_id).join("meta.json");
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read meta: {e}"))?;
-    let mut meta =
-        serde_json::from_str::<SessionMeta>(&content).map_err(|e| format!("parse meta: {e}"))?;
-    meta.backfill_summaries();
-    Ok(meta)
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read meta: {e}"))
+        .and_then(|content| {
+            serde_json::from_str::<SessionMeta>(&content).map_err(|e| format!("parse meta: {e}"))
+        });
+    match parsed {
+        Ok(mut meta) => {
+            meta.backfill_summaries();
+            Ok(meta)
+        }
+        Err(e) => {
+            // A missing / torn meta.json (crash mid-write on a pre-atomic build,
+            // disk full) must not make the meeting vanish from History while its
+            // transcript is intact. Rebuild a minimal meta from transcript.jsonl;
+            // not written back, so a transient read error never clobbers a good
+            // file.
+            let rows = read_transcript(session_id).map_err(|_| e.clone())?;
+            errors::record(
+                "session_meta_rebuilt",
+                &e,
+                Some(serde_json::json!({ "session_id": session_id, "rows": rows.len() })),
+            );
+            Ok(rebuild_meta(session_id, &rows, &session_dir(session_id)))
+        }
+    }
+}
+
+/// Minimal meta for a session whose meta.json is unreadable: the start time
+/// comes from the id (local-time directory name), duration from the last
+/// utterance's `t_end`, counts from the rows. backend / language / device are
+/// unknown and left empty.
+fn rebuild_meta(session_id: &str, rows: &[StoredUtterance], dir: &Path) -> SessionMeta {
+    let started = started_at_from_id(session_id);
+    let duration_secs = rows
+        .iter()
+        .map(|u| u.t_end)
+        .fold(0.0_f64, f64::max)
+        .max(0.0)
+        .ceil() as u64;
+    let mut meta = SessionMeta {
+        session_id: session_id.to_string(),
+        started_at: started
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+        ended_at: started.map(|t| (t + chrono::Duration::seconds(duration_secs as i64)).to_rfc3339()),
+        duration_secs,
+        count: rows.len(),
+        incomplete_count: rows.iter().filter(|u| u.incomplete).count(),
+        ..Default::default()
+    };
+    meta.set_summaries(scan_summaries(dir));
+    meta
+}
+
+/// Parse the `%Y-%m-%d_%H-%M-%S-%6f` local-time prefix `SessionRecorder::start`
+/// uses for directory names (an optional `-N` collision suffix is ignored).
+fn started_at_from_id(session_id: &str) -> Option<DateTime<Utc>> {
+    let stamp = session_id.get(..26)?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d_%H-%M-%S-%6f").ok()?;
+    naive
+        .and_local_timezone(Local)
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// Re-read meta.json, refresh the summary availability (has_summaries + the
@@ -305,7 +364,8 @@ pub fn touch_meta_summary_flags(session_id: &str) -> Result<(), String> {
     let dir = session_dir(session_id);
     meta.set_summaries(scan_summaries(&dir));
     let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("serialize meta: {e}"))?;
-    std::fs::write(dir.join("meta.json"), json).map_err(|e| format!("write meta: {e}"))?;
+    errors::write_atomic(&dir.join("meta.json"), json.as_bytes())
+        .map_err(|e| format!("write meta: {e}"))?;
     Ok(())
 }
 
@@ -598,9 +658,69 @@ pub async fn stop_session(state: &SharedRecorder) -> Option<String> {
     }
 }
 
+/// Id of the session currently recording, if any.
+pub async fn active_session_id(state: &SharedRecorder) -> Option<String> {
+    state.lock().await.as_ref().map(|r| r.session_id.clone())
+}
+
+/// Generation-safe close for backend-initiated teardown (fallback timers,
+/// idle fallback): finalize the active session only if it is still the one
+/// the caller captured when it armed. If the user has since stopped it or
+/// started a new meeting, do nothing — never close someone else's session.
+pub async fn stop_session_if(state: &SharedRecorder, expected_id: &str) -> Option<String> {
+    let mut guard = state.lock().await;
+    if guard.as_ref().map(|r| r.session_id.as_str()) != Some(expected_id) {
+        return None;
+    }
+    let rec = guard.take()?;
+    if let Err(e) = rec.finalize() {
+        errors::record(
+            "session_finalize_failed",
+            &e,
+            Some(serde_json::json!({ "session_id": rec.session_id })),
+        );
+    }
+    Some(rec.session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_recorder(id: &str) -> SessionRecorder {
+        let dir = std::env::temp_dir().join(format!(
+            "meetingcast-test-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        SessionRecorder {
+            session_id: id.to_string(),
+            dir,
+            started_at_wall: Utc::now(),
+            backend: "local".into(),
+            language: "zh".into(),
+            device: String::new(),
+            count: 0,
+            incomplete_count: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_session_if_only_closes_the_captured_session() {
+        let state = new_recorder();
+        // Nothing active → no-op.
+        assert_eq!(stop_session_if(&state, "a").await, None);
+        // A newer meeting is active → the stale fallback must not touch it.
+        *state.lock().await = Some(temp_recorder("b"));
+        assert_eq!(stop_session_if(&state, "a").await, None);
+        assert_eq!(active_session_id(&state).await.as_deref(), Some("b"));
+        // The captured session is still active → closed.
+        assert_eq!(stop_session_if(&state, "b").await.as_deref(), Some("b"));
+        assert_eq!(active_session_id(&state).await, None);
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("meetingcast-test-{}-b", std::process::id())),
+        );
+    }
 
     #[test]
     fn session_id_validation_rejects_path_traversal() {
@@ -673,6 +793,34 @@ mod tests {
         let json = serde_json::to_string(&u).unwrap();
         let map = serde_json::from_str::<serde_json::Value>(&json).unwrap();
         assert_eq!(map.get("lang").and_then(|v| v.as_str()), Some("ja"));
+    }
+
+    #[test]
+    fn started_at_parses_generated_ids() {
+        let a = started_at_from_id("2026-07-12_14-30-45-123456").expect("plain id");
+        let b = started_at_from_id("2026-07-12_14-30-45-123456-2").expect("suffixed id");
+        assert_eq!(a, b);
+        assert_eq!(
+            a.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-07-12 14:30:45"
+        );
+        assert!(started_at_from_id("garbage").is_none());
+    }
+
+    #[test]
+    fn rebuild_meta_counts_rows_and_derives_duration() {
+        let rows = vec![
+            parse(r#"{"id":"1","t_start":0.5,"t_end":3.2,"src":"a"}"#),
+            parse(r#"{"id":"2","t_start":3.5,"t_end":61.4,"src":"b","incomplete":true}"#),
+        ];
+        let dir = std::env::temp_dir().join("meetingcast-test-no-such-session");
+        let meta = rebuild_meta("2026-07-12_14-30-45-123456", &rows, &dir);
+        assert_eq!(meta.count, 2);
+        assert_eq!(meta.incomplete_count, 1);
+        assert_eq!(meta.duration_secs, 62);
+        assert!(!meta.started_at.is_empty());
+        assert!(meta.ended_at.is_some());
+        assert!(meta.has_summaries.is_empty());
     }
 
     #[test]
