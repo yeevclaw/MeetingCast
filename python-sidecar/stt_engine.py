@@ -115,7 +115,9 @@ def list_input_devices() -> list[dict]:
     or out — so the UI persists by name.
     """
     import sounddevice as sd
+    from audio_capture import refresh_devices_if_no_input
 
+    refresh_devices_if_no_input()
     seen: set[str] = set()
     out: list[dict] = []
     for d in sd.query_devices():
@@ -210,6 +212,8 @@ async def _run_stt_session(
     # again with the same dead device.
     if source_cfg.get("type") == "mic":
         device_pref = source_cfg.get("device") or ""
+        from audio_capture import refresh_devices_if_no_input
+        refresh_devices_if_no_input()
         if device_pref:
             try:
                 import sounddevice as sd
@@ -349,9 +353,12 @@ def _prewarm_mic():
     """
     import time
     import sounddevice as sd  # type: ignore
+    from audio_capture import refresh_devices_if_no_input
 
     def _no_op(indata, frames, time_info, status):
         pass
+
+    refresh_devices_if_no_input()
 
     with sd.InputStream(
         samplerate=16000,

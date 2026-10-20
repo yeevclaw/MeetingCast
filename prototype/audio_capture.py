@@ -16,6 +16,31 @@ MIC_STALL_SEC = 3.0
 _STATUS_LOG_INTERVAL_SEC = 5.0
 
 
+def refresh_devices_if_no_input() -> bool:
+    """Re-scan audio devices when PortAudio sees no input device.
+
+    PortAudio snapshots the device list once, at `import sounddevice`. On macOS
+    an app without microphone permission yet sees no input devices, so a
+    sidecar spawned before the user clicks 允許 keeps default input = -1
+    ("Error querying device -1") until it restarts. Re-initializing PortAudio
+    picks up the now-visible devices (also a mic plugged in after launch).
+
+    Only re-initializes when no input device is visible — then no input stream
+    can be open, so tearing PortAudio down is safe. Returns True if it did.
+    """
+    try:
+        sd.query_devices(kind="input")
+        return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:  # noqa: BLE001
+        print(f"PortAudio re-init failed: {e}", file=sys.stderr, flush=True)
+    return True
+
+
 def _default_input_name() -> str:
     try:
         return str(sd.query_devices(kind="input").get("name", "")).strip()
@@ -83,6 +108,7 @@ async def mic_chunks(
             device=dev,
         )
 
+    refresh_devices_if_no_input()
     try:
         stream = open_stream(device)
     except Exception as e:  # noqa: BLE001

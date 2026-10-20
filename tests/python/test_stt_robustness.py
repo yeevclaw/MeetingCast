@@ -421,6 +421,70 @@ class TestMicChunks(unittest.TestCase):
                 self.assertIn("sys.stderr", line)
 
 
+class TestRefreshDevices(unittest.TestCase):
+    """PortAudio's device list is a snapshot from import time; a sidecar that
+    started before mic permission was granted sees no input (-1) forever."""
+
+    def _patch(self, visible):
+        calls = []
+
+        def query_devices(kind=None):
+            if not visible[0]:
+                raise RuntimeError("Error querying device -1")
+            return {"name": "Blue Snowball"}
+
+        def terminate():
+            calls.append("terminate")
+
+        def initialize():
+            calls.append("initialize")
+            visible[0] = True
+
+        return calls, mock.patch.multiple(
+            audio_capture.sd,
+            query_devices=query_devices,
+            _terminate=terminate,
+            _initialize=initialize,
+        )
+
+    def test_reinit_when_no_input_visible(self):
+        visible = [False]
+        calls, patcher = self._patch(visible)
+        with patcher:
+            self.assertTrue(audio_capture.refresh_devices_if_no_input())
+        self.assertEqual(calls, ["terminate", "initialize"])
+        self.assertTrue(visible[0])
+
+    def test_no_reinit_when_input_visible(self):
+        calls, patcher = self._patch([True])
+        with patcher:
+            self.assertFalse(audio_capture.refresh_devices_if_no_input())
+        self.assertEqual(calls, [])
+
+    def test_mic_chunks_refreshes_before_open(self):
+        visible = [False]
+        calls, patcher = self._patch(visible)
+        opened_after_refresh = []
+
+        class _Stream(_FakeInputStream):
+            def __init__(self, **kw):
+                opened_after_refresh.append(visible[0])
+                super().__init__(**kw)
+
+        async def main():
+            gen = audio_capture.mic_chunks()
+            nxt = asyncio.ensure_future(gen.__anext__())
+            await asyncio.sleep(0.01)
+            _FakeInputStream.instances[-1].push()
+            await asyncio.wait_for(nxt, 1.0)
+            await gen.aclose()
+
+        with patcher, mock.patch.object(audio_capture.sd, "InputStream", _Stream):
+            run(main())
+        self.assertEqual(calls, ["terminate", "initialize"])
+        self.assertEqual(opened_after_refresh, [True])
+
+
 # ------------------------------------------------------------- items 1 / 2 --
 class TestServerErrorClassification(unittest.TestCase):
     def test_classes(self):
