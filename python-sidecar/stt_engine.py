@@ -7,6 +7,7 @@ For dev convenience this imports the existing STT modules from prototype/
 via sys.path; PyInstaller packaging in Phase 4 will collect them properly.
 """
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -115,12 +116,11 @@ def list_input_devices() -> list[dict]:
     or out — so the UI persists by name.
     """
     import sounddevice as sd
-    from audio_capture import refresh_devices_if_no_input
+    from audio_capture import pa_query
 
-    refresh_devices_if_no_input()
     seen: set[str] = set()
     out: list[dict] = []
-    for d in sd.query_devices():
+    for d in pa_query(sd.query_devices):
         channels = int(d.get("max_input_channels", 0) or 0)
         if channels <= 0:
             continue
@@ -132,10 +132,48 @@ def list_input_devices() -> list[dict]:
     return out
 
 
+def _check_input_device(device: str) -> None:
+    """Raise if `device` can't be opened with the capture settings. Blocking
+    (PortAudio) — run it off the event loop."""
+    import sounddevice as sd
+    from audio_capture import pa_query
+
+    pa_query(lambda: sd.check_input_settings(
+        device=device, samplerate=16000, channels=1, dtype="float32"
+    ))
+
+
+def _emit_stage(stage: str) -> None:
+    """Startup progress for the console's 啟動中 checklist: `mic_ready` (first
+    audio captured) and, cloud only, `stt_connected` (first websocket up)."""
+    emit({"type": "stage", "stage": stage})
+
+
+async def _announce_first_chunk(source):
+    """Pass `source` through, emitting `stage: mic_ready` once the first chunk
+    arrives — the honest "the mic is really capturing" signal (`started` goes
+    out before the device is even opened)."""
+    announced = False
+    try:
+        async for chunk in source:
+            if not announced:
+                announced = True
+                _emit_stage("mic_ready")
+            yield chunk
+    finally:
+        # Close the inner source now (its `with stream:` releases the mic)
+        # rather than whenever the async-generator finalizer gets to it.
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
+
+
 def _default_input_device_name() -> str:
     try:
         import sounddevice as sd
-        return str(sd.query_devices(kind="input").get("name", "")).strip()
+        from audio_capture import pa_query
+        return str(pa_query(lambda: sd.query_devices(kind="input")).get("name", "")).strip()
     except Exception:  # noqa: BLE001
         return ""
 
@@ -212,19 +250,11 @@ async def _run_stt_session(
     # again with the same dead device.
     if source_cfg.get("type") == "mic":
         device_pref = source_cfg.get("device") or ""
-        from audio_capture import refresh_devices_if_no_input
-        refresh_devices_if_no_input()
         if device_pref:
             try:
-                import sounddevice as sd
-                sd.check_input_settings(
-                    device=device_pref,
-                    samplerate=16000,
-                    channels=1,
-                    dtype="float32",
-                )
+                await asyncio.to_thread(_check_input_device, device_pref)
             except Exception as e:
-                fallback_name = _default_input_device_name()
+                fallback_name = await asyncio.to_thread(_default_input_device_name)
                 emit({
                     "type": "warning",
                     "code": "device_fallback",
@@ -256,6 +286,7 @@ async def _run_stt_session(
                 backend_kwargs["segmentation"] = str(stt_opts["segmentation"])
             # reconnecting / reconnected warnings → `warning` events
             backend_kwargs["on_warning"] = _emit_warning
+            backend_kwargs["on_stage"] = _emit_stage
         stt = get_backend(backend_name, **backend_kwargs)
         # Front-load the local model snapshot before opening the mic, so the
         # user sees a clear "preparing" state instead of a 1–2 min freeze on
@@ -272,7 +303,9 @@ async def _run_stt_session(
     # Read the source on its own task from here on (mic opens now — before a
     # cloud handshake), meter its level every ~250 ms, and end it cleanly on
     # a graceful stop so the backend can flush what it has buffered.
-    chunks = pump_audio(source, stop_event, on_level=_emit_level, sample_rate=16000)
+    chunks = pump_audio(
+        _announce_first_chunk(source), stop_event, on_level=_emit_level, sample_rate=16000
+    )
 
     emit({"type": "started"})
     session_clock = asyncio.get_running_loop().time
@@ -352,15 +385,12 @@ def _prewarm_mic():
     not an exception, so opening succeeds either way.
     """
     import time
-    import sounddevice as sd  # type: ignore
-    from audio_capture import refresh_devices_if_no_input
+    from audio_capture import TrackedInputStream
 
     def _no_op(indata, frames, time_info, status):
         pass
 
-    refresh_devices_if_no_input()
-
-    with sd.InputStream(
+    with TrackedInputStream(
         samplerate=16000,
         channels=1,
         dtype="float32",
@@ -526,6 +556,32 @@ async def _run_prewarm_step(step: str, fn) -> None:
         emit({"type": "prewarm", "step": step, "state": "error", "message": str(e)})
 
 
+# One `devices` reply at a time, in request order (asyncio.Lock is FIFO):
+# Rust keeps a single pending slot, so out-of-order replies would hand an
+# older listing to a newer request.
+_devices_lock: asyncio.Lock | None = None
+
+
+async def _reply_devices() -> None:
+    global _devices_lock
+    if _devices_lock is None:
+        _devices_lock = asyncio.Lock()
+    async with _devices_lock:
+        await _reply_devices_now()
+
+
+async def _reply_devices_now() -> None:
+    try:
+        devices = await asyncio.to_thread(list_input_devices)
+    except Exception as e:  # noqa: BLE001
+        # Always emit `devices` so the Rust-side oneshot resolves —
+        # without it the UI hangs until the timeout fires.
+        emit({"type": "devices", "devices": []})
+        emit({"type": "error", "message": f"list_devices: {e}"})
+    else:
+        emit({"type": "devices", "devices": devices})
+
+
 async def main():
     # Start heavy prewarm in background threads, but do not block the command
     # loop on it. If HuggingFace is slow or the user wants cloud STT, the
@@ -537,6 +593,8 @@ async def main():
     mic_task = asyncio.create_task(_run_prewarm_step("mic", _prewarm_mic))
     emit({"type": "ready"})
     stt_task: asyncio.Task | None = None
+    # Strong refs for fire-and-forget tasks (asyncio keeps only weak ones).
+    background: set[asyncio.Task] = set()
     cancel_event: asyncio.Event | None = None
     stop_event: asyncio.Event | None = None
 
@@ -600,15 +658,11 @@ async def main():
                 sys.stdout.flush()
                 os._exit(0)
             elif cmd_type == "list_devices":
-                try:
-                    devices = list_input_devices()
-                except Exception as e:
-                    # Always emit `devices` so the Rust-side oneshot resolves —
-                    # without it the UI hangs until the timeout fires.
-                    emit({"type": "devices", "devices": []})
-                    emit({"type": "error", "message": f"list_devices: {e}"})
-                else:
-                    emit({"type": "devices", "devices": devices})
+                # Its own task, PortAudio on a worker thread: the command loop
+                # (start / stop) never waits behind a device query.
+                task = asyncio.create_task(_reply_devices())
+                background.add(task)
+                task.add_done_callback(background.discard)
             else:
                 emit({"type": "error", "message": f"unknown command: {cmd_type}"})
     finally:

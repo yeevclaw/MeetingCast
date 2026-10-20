@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -366,6 +367,12 @@ class _FakeInputStream:
     def __exit__(self, *a):
         return False
 
+    def start(self):
+        self.started = True
+
+    def close(self):
+        self.closed = True
+
     def push(self, n=1600):
         self.callback(np.zeros((n, 1), dtype=np.float32), n, None, None)
 
@@ -483,6 +490,123 @@ class TestRefreshDevices(unittest.TestCase):
             run(main())
         self.assertEqual(calls, ["terminate", "initialize"])
         self.assertEqual(opened_after_refresh, [True])
+
+    def test_no_reinit_while_a_stream_is_open(self):
+        """An unplugged USB mic mid-session also hides every input; tearing
+        PortAudio down then would kill the live stream."""
+        visible = [True]
+        calls, patcher = self._patch(visible)
+        with patcher, mock.patch.object(audio_capture.sd, "InputStream", _FakeInputStream):
+            with audio_capture.TrackedInputStream(callback=lambda *a: None):
+                self.assertEqual(audio_capture._active_streams, 1)
+                visible[0] = False
+                self.assertFalse(audio_capture.refresh_devices_if_no_input())
+            self.assertEqual(audio_capture._active_streams, 0)
+            self.assertTrue(audio_capture.refresh_devices_if_no_input())
+        self.assertEqual(calls, ["terminate", "initialize"])
+
+    def test_lock_is_free_while_a_stream_opens(self):
+        """The open can sit on the macOS permission prompt; device queries on
+        other threads must not wait for it — only a re-init is held off (by
+        the reserved _active_streams count)."""
+        free_during_open = []
+
+        class _Probe(_FakeInputStream):
+            def __init__(self, **kw):
+                r = []
+
+                def probe():
+                    got = audio_capture._PA_LOCK.acquire(blocking=False)
+                    if got:
+                        audio_capture._PA_LOCK.release()
+                    r.append(got)
+
+                t = threading.Thread(target=probe)
+                t.start()
+                t.join(2)
+                free_during_open.append(bool(r and r[0]))
+                self.reserved = audio_capture._active_streams
+                super().__init__(**kw)
+
+        calls, patcher = self._patch([True])
+        with patcher, mock.patch.object(audio_capture.sd, "InputStream", _Probe):
+            s = audio_capture.TrackedInputStream(callback=lambda *a: None)
+            s.close()
+        self.assertEqual(free_during_open, [True])
+        self.assertEqual(_FakeInputStream.instances[-1].reserved, 1)
+        self.assertEqual(audio_capture._active_streams, 0)
+
+    def test_failed_open_releases_the_reservation(self):
+        class _Fail:
+            def __init__(self, **kw):
+                raise RuntimeError("no device")
+
+        with mock.patch.object(audio_capture.sd, "InputStream", _Fail):
+            with self.assertRaises(RuntimeError):
+                audio_capture.TrackedInputStream(callback=lambda *a: None)
+        self.assertEqual(audio_capture._active_streams, 0)
+
+    def test_mic_chunks_closes_stream_on_stop(self):
+        async def main():
+            gen = audio_capture.mic_chunks()
+            nxt = asyncio.ensure_future(gen.__anext__())
+            await asyncio.sleep(0.02)
+            _FakeInputStream.instances[-1].push()
+            await asyncio.wait_for(nxt, 1.0)
+            await gen.aclose()
+
+        with mock.patch.object(audio_capture.sd, "InputStream", _FakeInputStream):
+            run(main())
+        st = _FakeInputStream.instances[-1]
+        self.assertTrue(getattr(st, "started", False))
+        self.assertTrue(getattr(st, "closed", False))
+        self.assertEqual(audio_capture._active_streams, 0)
+
+    def test_failed_start_releases_the_count(self):
+        class _BadStart(_FakeInputStream):
+            closed = False
+
+            def __enter__(self):
+                raise RuntimeError("start failed")
+
+            def close(self):
+                _BadStart.closed = True
+
+        with mock.patch.object(audio_capture.sd, "InputStream", _BadStart):
+            with self.assertRaises(RuntimeError):
+                with audio_capture.TrackedInputStream(callback=lambda *a: None):
+                    pass
+        self.assertTrue(_BadStart.closed)
+        self.assertEqual(audio_capture._active_streams, 0)
+
+    def test_cancelled_open_closes_the_late_stream(self):
+        """Stop pressed while the open waits on the permission prompt: the
+        stream that opens afterwards must be closed, not leaked."""
+        gate = threading.Event()
+        closed = []
+
+        class _Late:
+            def close(self):
+                closed.append(True)
+
+        def slow_open(_dev):
+            gate.wait(2)
+            return _Late()
+
+        async def main():
+            t = asyncio.ensure_future(audio_capture._open_off_loop(slow_open, None))
+            await asyncio.sleep(0.02)
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+            gate.set()
+            for _ in range(100):
+                if closed:
+                    break
+                await asyncio.sleep(0.01)
+
+        run(main())
+        self.assertEqual(closed, [True])
 
 
 # ------------------------------------------------------------- items 1 / 2 --
@@ -653,6 +777,40 @@ class TestCloudReconnect(unittest.TestCase):
         # audio captured before the connection existed was buffered and sent
         self.assertGreater(types.count("input_audio_buffer.append"), 0)
         self.assertEqual(types.count("input_audio_buffer.commit"), 1)
+
+    def test_stage_connected_once_across_reconnects(self):
+        """`stt_connected` fires on the first websocket only — a reconnect is
+        announced by `reconnected`, never by a second startup stage."""
+        stages = []
+        attempts = []
+
+        class _ClosingWS(_FakeWS):
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        def fake_connect(*_a, **_kw):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("network unreachable")
+            if len(attempts) == 2:
+                return _ClosingWS([])
+            return _FakeWS(["你好。"])
+
+        async def main():
+            stt = rt.OpenAILiveTranscribeSTT(
+                language="zh", on_warning=lambda _w: None, on_stage=stages.append
+            )
+            stt._vad = lambda: _FakeVADModel([0.9] * 1000)
+            events = {0: {"start": 0.0}, 40: {"end": 1.2}}
+            with mock.patch.object(rt, "VADIterator", _fake_vad_iterator(events)):
+                return [t async for t in stt.stream(_pcm_source(60, delay=0.005))]
+
+        with mock.patch.object(rt.websockets, "connect", fake_connect), \
+                mock.patch.object(rt, "RECONNECT_DELAYS", (0.01,)), \
+                mock.patch.object(rt, "RECONNECT_STABLE_SEC", 0.02):
+            run(main())
+        self.assertGreaterEqual(len(attempts), 3)
+        self.assertEqual(stages, ["stt_connected"])
 
     def test_flapping_link_announces_once_per_outage(self):
         """Connect → drop → connect → drop → stable: one `reconnecting`, and
@@ -825,6 +983,57 @@ class TestStoppedReason(unittest.TestCase):
         async def hang(*_a):
             await asyncio.sleep(10)
         self.assertEqual(self._run(hang, source="mic", cancel_after=0.01)[0], "requested")
+
+
+
+class TestStartupStages(unittest.TestCase):
+    def test_mic_ready_once_on_first_chunk_and_inner_closed(self):
+        emitted = []
+        closed = []
+
+        async def source():
+            try:
+                for _ in range(3):
+                    yield b"\x00\x00"
+            finally:
+                closed.append(True)
+
+        async def main():
+            gen = stt_engine._announce_first_chunk(source())
+            first = await gen.__anext__()
+            self.assertEqual(emitted, [{"type": "stage", "stage": "mic_ready"}])
+            await gen.__anext__()
+            await gen.aclose()
+            return first
+
+        with mock.patch.object(stt_engine, "emit", emitted.append):
+            first = run(main())
+        self.assertEqual(first, b"\x00\x00")
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(closed, [True])
+
+    def test_list_devices_never_blocks_the_command_loop(self):
+        """A device query stuck behind the permission prompt must not hold
+        up `start` / `stop`: it runs as its own task on a worker thread."""
+        gate = threading.Event()
+        emitted = []
+
+        def slow_list():
+            gate.wait(2)
+            return [{"name": "Mic", "channels": 1}]
+
+        async def main():
+            with mock.patch.object(stt_engine, "list_input_devices", slow_list), \
+                    mock.patch.object(stt_engine, "emit", emitted.append):
+                t = asyncio.create_task(stt_engine._reply_devices())
+                await asyncio.sleep(0.02)
+                # the loop is free while the query is blocked
+                self.assertFalse(t.done())
+                gate.set()
+                await asyncio.wait_for(t, 2)
+
+        run(main())
+        self.assertEqual(emitted, [{"type": "devices", "devices": [{"name": "Mic", "channels": 1}]}])
 
 
 if __name__ == "__main__":

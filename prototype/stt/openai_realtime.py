@@ -549,6 +549,7 @@ class OpenAILiveTranscribeSTT:
         delay: str = DEFAULT_DELAY,
         segmentation: str = SEGMENTATION_SENTENCE,
         on_warning: Callable[[dict], None] | None = None,
+        on_stage: Callable[[str], None] | None = None,
     ):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -569,6 +570,9 @@ class OpenAILiveTranscribeSTT:
         # Sink for structured warnings ({code, message}); the sidecar turns
         # them into `warning` events. None (CLI) → stderr.
         self._on_warning = on_warning
+        # Startup progress sink: called once with "stt_connected" when the
+        # first websocket session is up, so the UI can tick its 連線 step.
+        self._on_stage = on_stage
         self._vad_model = None
 
     def _vad(self):
@@ -912,6 +916,11 @@ class OpenAILiveTranscribeSTT:
                     ) as ws:
                         await ws.send(json.dumps(self._session_payload()))
                         connected_at = loop.time()
+                        if not ever_connected and self._on_stage is not None:
+                            try:
+                                self._on_stage("stt_connected")
+                            except Exception:  # noqa: BLE001
+                                pass
                         ever_connected = True
                         outbox.connection_reset()
                         if conn_state["announced"]:
