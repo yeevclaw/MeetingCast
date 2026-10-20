@@ -12,6 +12,7 @@ import PrewarmChecklist, {
 } from "@/components/PrewarmChecklist";
 import SessionSetupCard from "@/components/SessionSetupCard";
 import SettingsModal from "@/components/SettingsModal";
+import StartupProgress, { bootDone, ListeningIndicator, type BootState } from "@/components/StartupProgress";
 import WelcomeWizard from "@/components/WelcomeWizard";
 import { estimateHourlyUsd } from "@/lib/cost";
 import { friendly, isOfflineError, type FriendlyError } from "@/lib/errors";
@@ -570,6 +571,23 @@ export default function ControlWindow() {
   }, [selectedDevice]);
 
   const startInFlightRef = useRef(false);
+  // The current run's startup checklist (see StartupProgress): set on the
+  // 開始 click, ticked by `stt:started` / `stt:stage`, cleared once every step
+  // is done (→ listening), on stop, or when the start fails. The ref mirrors
+  // it for listeners and the double-start guard.
+  const [boot, setBoot] = useState<BootState | null>(null);
+  const bootRef = useRef<BootState | null>(null);
+  // Set by `stt:stopped` when the run ended before it ever got to listening,
+  // so the `stt:interrupted` that follows reads as 無法開始 (with the real
+  // cause up front) instead of 「辨識連線中斷，本場已自動保存」.
+  const stoppedDuringBootRef = useRef(false);
+  const updateBoot = useCallback((fn: (b: BootState | null) => BootState | null) => {
+    const next = fn(bootRef.current);
+    const settled = next && bootDone(next) ? null : next;
+    if (settled === bootRef.current) return;
+    bootRef.current = settled;
+    setBoot(settled);
+  }, []);
   // True for the whole shared stop flow (stop_capture → drain → stop_stt →
   // UI reset). `stt:stopped` flips `running` false mid-flow, so without this
   // a quick 開始 would start a new session that the old flow then flushes
@@ -591,6 +609,8 @@ export default function ControlWindow() {
     // second invoke during the first's await would surface "already running"
     // from the sidecar as a confusing toast.
     if (startInFlightRef.current) return;
+    // A run is already starting (its 啟動中 checklist is up).
+    if (bootRef.current) return;
     // The previous session is still being finalized.
     if (stoppingRef.current) return;
 
@@ -633,6 +653,14 @@ export default function ControlWindow() {
     }
 
     startInFlightRef.current = true;
+    updateBoot(() => ({
+      since: Date.now(),
+      backend: backendRef.current,
+      demo: !useMicRef.current,
+      mic: "in_progress",
+      engine: "in_progress",
+    }));
+    let launched = false;
     setError(null);
     setHistory([]);
     setLatestSrc("");
@@ -668,12 +696,23 @@ export default function ControlWindow() {
         source,
         language: langCfgRef.current.source,
       });
+      launched = true;
     } catch (err) {
-      setError({ raw: String(err), fallback: "無法開始錄音" });
+      if (String(err).includes("already_recording")) {
+        // Rust says a run is live but the UI thought otherwise (e.g. this
+        // window reloaded mid-recording). Show it as recording so 停止 is
+        // reachable, instead of a 開始 that silently does nothing.
+        setRunning(true);
+        runningRef.current = true;
+        showToast("info", "已經在錄音中；要結束請按「停止」", 4000);
+      } else {
+        setError({ raw: String(err), fallback: "無法開始錄音" });
+      }
     } finally {
       startInFlightRef.current = false;
+      if (!launched) updateBoot(() => null);
     }
-  }, [showToast, applyLangCfg, openSettings]);
+  }, [showToast, applyLangCfg, openSettings, updateBoot]);
 
   const handleCloseSettings = useCallback(async () => {
     setShowSettings(false);
@@ -751,6 +790,7 @@ export default function ControlWindow() {
       setActiveSessionId(null);
       setMicStalled(null);
       setReconnecting(null);
+      updateBoot(() => null);
       // The session is closed — a new one may start. The auto-summary below
       // only touches the closed session, so it doesn't hold the start button.
       stoppingRef.current = false;
@@ -791,7 +831,7 @@ export default function ControlWindow() {
       }
     }
     return true;
-  }, [flushPending, showToast]);
+  }, [flushPending, showToast, updateBoot]);
 
   const handleStop = useCallback(async () => {
     await runStopFlow();
@@ -827,6 +867,8 @@ export default function ControlWindow() {
       listen<TranscriptPayload>("transcript", (e) => {
         const { text, is_final, t_start, t_end } = e.payload;
         if (!text) return;
+        // Recognized speech is proof the run works, whatever step is unticked.
+        if (bootRef.current) updateBoot(() => null);
         if (is_final) {
           lastFinalAtRef.current = Date.now();
           setLatestSrc("");
@@ -1068,6 +1110,11 @@ export default function ControlWindow() {
       }),
       listen("stt:started", () => {
         setRunning(true);
+        // Local: `started` follows the model load, so the engine is ready.
+        // Cloud: it only means the pipeline is up — wait for stt_connected.
+        updateBoot((b) =>
+          b && b.backend === "local" ? { ...b, engine: "done", engineDoneAt: Date.now() } : b,
+        );
         // A sidecar auto-restart re-sends `start` mid-session and Rust offsets
         // transcript times onto the original clock — keep the original start
         // (resetting it would make lag negative). `stt:stopped` / the stop
@@ -1084,7 +1131,16 @@ export default function ControlWindow() {
         }
         setModelLoading(false);
       }),
+      listen<string>("stt:stage", (e) => {
+        if (e.payload === "mic_ready") {
+          updateBoot((b) => (b ? { ...b, mic: "done" } : b));
+        } else if (e.payload === "stt_connected") {
+          updateBoot((b) => (b ? { ...b, engine: "done" } : b));
+        }
+      }),
       listen("stt:stopped", () => {
+        stoppedDuringBootRef.current = bootRef.current != null;
+        updateBoot(() => null);
         setRunning(false);
         setSessionStartedAt(null);
         sessionStartedAtRef.current = null;
@@ -1138,8 +1194,14 @@ export default function ControlWindow() {
       // Capture died mid-session. Rust left the session open for us; run the
       // normal stop flow (keeps the tail + auto-summary), then explain.
       listen<string>("stt:interrupted", async (e) => {
+        const duringBoot = stoppedDuringBootRef.current;
+        stoppedDuringBootRef.current = false;
         await runStopFlow();
-        setError({ raw: e.payload, headline: e.payload, actions: ["restart"] });
+        setError(
+          duringBoot
+            ? { raw: e.payload, fallback: "無法開始錄音", actions: ["restart"] }
+            : { raw: e.payload, headline: e.payload, actions: ["restart"] },
+        );
       }),
       listen<string>("session:opened", (e) => {
         setActiveSessionId(e.payload);
@@ -1203,6 +1265,10 @@ export default function ControlWindow() {
           showToast("info", "正在結束上一場，請稍候", 3000);
           return;
         }
+        if (bootRef.current && !runningRef.current) {
+          showToast("info", "正在開始錄音，請稍候", 3000);
+          return;
+        }
         // Stopping is always allowed (it's the safe direction).
         if (runningRef.current) {
           handleStop();
@@ -1242,6 +1308,7 @@ export default function ControlWindow() {
     clearTrFailure,
     noteTrFailure,
     runStopFlow,
+    updateBoot,
   ]);
 
   // Follow the newest line only while the user is (near) the bottom; once
@@ -1281,6 +1348,24 @@ export default function ControlWindow() {
     const id = setInterval(() => setElapsed(Date.now() - sessionStartedAt), 1000);
     return () => clearInterval(id);
   }, [sessionStartedAt]);
+
+  // Ticks the startup checklist's "taking long" hints while a run starts.
+  const bootSince = boot?.since ?? null;
+  const [bootElapsed, setBootElapsed] = useState(0);
+  useEffect(() => {
+    if (bootSince === null) {
+      setBootElapsed(0);
+      return;
+    }
+    setBootElapsed(Date.now() - bootSince);
+    const id = setInterval(() => setBootElapsed(Date.now() - bootSince), 1000);
+    return () => clearInterval(id);
+  }, [bootSince]);
+  const booting = boot !== null;
+  const restartBoot = useCallback(async () => {
+    await runStopFlow();
+    handleStart();
+  }, [runStopFlow, handleStart]);
 
   const micMissing = micAvailable === false && useMic;
   const hasPrewarmError = Object.values(stepStatus).some((s) => s === "error");
@@ -1487,8 +1572,8 @@ export default function ControlWindow() {
           open={openChip}
           setOpen={setOpenChip}
           tone="neutral"
-          lead={<span className={`inline-block h-2 w-2 rounded-full ${running ? "ai-dot" : "bg-paper-400"}`} />}
-          value={running ? "錄音中" : "閒置"}
+          lead={<span className={`inline-block h-2 w-2 rounded-full ${running || booting ? "ai-dot" : "bg-paper-400"}`} />}
+          value={booting ? "啟動中" : running ? "錄音中" : "閒置"}
           trail={
             <span className={`font-mono text-[11px] tabular-nums ${running ? "text-paper-700" : "text-paper-500"}`}>
               {running ? formatElapsed(elapsed) : "0:00"}
@@ -1497,7 +1582,9 @@ export default function ControlWindow() {
         >
           <PopTitle>錄音狀態</PopTitle>
           <PopText>
-            {running
+            {booting
+              ? "正在開啟麥克風與辨識引擎，完成後就會開始聆聽。"
+              : running
               ? `已錄 ${formatElapsed(elapsed)}。逐字稿與譯文會存到這場會議，停止後可在「歷史會議」查看。`
               : "按下方「開始」或快捷鍵 ⌘ ⇧ M 開始錄音。"}
           </PopText>
@@ -1807,13 +1894,20 @@ export default function ControlWindow() {
                     )}
                   </div>
                 </div>
+              ) : boot ? (
+                <StartupProgress
+                  boot={boot}
+                  elapsedMs={bootElapsed}
+                  modelLoading={modelLoading}
+                  onRestart={restartBoot}
+                  onOpenMicSettings={() => invoke("open_mic_settings").catch(() => {})}
+                />
               ) : running ? (
-                <div className="flex h-full flex-col items-center justify-center gap-3 text-paper-600">
-                  <span className="ai-dot inline-block h-3 w-3 rounded-full" />
-                  <p className="text-sm font-medium text-paper-700">
-                    {modelLoading ? "正在準備辨識模型，首次需要多等一下…" : "聆聽中…請開始說話"}
-                  </p>
-                </div>
+                useMic ? (
+                  <ListeningIndicator />
+                ) : (
+                  <ListeningIndicator title="正在播放內建示範音檔…" note="文字會逐句出現在這裡" />
+                )
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-2 text-paper-600">
                   <p className="text-base">按「開始」後，你說的話會在這裡逐句出現。</p>
@@ -1863,7 +1957,7 @@ export default function ControlWindow() {
         <aside className="grid min-h-0 grid-rows-[auto_1fr]">
           <SessionSetupCard
             cfg={cfgSnap}
-            running={running}
+            running={running || booting}
             useMic={useMic}
             micLabel={micValue}
             costUsd={costUsd}
@@ -1893,7 +1987,7 @@ export default function ControlWindow() {
       <div className="flex items-center gap-2.5 border-t border-paper-200 bg-white px-4">
         <button
           className={`inline-flex h-11 items-center gap-2.5 rounded-xl px-7 text-base font-semibold text-white transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 ${
-            stopping
+            stopping || booting
               ? "bg-paper-800"
               : running
               ? "bg-recording"
@@ -1904,6 +1998,10 @@ export default function ControlWindow() {
           onClick={
             stopping
               ? undefined
+              : booting
+              ? running
+                ? handleStop
+                : undefined
               : running
               ? handleStop
               : startBlock === "engine_error"
@@ -1915,15 +2013,26 @@ export default function ControlWindow() {
           onMouseDown={(e) => {
             // Keep the window-level "click outside closes popovers" handler
             // from immediately closing the chip this button opens.
-            if (!stopping && !running && (startBlock === "engine_error" || startBlock === "mic")) e.stopPropagation();
+            if (!stopping && !booting && !running && (startBlock === "engine_error" || startBlock === "mic")) e.stopPropagation();
           }}
-          disabled={stopping || (!running && startBlock === "preparing")}
-          aria-label={stopping ? "正在結束錄音" : running ? "停止錄音" : "開始錄音"}
+          disabled={stopping || (booting && !running) || (!booting && !running && startBlock === "preparing")}
+          aria-label={
+            stopping ? "正在結束錄音" : booting ? (running ? "取消開始錄音" : "正在開始錄音") : running ? "停止錄音" : "開始錄音"
+          }
+          aria-busy={booting && !running}
           type="button"
         >
-          <span className={`inline-block h-2.5 w-2.5 bg-white ${running || stopping ? "rounded-[2px]" : "rounded-full"}`} />
+          {booting && !running ? (
+            <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+          ) : (
+            <span className={`inline-block h-2.5 w-2.5 bg-white ${running || stopping ? "rounded-[2px]" : "rounded-full"}`} />
+          )}
           {stopping
             ? "正在結束…"
+            : booting
+            ? running
+              ? "取消"
+              : "啟動中…"
             : running
             ? "停止"
             : startBlock === "engine_error"
@@ -2070,6 +2179,7 @@ export default function ControlWindow() {
           backend={backend}
           setBackend={setBackend}
           running={running}
+          booting={booting}
           startTest={handleStart}
           stopTest={handleStop}
           latestSrc={latestSrc}

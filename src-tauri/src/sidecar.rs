@@ -62,6 +62,12 @@ pub enum SidecarEvent {
     },
     ModelLoading,
     ModelReady,
+    /// Startup progress of one run, for the console's 啟動中 checklist:
+    /// `mic_ready` (first audio captured) and `stt_connected` (cloud only:
+    /// first websocket up). Forwarded as `stt:stage` with the bare name.
+    Stage {
+        stage: String,
+    },
     /// Per-stage progress for startup prewarm (model load + mic init etc.)
     /// so the frontend can render a checklist instead of a single spinner.
     Prewarm {
@@ -187,6 +193,21 @@ pub struct SidecarManager {
     /// `arm_close_fallback`). Aborted by `start_stt` / `stop_stt`; the task
     /// itself is also generation-safe (captured session id).
     close_fallback: Option<JoinHandle<()>>,
+    /// True while a `start_stt` call is running (spawn + start command +
+    /// session open), so a second one can't slip in before `last_start` is set.
+    start_in_flight: bool,
+}
+
+/// Returned by `start_stt` when a run is already starting or capturing. The
+/// frontend treats it as a no-op (it means "already doing what you asked").
+pub const ALREADY_RECORDING: &str = "already_recording";
+
+/// A run is starting or capturing: a start is in flight, or the last start
+/// is still live (sidecar up, or being respawned by the watchdog). A second
+/// start then must not open a new session — before this guard it finalized
+/// the live one and left an empty duplicate on disk.
+fn capture_active(m: &SidecarManager) -> bool {
+    m.start_in_flight || (m.last_start.is_some() && (m.stdin.is_some() || m.starting))
 }
 
 /// How an un-requested `stopped` is surfaced to the frontend.
@@ -268,6 +289,7 @@ impl SidecarManager {
             stop_waiter: None,
             last_error: None,
             close_fallback: None,
+            start_in_flight: false,
         }
     }
 
@@ -740,6 +762,7 @@ fn emit_event(app: &AppHandle, event: SidecarEvent) {
         SidecarEvent::Ready => app.emit("stt:ready", ()),
         SidecarEvent::ModelLoading => app.emit("stt:model_loading", ()),
         SidecarEvent::ModelReady => app.emit("stt:model_ready", ()),
+        SidecarEvent::Stage { stage } => app.emit("stt:stage", stage),
         SidecarEvent::Prewarm { step, state, message, downloaded_bytes, total_bytes, cached } => {
             if state == "error" {
                 errors::record(
@@ -896,6 +919,56 @@ pub async fn start_stt(
     config: tauri::State<'_, SharedConfig>,
     recorder: tauri::State<'_, SharedRecorder>,
     ctx: tauri::State<'_, TranslationContext>,
+    backend: String,
+    source: Value,
+    language: Option<String>,
+) -> Result<(), String> {
+    {
+        let mut m = state.lock().await;
+        if capture_active(&m) {
+            return Err(ALREADY_RECORDING.into());
+        }
+        m.start_in_flight = true;
+    }
+    let mut guard = StartInFlight(Some(state.inner().clone()));
+    let r = start_stt_inner(app, &state, &config, &recorder, &ctx, backend, source, language).await;
+    state.lock().await.start_in_flight = false;
+    guard.0 = None;
+    r
+}
+
+/// Clears `start_in_flight` if `start_stt_inner` never returns normally (a
+/// panic unwinds the command future), so one bad start can't refuse every
+/// later one with `already_recording`. Disarmed on the normal path, which
+/// clears the flag itself without waiting for a spawned task.
+struct StartInFlight(Option<SharedManager>);
+
+impl Drop for StartInFlight {
+    fn drop(&mut self) {
+        if let Some(mgr) = self.0.take() {
+            let cleared = match mgr.try_lock() {
+                Ok(mut m) => {
+                    m.start_in_flight = false;
+                    true
+                }
+                Err(_) => false,
+            };
+            if !cleared {
+                tokio::spawn(async move {
+                    mgr.lock().await.start_in_flight = false;
+                });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_stt_inner(
+    app: AppHandle,
+    state: &tauri::State<'_, SharedManager>,
+    config: &tauri::State<'_, SharedConfig>,
+    recorder: &tauri::State<'_, SharedRecorder>,
+    ctx: &tauri::State<'_, TranslationContext>,
     backend: String,
     mut source: Value,
     language: Option<String>,
@@ -1376,6 +1449,44 @@ mod tests {
         assert_eq!(payload["code"], "device_fallback");
         assert_eq!(payload["message"], "fell back");
         assert_eq!(payload["device"], "MacBook Mic");
+    }
+
+    #[test]
+    fn parses_stage_event() {
+        let ev: SidecarEvent =
+            serde_json::from_str(r#"{"type":"stage","stage":"stt_connected"}"#).unwrap();
+        assert!(matches!(ev, SidecarEvent::Stage { stage } if stage == "stt_connected"));
+    }
+
+    #[tokio::test]
+    async fn start_in_flight_guard_clears_on_unwind() {
+        let mgr: SharedManager = Arc::new(Mutex::new(SidecarManager::new()));
+        mgr.lock().await.start_in_flight = true;
+        {
+            let _g = StartInFlight(Some(mgr.clone()));
+            // dropped without disarming = the panic / cancellation path
+        }
+        assert!(!mgr.lock().await.start_in_flight);
+    }
+
+    #[test]
+    fn capture_active_blocks_duplicate_starts() {
+        let mut m = SidecarManager::new();
+        assert!(!capture_active(&m), "idle: start allowed");
+        m.start_in_flight = true;
+        assert!(capture_active(&m), "a start in flight blocks a second one");
+        m.start_in_flight = false;
+        // Live run being respawned by the watchdog (stdin gone, starting set).
+        m.last_start = Some(serde_json::json!({"type": "start"}));
+        m.starting = true;
+        assert!(capture_active(&m));
+        // App-launch prewarm spawn: starting, but no run yet.
+        m.last_start = None;
+        assert!(!capture_active(&m));
+        // Run ended (stop / fatal clear last_start) and the engine is gone.
+        m.starting = false;
+        m.last_start = Some(serde_json::json!({"type": "start"}));
+        assert!(!capture_active(&m), "stale last_start without a live engine");
     }
 
     #[test]

@@ -151,7 +151,7 @@ function formatEta(sec: number): string {
     : `剩約 ${Math.max(5, Math.round(sec / 5) * 5)} 秒`;
 }
 
-function StepIcon({ status, stalled }: { status: StepStatus; stalled?: boolean }) {
+export function StepIcon({ status, stalled }: { status: StepStatus; stalled?: boolean }) {
   if (status === "done") {
     return (
       <span className="mt-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-full bg-ok-700 text-white">

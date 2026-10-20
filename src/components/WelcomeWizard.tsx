@@ -80,6 +80,7 @@ export default function WelcomeWizard({
   backend,
   setBackend,
   running,
+  booting = false,
   startTest,
   stopTest,
   latestSrc,
@@ -104,6 +105,10 @@ export default function WelcomeWizard({
   backend: Backend;
   setBackend: (b: Backend) => void;
   running: boolean;
+  /** A recording run is starting (the console's 啟動中 state) — the test
+   *  button stays in 啟動中… until it is running, not just until the
+   *  start command returned. */
+  booting?: boolean;
   startTest: () => Promise<void>;
   stopTest: () => Promise<void>;
   latestSrc: string;
@@ -729,9 +734,9 @@ export default function WelcomeWizard({
                         type="button"
                         className="ai-fill rounded-xl px-5 py-2.5 text-sm font-semibold disabled:opacity-50"
                         onClick={beginTest}
-                        disabled={testStarting || !!startBlockedReason}
+                        disabled={testStarting || booting || !!startBlockedReason}
                       >
-                        {testStarting ? "啟動中…" : testBegun ? "再試一次" : "開始試講"}
+                        {testStarting || booting ? "啟動中…" : testBegun ? "再試一次" : "開始試講"}
                       </button>
                     ) : (
                       <button

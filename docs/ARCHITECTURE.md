@@ -240,9 +240,9 @@ graph TB
 所有 UI 走 `App.css` 的 `@theme paper-*` token（warm paper / 墨色），狀態色都收斂進暖色家族（`danger-*` / `warn-*` / `recording`）。**不在元件寫 hex 硬編碼**。
 
 ### 命名空間
-- Tauri event：`transcript` / `stt:*`（含 `stt:level` = rms 數字、`stt:signal` = `{code, message, device?}`、`stt:interrupted` = 繁中字串）/ `translation:chunk:<lang>` / `translation:done:<lang>` / `translation:error:<lang>`（口譯模式，`{id, message}`）/ `translation:skip:<lang>`（口譯模式，`{id}`，太短不翻）/ `session:reset` / `session:closed` / `hotkey:toggle`
+- Tauri event：`transcript` / `stt:*`（含 `stt:level` = rms 數字、`stt:stage` = `mic_ready` / `stt_connected`、`stt:signal` = `{code, message, device?}`、`stt:interrupted` = 繁中字串）/ `translation:chunk:<lang>` / `translation:done:<lang>` / `translation:error:<lang>`（口譯模式，`{id, message}`）/ `translation:skip:<lang>`（口譯模式，`{id}`，太短不翻）/ `session:reset` / `session:closed` / `hotkey:toggle`
 - Sidecar 命令：`start` / `stop` / `shutdown`
-- Sidecar 事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning`（可帶 `code`）/ `level` / `prewarm` / `model_loading` / `model_ready`
+- Sidecar 事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning`（可帶 `code`）/ `level` / `stage`（`mic_ready` = 收到第一段音訊；`stt_connected` = 雲端首次連上，本機不送）/ `prewarm` / `model_loading` / `model_ready` / `devices`（回 `list_devices`，依請求順序逐一回覆）。注意 `started` 在麥克風真正開啟前就送出，主控台「啟動中」清單以 `stage` 打勾。Rust `start_stt` 在已有一場啟動中或錄音中時回 `already_recording`，不另開 session
 
 ### 設定檔
 `~/Library/Application Support/MeetingCast/config.toml`
