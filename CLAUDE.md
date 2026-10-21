@@ -2,9 +2,9 @@
 
 中／英／日／越任一語言會議即時轉寫 + 並行翻譯到兩個可配置譯文槽位視窗（各自選目標語言）供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。源語言可選 zh/en/ja/vi；目標語言可選 zh/en/ja/vi/km（km 柬埔寨文為 target-only，Whisper 對 Khmer 辨識品質不堪用，registry `source_capable: false` 把它從源語言選單隱藏）；單場單向，不同時處理對方發言。
 
-目前 ship 0.1.30 ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
+目前 ship 0.1.31（GitHub Release `v0.1.31`）ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
 
-## 關鍵架構決策（不要重新討論）
+## 關鍵架構決策（已定案；要推翻請先提出理由與量測，不要默默改）
 
 - **STT 引擎用 mlx-whisper**（不是 faster-whisper）— ctranslate2 在 macOS 沒 Metal，CPU 4.3s vs mlx Metal 0.9s
 - **雙 backend**：`MLXWhisperSTT`（local 預設）+ `OpenAILiveTranscribeSTT`（`gpt-live-transcribe`，openai cloud），同一 `Transcript` stream 介面，UI 可切。雲端模式用 `zh-tw`／ISO 語言提示，並注入 active glossary 的 context prompt + canonical keywords。Deepgram backend 已於 0.1.20 後移除
@@ -14,7 +14,8 @@
 - **兩種翻譯模式**：`[interp] mode = "sentence"`（預設）由前端 ControlWindow 逐句 `invoke("translate")`；`"incremental"` 由 Rust `interp.rs` 接手：sidecar 送 clause 級片段（`transcript.boundary`），引擎把片段拼成句群、每語言一條序列化隊列、譯文只追加（已輸出譯文以 `<emitted>` 帶入，`strip_overlap` 保證不重複）、句群關閉時自己寫 session。事件名沿用 `translation:chunk/done:{lang}`，id = 句群 id（`transcript.utterance_id`）。設計與基線數字見 `docs/PLAN_INCREMENTAL_INTERP.md`
 - **Sidecar 訊息協定**：line-delimited JSON over stdio。命令：`start`（含 `stt: {delay, segmentation}`）/ `stop` / `shutdown` / `list_devices`；事件：`ready` / `started` / `transcript`（final 帶 `boundary`: clause/forced/sentence/pause）/ `stopped` / `error` / `warning` / `level` / `stage`（`mic_ready` / `stt_connected`，驅動主控台「啟動中」清單）/ `prewarm` / `model_loading` / `model_ready` / `devices`。PortAudio 只在 `audio_capture.py` 的 `_PA_LOCK` 下開 stream／重新掃描，且不在 asyncio 事件迴圈上呼叫
 - **翻譯 chunk 帶 utterance id**：避免並行翻譯時 chunk 在 UI 交錯
-- **dev sidecar binary 陷阱**：`pnpm tauri dev` 會把 `binaries/stt_engine-<triple>` copy 到 `target/debug/`，sidecar.rs 優先吃這個 stale binary。測 Python 改動前先 `mv src-tauri/target/debug/stt_engine src-tauri/target/debug/stt_engine.bak`
+- **sidecar 執行來源**：不在 `.app` 裡（`pnpm tauri dev`）一律跑 `prototype/.venv` + `python-sidecar/stt_engine.py` 原始碼，`target/debug/` 裡的 PyInstaller 副本不會被用到；只有 `.app` 跑 `binaries/stt_engine-<triple>`，所以 Python 改動要 `./scripts/build-sidecar.sh` 後才會進 dmg（`locate_sidecar`）
+- **release build 不碰編譯機路徑**：`CARGO_MANIFEST_DIR` 相關路徑（`prototype/.env`、dev demo WAV）只在 `cfg!(debug_assertions)` 下使用；release 讀 `~/Documents` 會觸發 macOS 資料夾授權、卡住啟動
 - **色票統一**：`App.css` 的 `@theme paper-*`（2026-09 起為冷灰中性階，名稱沿用）/ `ai-*`（藍→紫→粉→橘漸層，只用在品牌字、開始鍵與錄音點、譯文視窗光暈、進度四處）/ `ok-* / warn-* / danger-* / recording` / `stage-*`（譯文視窗，`.stage-light` 切淺色），元件不寫 hex。utility：`.ai-text .ai-fill .ai-bar .ai-dot .ai-caret .aura-host`
 - **UI 結構（2026-09 改版）**：主控台 960×640 = 狀態列 chip（可點開 popover）＋逐字稿優先＋右欄「本場設定」卡；兩個譯文視窗純黑＋光暈、字級隨高度自動；右欄「本場設定」卡即每場設定的編輯器（來源／譯文一二／辨識引擎／麥克風直接改，即存 config）；設定 modal 只剩兩分頁（帳號／進階，0.1.29 起拿掉重複的「會議」分頁，辨識延遲與同步口譯移到進階）；onboarding 六步。設計與實作對照見 `docs/UX_REDESIGN_2026-09.md`
 - **網路探測在 Rust**：`netcheck.rs` 每 20 秒 TCP connect 供應商 API host，發 `network:status`；離線時 `translate` / `interp` 立即回 `offline:` 前綴錯誤，前端視為「暫停」不報錯
@@ -36,7 +37,7 @@ cd src-tauri && cargo test
 
 ## 包版 SOP（macOS .dmg）
 
-**完整查表 + 9 個版本踩坑歷史 + 診斷招式都在 memory `project_macos_signing.md`，ship 前必讀。**
+**完整查表 + 踩坑歷史 + 診斷招式在維護者本機的 Claude memory `project_macos_signing.md`（不在 repo 內；沒有的話照下列步驟即可）。**
 
 每次都要：
 
@@ -57,7 +58,7 @@ cd src-tauri && cargo test
    codesign -dvv "$APP/Contents/MacOS/stt_engine"
    codesign -d --entitlements - "$APP/Contents/MacOS/stt_engine" 2>&1 | grep "Key"
    ```
-   預期 `flags=0x10002(adhoc,runtime)` + `Sealed Resources version=2` + 5 個 entitlement Key
+   預期兩者 `flags=0x10002(adhoc,runtime)`、主程式 `Sealed Resources version=2`（sidecar 是單檔 Mach-O，`Sealed Resources=none` 屬正常）、sidecar 5 個 entitlement Key
 7. 收件人裝完務必 `xattr -cr /Applications/MeetingCast.app`（quarantine + ad-hoc 在 Sequoia 直接報 damaged）
 
 **dev 機跑 OK ≠ ship OK**：entitlements／簽章缺漏在 dev 機看不到，只有真實 fresh Mac 會炸（0.1.6–0.1.14 都栽在這裡）。詳細見 memory file。
@@ -87,7 +88,8 @@ cd src-tauri && cargo test
 
 - Phase 1–3 完成（CLI pipeline / Tauri 骨架 / 多視窗 UX）
 - Phase 4 大部分完成：設定 UI、crash 重啟、hotkey、Welcome wizard、hallucination 防禦、MicMeter、可分發 dmg、術語表全鏈路、會議紀錄 + AI 總結
-- 剩：Markdown 三語匯出、log 檔案輪替、真人麥克風 live test
+- 剩：Markdown 三語匯出、log 檔案輪替、fresh Mac 乾淨機驗證（真人麥克風實測已於 2026-10 完成）
+- 未 merge：`feature/interp-revise-tail`（口譯尾段可改）從 0.1.30 分出，與現行 `interp.rs` / `<emitted>` 寫法衝突，需重接後再 live 驗證
 - 暫不做：字體 / 視窗外觀 GUI 設定、歷史會議搜尋、雲端同步、對方發言反向翻譯
 
 ## 開發守則
@@ -104,7 +106,6 @@ cd src-tauri && cargo test
 - 不要用 WebSocket 傳 sidecar 訊息（stdio 夠用且更穩）
 - 不要追求「完美翻譯」，追求「夠好且即時」
 - 不要在元件寫 `bg-[#xxx]` 硬編碼色，走 `App.css` token
-- 不要忘了 dev 模式 stale binary 陷阱
 
 ## 環境
 
@@ -155,7 +156,7 @@ glow = true              # 譯文視窗外框 AI 漸層光暈
 # [vad] 暫 hardcoded
 ```
 
-**API key 載入**：app 啟動讀 `config.toml` → 欄位空時 dev 模式 fallback dotenvy 從 `prototype/.env` seed → Settings UI 改值 persist 回 config.toml。
+**API key 載入**：app 啟動讀 `config.toml` → 欄位空時僅 debug build fallback dotenvy 從 `prototype/.env` seed（該檔 key 已失效，實際以 config.toml 為準）→ Settings UI 改值 persist 回 config.toml。
 
 **Errors log**：`~/Library/Application Support/MeetingCast/errors.log`，JSON-lines 每行 `{timestamp, category, message, context}`。
 
