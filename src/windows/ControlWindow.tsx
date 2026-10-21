@@ -1959,6 +1959,7 @@ export default function ControlWindow() {
             cfg={cfgSnap}
             running={running || booting}
             useMic={useMic}
+            sidecarReady={sidecarReady === true}
             micLabel={micValue}
             costUsd={costUsd}
             targetCount={targets.length}

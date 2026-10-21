@@ -16,10 +16,14 @@ type Backend = "local" | "openai";
  * optimistic local copy so a select doesn't snap back while the round-trip
  * to Rust is in flight.
  */
+const DEVICE_LIST_ATTEMPTS = 3;
+const DEVICE_LIST_RETRY_MS = 2000;
+
 export default function SessionSetupCard({
   cfg,
   running,
   useMic,
+  sidecarReady,
   micLabel,
   costUsd,
   targetCount,
@@ -31,6 +35,9 @@ export default function SessionSetupCard({
   cfg: Config | null;
   running: boolean;
   useMic: boolean;
+  /** The STT engine answered `ready`. Devices are listed by the engine, so
+   *  asking before that (cold start) can only time out. */
+  sidecarReady: boolean;
   /** Human label for the mic chip when the device select is hidden. */
   micLabel: string;
   costUsd: number | null;
@@ -52,26 +59,47 @@ export default function SessionSetupCard({
     setLocal(cfg);
   }, [cfg]);
 
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // The engine may still be busy right after launch (imports, model load),
+  // so a timeout is retried a couple of times before it is shown.
   const refreshDevices = useCallback(async () => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     setRefreshing(true);
     try {
-      const list = await invoke<AudioDevice[]>("list_audio_devices");
-      setDevices(list);
-      setDevicesError(null);
-    } catch (e) {
-      setDevicesError(String(e));
-      setDevices([]);
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const list = await invoke<AudioDevice[]>("list_audio_devices");
+          if (!mountedRef.current) return;
+          setDevices(list);
+          setDevicesError(null);
+          return;
+        } catch (e) {
+          if (!mountedRef.current) return;
+          if (attempt >= DEVICE_LIST_ATTEMPTS) {
+            setDevicesError(String(e));
+            setDevices([]);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, DEVICE_LIST_RETRY_MS));
+        }
+      }
     } finally {
       refreshInFlight.current = false;
-      setRefreshing(false);
+      if (mountedRef.current) setRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
-    if (useMic) refreshDevices();
-  }, [useMic, refreshDevices]);
+    if (useMic && sidecarReady) refreshDevices();
+  }, [useMic, sidecarReady, refreshDevices]);
 
   function showNote(text: string) {
     setNote(text);
@@ -128,7 +156,8 @@ export default function SessionSetupCard({
   const backend: Backend = local.stt?.backend === "openai" ? "openai" : "local";
   const openaiKeyMissing = backend === "openai" && !local.api.openai_api_key.trim();
   const device = local.audio.input_device;
-  const deviceMissing = device !== "" && !(devices ?? []).some((d) => d.name === device);
+  // Unknown until the engine has listed devices — don't call it 未連接 yet.
+  const deviceMissing = device !== "" && devices !== null && !devices.some((d) => d.name === device);
 
   return (
     <div className="border-b border-paper-200 bg-white px-[18px] py-4">
@@ -211,7 +240,9 @@ export default function SessionSetupCard({
                 title={device || "系統預設"}
               >
                 <option value="">系統預設</option>
-                {deviceMissing && <option value={device}>{device}（未連接）</option>}
+                {device !== "" && (deviceMissing || devices === null) && (
+                  <option value={device}>{deviceMissing ? `${device}（未連接）` : device}</option>
+                )}
                 {(devices ?? []).map((d) => (
                   <option key={d.name} value={d.name}>
                     {d.name}

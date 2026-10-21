@@ -1340,9 +1340,14 @@ pub async fn demo_wav_path(app: AppHandle) -> Result<String, String> {
             return Ok(p.to_string_lossy().to_string());
         }
     }
-    let dev = project_root().join("prototype/samples/weather_90s.wav");
-    if dev.exists() {
-        return Ok(dev.to_string_lossy().to_string());
+    // Dev builds only: in a release build project_root() is the build
+    // machine's checkout, and probing it under ~/Documents can raise a macOS
+    // folder-permission prompt.
+    if cfg!(debug_assertions) {
+        let dev = project_root().join("prototype/samples/weather_90s.wav");
+        if dev.exists() {
+            return Ok(dev.to_string_lossy().to_string());
+        }
     }
     Err("demo wav not found: neither the bundled resource nor the dev-tree copy exists".into())
 }

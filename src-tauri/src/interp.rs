@@ -380,10 +380,19 @@ async fn run_target(app: AppHandle, group: SharedGroup, lang: String) {
                                 })),
                             );
                         }
-                        let _ = app.emit(
-                            &format!("translation:error:{lang}"),
-                            json!({ "id": job.id, "message": f.error }),
-                        );
+                        // Only the closed group's last call (after its
+                        // retry) leaves the row incomplete. A mid-group
+                        // failure is covered by the next call — surfacing it
+                        // flashed 「翻譯失敗」 on every upstream hiccup while
+                        // the line on screen ended up complete. The UI also
+                        // settles the row on this event, which a still-open
+                        // group must not be. Logged above either way.
+                        if job.closed {
+                            let _ = app.emit(
+                                &format!("translation:error:{lang}"),
+                                json!({ "id": job.id, "message": f.error }),
+                            );
+                        }
                     }
                 }
                 if job.closed {

@@ -19,12 +19,18 @@ mod verify;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Dev: seed env from prototype/.env so config.seed_from_dotenv can pick it up.
-    let env_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("prototype/.env"))
-        .unwrap_or_default();
-    let _ = dotenvy::from_path(&env_path);
+    // Dev only: seed env from prototype/.env so config.seed_from_dotenv can
+    // pick it up. Never in a release build — the path is the build machine's
+    // checkout, and when it sits under ~/Documents macOS stalls this open()
+    // on a 「取用文件檔案夾」 permission prompt before any window exists, so
+    // the app looked like it never launched.
+    if cfg!(debug_assertions) {
+        let env_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("prototype/.env"))
+            .unwrap_or_default();
+        let _ = dotenvy::from_path(&env_path);
+    }
 
     let mut cfg = config::load();
     config::seed_from_dotenv(&mut cfg);
