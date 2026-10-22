@@ -490,10 +490,10 @@ fn needs_space(emitted: &str, cont: &str, target: &str) -> bool {
     if emitted.is_empty() || cont.is_empty() {
         return false;
     }
-    let spaced = !matches!(
+    let spaced = matches!(
         languages::get(target).map(|l| l.script_profile.as_str()),
-        Some("cjk") | Some("han") | Some("kana") | Some("zh") | Some("ja")
-    ) && !matches!(target, "zh" | "ja");
+        Some("latin")
+    );
     if !spaced {
         return false;
     }
@@ -864,6 +864,7 @@ mod tests {
         assert!(!needs_space("", "everyone", "en"));
         assert!(!needs_space("大家下午好", "今天", "zh"));
         assert!(!needs_space("こんにちは", "今日は", "ja"));
+        assert!(!needs_space("សួស្តី", "អ្នកទាំងអស់គ្នា", "km"));
         assert!(needs_space("Chào buổi chiều", "mọi người", "vi"));
     }
 
@@ -877,6 +878,7 @@ mod tests {
         assert_eq!(first_chunk("", "Good afternoon,", "en"), "Good afternoon,");
         assert_eq!(first_chunk("", " Good afternoon,", "en"), " Good afternoon,");
         assert_eq!(first_chunk("Hello", "Hello", "en"), "");
+        assert_eq!(first_chunk("សួស្តី", "អ្នកទាំងអស់គ្នា", "km"), "អ្នកទាំងអស់គ្នា");
     }
 
     #[test]
