@@ -4,10 +4,9 @@ local stream, zh script prompt, cache-first model check, level metering and
 graceful-stop pump, mic stall detection, and the cloud backend's reconnect
 loop (all with fakes — no model download, no mic, no network, no API spend).
 
-stdlib unittest (pytest isn't installed in prototype/.venv). Run (cwd =
-prototype/):
+Run from the repository root with:
 
-    .venv/bin/python -m unittest discover -s ../tests/python
+    python -m pytest tests/python
 """
 import asyncio
 import json
@@ -17,6 +16,15 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pytest
+
+# Check optional native dependencies before importing the STT modules.
+pytest.importorskip("mlx.core")
+pytest.importorskip("mlx_whisper")
+pytest.importorskip("torch")
+pytest.importorskip("silero_vad")
+pytest.importorskip("sounddevice")
 
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO / "prototype"))

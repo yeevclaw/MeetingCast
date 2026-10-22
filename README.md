@@ -27,3 +27,14 @@
 3. 兩個譯文視窗同步顯示各自目標語言的譯文，可拖到外接螢幕
 4. 按「停止錄音」結束，紀錄自動存檔
 5. 右上角 history icon 可查看歷史會議、產生 AI 總結、匯出 Markdown
+
+## Python 測試
+
+在 repo 根目錄執行（建議使用 Python 3.13+ 的虛擬環境）：
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest tests/python
+```
+
+Linux／無 GPU 的 CI 可執行純邏輯測試；需要原生依賴的三個 STT 測試模組，會在缺少 `mlx.core`、`mlx_whisper`、`torch`、`silero_vad` 或 `sounddevice` 等所需套件時顯示 skipped。Apple Silicon macOS 安裝 `python -m pip install -r prototype/requirements.txt -r requirements-test.txt` 後使用相同測試命令；依賴可匯入時，所有測試都會執行，不按作業系統或 GPU 狀態跳過。

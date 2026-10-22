@@ -1,10 +1,9 @@
 """Unit tests for the deterministic STT hallucination gates and the offline
 eval parity checks.
 
-pytest is not installed in prototype/.venv, so these use stdlib unittest to
-avoid adding a dependency. Run (cwd = prototype/):
+Run from the repository root with:
 
-    .venv/bin/python -m unittest discover -s ../tests/python
+    python -m pytest tests/python
 
 Covers:
   * prototype/stt/local.py  — known-phrase blocklist, single-char dominance,
@@ -17,6 +16,14 @@ import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pytest
+
+# Check optional native dependencies before importing the STT modules.
+pytest.importorskip("mlx.core")
+pytest.importorskip("mlx_whisper")
+pytest.importorskip("torch")
+pytest.importorskip("silero_vad")
 
 # Mirror python-sidecar/stt_engine.py: put prototype/ (for the `stt` package)
 # and prototype/eval/ (for `checks`) on sys.path so imports resolve regardless
