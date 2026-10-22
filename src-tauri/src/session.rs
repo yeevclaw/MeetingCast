@@ -585,10 +585,26 @@ pub async fn export_session_markdown(session_id: String) -> Result<String, Strin
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Resolve an IPC-supplied path and confine it to the sessions directory.
+fn validate_reveal_path(path: &Path, sessions: &Path) -> Result<PathBuf, String> {
+    let sessions = sessions
+        .canonicalize()
+        .map_err(|e| format!("resolve sessions directory: {e}"))?;
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("resolve reveal path: {e}"))?;
+    // Resolve symlinks and `..` before checking whole path components.
+    if !path.starts_with(&sessions) {
+        return Err("reveal path is outside sessions directory".into());
+    }
+    Ok(path)
+}
+
 /// Reveal a file in Finder with `open -R`. Used after export so the user
 /// sees the freshly-written markdown highlighted.
 #[tauri::command]
 pub async fn reveal_in_finder(path: String) -> Result<(), String> {
+    let path = validate_reveal_path(Path::new(&path), &sessions_dir())?;
     std::process::Command::new("open")
         .arg("-R")
         .arg(&path)
@@ -733,6 +749,55 @@ mod tests {
     fn session_id_validation_accepts_generated_shape() {
         assert!(validate_session_id("2026-07-12_14-30-45-123456").is_ok());
         assert!(validate_session_id("2026-07-12_14-30-45-123456-2").is_ok());
+    }
+
+    #[test]
+    fn reveal_path_is_confined_to_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "meetingcast-test-reveal-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let sessions = root.join("sessions");
+        let session = sessions.join("2026-07-12_14-30-45-123456");
+        std::fs::create_dir_all(&session).unwrap();
+        let exported = session.join("transcript.md");
+        std::fs::write(&exported, "# Transcript").unwrap();
+        assert_eq!(
+            validate_reveal_path(&exported, &sessions).unwrap(),
+            exported.canonicalize().unwrap()
+        );
+        assert_eq!(
+            validate_reveal_path(&session, &sessions).unwrap(),
+            session.canonicalize().unwrap()
+        );
+
+        let outside = root.join("config.toml");
+        std::fs::write(&outside, "").unwrap();
+        assert!(validate_reveal_path(&outside, &sessions).is_err());
+        assert!(validate_reveal_path(&sessions.join("../config.toml"), &sessions).is_err());
+        let sibling = root.join("sessions-other");
+        std::fs::create_dir(&sibling).unwrap();
+        assert!(validate_reveal_path(&sibling, &sessions).is_err());
+        assert!(validate_reveal_path(&session.join("missing.md"), &sessions).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = session.join("outside.md");
+            symlink(&outside, &link).unwrap();
+            assert!(validate_reveal_path(&link, &sessions).is_err());
+            let dir_link = session.join("outside-dir");
+            symlink(&root, &dir_link).unwrap();
+            assert!(validate_reveal_path(&dir_link.join("config.toml"), &sessions).is_err());
+            let inside_link = session.join("inside.md");
+            symlink(&exported, &inside_link).unwrap();
+            assert_eq!(
+                validate_reveal_path(&inside_link, &sessions).unwrap(),
+                exported.canonicalize().unwrap()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn parse(line: &str) -> StoredUtterance {
