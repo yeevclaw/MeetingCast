@@ -2,7 +2,7 @@
 
 中／英／日／越任一語言會議即時轉寫 + 並行翻譯到兩個可配置譯文槽位視窗（各自選目標語言）供外籍同仁閱讀。指標優先序：**準確性 > 速度 > 成本**。源語言可選 zh/en/ja/vi；目標語言可選 zh/en/ja/vi/km（km 柬埔寨文為 target-only，Whisper 對 Khmer 辨識品質不堪用，registry `source_capable: false` 把它從源語言選單隱藏）；單場單向，不同時處理對方發言。
 
-目前 ship 0.1.31（GitHub Release `v0.1.31`）ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
+目前 ship 0.1.32（GitHub Release `v0.1.32`）ad-hoc 簽章 dmg、可分發 fresh Mac，整套 entitlements / cwd / mic / SSL / prewarm 坑都修過。完整資料流 / 訊息協定 / crash watchdog 設計見 `docs/ARCHITECTURE.md`。
 
 ## 關鍵架構決策（已定案；要推翻請先提出理由與量測，不要默默改）
 
