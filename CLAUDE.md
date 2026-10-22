@@ -107,6 +107,13 @@ cd src-tauri && cargo test
 - 不要追求「完美翻譯」，追求「夠好且即時」
 - 不要在元件寫 `bg-[#xxx]` 硬編碼色，走 `App.css` token
 
+## PR 描述慣例
+
+- 所有 PR（含 Codex 開發、Claude Code 驗證的夜間自動流程）一律使用 `.github/pull_request_template.md` 的段落：一句話摘要／背景與問題／使用者體驗影響／安全與場景面／架構與維運面／實際改動／驗證方式與結果／尚未驗證與風險／`Fixes #N`
+- 除了程式改動，必須用實際場景說明對產品、使用者體驗、維運與架構的影響（哪個畫面或設定、什麼條件會觸發、使用者看到什麼差異）
+- 具體且誠實：依實際 diff 與真實呼叫路徑撰寫，不誇大風險、不寫空泛形容；無影響就寫「無」，只影響開發者/CI 要明說
+- 用 `gh pr create --body-file` 帶入完整描述；未實測的部分（例如 Mac 實機）一定列在「尚未驗證與風險」
+
 ## 環境
 
 macOS 13+（Apple Silicon 強烈推薦） / Python 3.13+ / Node.js 20+ / Rust 1.75+ / 麥克風權限。首次啟動下載 Whisper `large-v3-turbo` ~1.5 GB。
