@@ -17,6 +17,7 @@ import WelcomeWizard from "@/components/WelcomeWizard";
 import { estimateHourlyUsd } from "@/lib/cost";
 import { friendly, isOfflineError, type FriendlyError } from "@/lib/errors";
 import { LANGS, zhName } from "@/lib/languages";
+import { readSessionPanelCollapsed, saveSessionPanelCollapsed } from "@/lib/sessionPanel";
 import type {
   ChunkPayload,
   Config,
@@ -119,6 +120,8 @@ function formatElapsed(ms: number): string {
 }
 
 export default function ControlWindow() {
+  const [panelCollapsed, setPanelCollapsed] = useState(readSessionPanelCollapsed);
+  useEffect(() => saveSessionPanelCollapsed(panelCollapsed), [panelCollapsed]);
   const [running, setRunning] = useState(false);
   const [backend, setBackend] = useState<"local" | "openai">("local");
   const [useMic, setUseMic] = useState(true);
@@ -1779,9 +1782,9 @@ export default function ControlWindow() {
       </div>
 
       {/* ---------- Body ---------- */}
-      <div className="grid min-h-0 grid-cols-[1fr_320px]">
+      <div className={`grid min-h-0 ${panelCollapsed ? "grid-cols-1" : "grid-cols-[minmax(0,1fr)_320px]"}`}>
         {/* Transcript */}
-        <section className="relative flex min-h-0 flex-col border-r border-paper-200">
+        <section className={`relative flex min-h-0 min-w-0 flex-col ${panelCollapsed ? "" : "border-r border-paper-200"}`}>
           {error && !isOfflineError(error.raw) && (() => {
             const f = errorView(error);
             const actions = error.actions ?? [];
@@ -1857,6 +1860,15 @@ export default function ControlWindow() {
             <span className="rounded-full bg-paper-100 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-paper-700">
               {zhName(sourceLang)}
             </span>
+            <button
+              type="button"
+              className="ml-auto rounded-md border border-paper-300 bg-white px-2 py-1 text-xs normal-case tracking-normal text-paper-700 hover:bg-paper-100 focus-visible:outline-2 focus-visible:outline-ai-blue"
+              aria-expanded={!panelCollapsed}
+              aria-controls="session-panel"
+              onClick={() => setPanelCollapsed((collapsed) => !collapsed)}
+            >
+              {panelCollapsed ? "← 展開本場設定" : "收合本場設定 →"}
+            </button>
           </div>
 
           <div ref={historyRef} onScroll={onTranscriptScroll} className="flex-1 overflow-y-auto px-6 pb-6">
@@ -1954,7 +1966,7 @@ export default function ControlWindow() {
         </section>
 
         {/* Side column */}
-        <aside className="grid min-h-0 grid-rows-[auto_1fr]">
+        <aside id="session-panel" hidden={panelCollapsed} className={panelCollapsed ? "hidden" : "grid min-h-0 grid-rows-[auto_1fr]"}>
           <SessionSetupCard
             cfg={cfgSnap}
             running={running || booting}

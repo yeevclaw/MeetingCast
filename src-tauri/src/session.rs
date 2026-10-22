@@ -239,6 +239,12 @@ impl SessionRecorder {
         // transparently folded into v2 — disk is v2-only from now on.
         let mut u = u.clone();
         u.normalize();
+        // Use the recorder's source language, not a later config selection.
+        // This also protects source-only/incomplete rows and older frontends.
+        u.src = crate::text::normalize(&self.language, &u.src);
+        for (language, text) in &mut u.translations {
+            *text = crate::text::normalize(language, text);
+        }
         let line = serde_json::to_string(&u).map_err(|e| format!("serialize utterance: {e}"))?;
         let mut f = OpenOptions::new()
             .create(true)
@@ -802,6 +808,32 @@ mod tests {
 
     fn parse(line: &str) -> StoredUtterance {
         serde_json::from_str(line).expect("parse utterance")
+    }
+
+    #[test]
+    fn persisted_source_only_and_translated_rows_use_their_own_language() {
+        let mut rec = temp_recorder(&format!(
+            "traditional-output-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let u = parse(r#"{"id":"u1","t_start":0,"t_end":1,"src":"这些新的场景","translations":{},"incomplete":true}"#);
+        rec.append(&u).unwrap();
+        // A Japanese source with a Chinese target must leave Japanese Han
+        // characters intact, while normalizing only the Chinese translation.
+        rec.language = "ja".into();
+        let u = parse(r#"{"id":"u2","t_start":1,"t_end":2,"src":"日本語の会議","translations":{"zh":"开发与头发","ja":"日本語の会議","vi":"Tiếng Việt","km":"ភាសាខ្មែរ"}}"#);
+        rec.append(&u).unwrap();
+        let rows = std::fs::read_to_string(rec.dir.join("transcript.jsonl")).unwrap();
+        let rows: Vec<StoredUtterance> = rows.lines().map(parse).collect();
+        assert_eq!(rows[0].src, "這些新的場景");
+        assert!(rows[0].incomplete);
+        assert!(rows[0].translations.is_empty());
+        assert_eq!(rows[1].src, "日本語の会議");
+        assert_eq!(rows[1].translations["zh"], "開發與頭髮");
+        assert_eq!(rows[1].translations["ja"], "日本語の会議");
+        assert_eq!(rows[1].translations["vi"], "Tiếng Việt");
+        assert_eq!(rows[1].translations["km"], "ភាសាខ្មែរ");
+        std::fs::remove_dir_all(rec.dir).unwrap();
     }
 
     #[test]

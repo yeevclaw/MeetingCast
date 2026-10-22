@@ -10,8 +10,9 @@
 //! * per target language, keeps exactly one LLM call in flight per group and
 //!   asks the model for the *continuation* of what has already been shown,
 //!   so translation starts before the speaker finishes the sentence;
-//! * enforces append-only output — text already emitted to the UI is never
-//!   retracted; a repeated prefix from the model is stripped, never re-shown;
+//! * appends translation content; Chinese script normalization may correct
+//!   this call's visible prefix as word context arrives. A repeated model
+//!   prefix is stripped, never re-shown;
 //! * writes one `transcript.jsonl` row per group when every target is done,
 //!   and feeds the rolling `TranslationContext` the sentence translator uses.
 //!
@@ -36,6 +37,7 @@ use crate::errors;
 use crate::languages;
 use crate::session::{SharedRecorder, StoredUtterance};
 use crate::netcheck;
+use crate::text;
 use crate::translator::{
     self, Provider, StreamAction, TraceGuard, TranslationContext, FIRST_TOKEN_DEADLINE,
     FIRST_TOKEN_TIMEOUT_ERR,
@@ -723,6 +725,29 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Call
             StreamAction::Delta(delta) => {
                 guard.mark_ttft();
                 got_first = true;
+                if lang == "zh" {
+                    // Retain raw context across SSE tokens, normalize before
+                    // overlap detection, and correct only this continuation's
+                    // script when a longer phrase changes the conversion.
+                    head.push_str(&delta);
+                    let normalized = text::normalize(lang, &head);
+                    if !decided && head_ready(&normalized, &job.emitted, scan_chars) {
+                        decided = true;
+                        if translator::is_meta_prefix(&head) {
+                            errors::record(
+                                "translation_meta_filtered",
+                                &head.chars().take(80).collect::<String>(),
+                                Some(json!({ "target": lang, "id": job.id, "kind": "interp" })),
+                            );
+                            guard.outcome = "filtered";
+                            return Ok(String::new());
+                        }
+                    }
+                    if decided {
+                        emit_zh_continuation(app, job, &normalized, &mut shown);
+                    }
+                    continue;
+                }
                 if decided {
                     shown.push_str(&delta);
                     let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": delta }));
@@ -766,14 +791,32 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Call
             guard.outcome = "filtered";
             return Ok(String::new());
         }
-        let first = first_chunk(&job.emitted, &head, lang);
-        if !first.is_empty() {
-            shown.push_str(&first);
-            let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": first }));
+        if lang == "zh" {
+            emit_zh_continuation(app, job, &text::normalize(lang, &head), &mut shown);
+        } else {
+            let first = first_chunk(&job.emitted, &head, lang);
+            if !first.is_empty() {
+                shown.push_str(&first);
+                let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": first }));
+            }
         }
     }
     guard.outcome = if shown.trim().is_empty() { "empty" } else { "ok" };
     Ok(shown)
+}
+
+fn emit_zh_continuation(app: &AppHandle, job: &Job, normalized: &str, shown: &mut String) {
+    let next = first_chunk(&job.emitted, normalized, "zh");
+    let (replace, delta) = text::update(shown, &next);
+    if replace {
+        let _ = app.emit(
+            "translation:replace:zh",
+            json!({ "id": job.id, "text": format!("{}{}", job.emitted, next) }),
+        );
+    } else if !delta.is_empty() {
+        let _ = app.emit("translation:chunk:zh", json!({ "id": job.id, "text": delta }));
+    }
+    *shown = next;
 }
 
 /// The first visible chunk of a continuation: overlap with `emitted`

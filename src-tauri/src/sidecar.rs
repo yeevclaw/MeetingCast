@@ -15,13 +15,23 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::config::SharedConfig;
+use crate::config::{Config, SharedConfig};
 use crate::errors;
 use crate::interp;
 use crate::languages;
 use crate::session::{self, SharedRecorder};
+use crate::text;
 use crate::traces;
 use crate::translator::TranslationContext;
+
+fn prepare_transcript(cfg: &Config, text: &str, is_final: bool) -> String {
+    let rewritten = if is_final {
+        cfg.apply_glossary_aliases(text)
+    } else {
+        text.to_owned()
+    };
+    text::normalize(&cfg.language.source, &rewritten)
+}
 
 const MAX_RESTART_ATTEMPTS: u32 = 3;
 const RESTART_BACKOFF_SECS: u64 = 2;
@@ -480,6 +490,16 @@ async fn spawn_inner_body(
                         // alias inside an interim might trigger a wrong rewrite
                         // that stabilizes once the full word is recognized.
                         SidecarEvent::Transcript { text, is_final, t_start, t_end, boundary, .. } => {
+                            // Both cloud and local prompts are advisory. Normalize
+                            // previews as well as finals before any UI/translation
+                            // consumer; final aliases still see the original text.
+                            let (text, incremental) = {
+                                let cfg = cfg_o.lock().await;
+                                (
+                                    prepare_transcript(&cfg, &text, is_final),
+                                    cfg.incremental_enabled(),
+                                )
+                            };
                             // Session clock: shift onto the pre-restore time
                             // base; the first transcript after a restore also
                             // proves the respawn healthy → reset the budget.
@@ -505,10 +525,7 @@ async fn spawn_inner_body(
                                 );
                                 continue;
                             }
-                            let (rewritten, incremental) = {
-                                let cfg = cfg_o.lock().await;
-                                (cfg.apply_glossary_aliases(&text), cfg.incremental_enabled())
-                            };
+                            let rewritten = text;
                             // Reset the idle watcher's activity clock on any
                             // speech-bearing final. Empty transcripts (which
                             // some backends emit on noise) deliberately do NOT
@@ -1390,6 +1407,27 @@ pub async fn list_audio_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_stt_boundary_normalizes_previews_and_finals_after_aliases() {
+        let mut cfg = Config::default();
+        cfg.glossaries.push(crate::config::GlossaryBook {
+            name: "test".into(),
+            source_lang: "zh".into(),
+            entries: vec![crate::config::GlossaryEntry {
+                term: "开发平台".into(),
+                aliases: vec!["开花平台".into()],
+                ..Default::default()
+            }],
+        });
+        cfg.active_glossary = Some("test".into());
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", false), "開花平臺的會議");
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", true), "開發平臺的會議");
+        cfg.language.source = "ja".into();
+        for is_final in [false, true] {
+            assert_eq!(prepare_transcript(&cfg, "日本語の会議", is_final), "日本語の会議");
+        }
+    }
 
     #[test]
     fn clock_is_identity_until_a_restore() {

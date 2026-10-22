@@ -15,6 +15,7 @@ use crate::config::SharedConfig;
 use crate::errors;
 use crate::languages;
 use crate::session;
+use crate::text;
 use crate::traces::{self, TraceRecord};
 use crate::verify;
 
@@ -827,6 +828,7 @@ async fn consume_translation_stream(
     // rolling context. Includes the buffered prefix.
     let mut full_translation = String::new();
     let mut emitted_any = false;
+    let mut shown = String::new();
 
     loop {
         let next = if got_first {
@@ -847,10 +849,7 @@ async fn consume_translation_stream(
                         full_translation.push_str(&delta);
                         if !is_meta {
                             emitted_any = true;
-                            let _ = app.emit(
-                                chunk_event,
-                                ChunkPayload { id: id.to_string(), text: delta },
-                            );
+                            emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
                         }
                     } else {
                         buffer.push_str(&delta);
@@ -866,10 +865,7 @@ async fn consume_translation_stream(
                             } else {
                                 full_translation.push_str(&buffer);
                                 emitted_any = true;
-                                let _ = app.emit(
-                                    chunk_event,
-                                    ChunkPayload { id: id.to_string(), text: buffer.clone() },
-                                );
+                                emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
                             }
                         }
                     }
@@ -903,14 +899,32 @@ async fn consume_translation_stream(
             );
         } else {
             full_translation.push_str(&buffer);
-            let _ = app.emit(
-                chunk_event,
-                ChunkPayload { id: id.to_string(), text: buffer.clone() },
-            );
+            emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
         }
     }
 
-    StreamOutcome::Completed { full_text: full_translation, is_meta }
+    StreamOutcome::Completed { full_text: shown, is_meta }
+}
+
+fn emit_normalized_translation(
+    app: &AppHandle,
+    id: &str,
+    target: &str,
+    chunk_event: &str,
+    raw: &str,
+    shown: &mut String,
+) {
+    let next = text::normalize(target, raw);
+    let (replace, delta) = text::update(shown, &next);
+    if !delta.is_empty() || replace {
+        let event = if replace {
+            format!("translation:replace:{target}")
+        } else {
+            chunk_event.to_owned()
+        };
+        let _ = app.emit(&event, ChunkPayload { id: id.to_owned(), text: delta });
+    }
+    *shown = next;
 }
 
 /// Single non-streaming re-issue of a translate request after the SSE stream
@@ -1134,6 +1148,7 @@ pub async fn translate(
                 // UI already showed with the complete text.
                 match translate_once_nonstreaming(provider, &api_key, &body, &mut guard).await {
                     Ok(text) => {
+                        let text = text::normalize(&target, &text);
                         let _ = app.emit(
                             &replace_event,
                             ChunkPayload { id: id.clone(), text: text.clone() },
@@ -1427,12 +1442,21 @@ async fn consume_summary_stream(
 ) -> SummaryStreamOutcome {
     let mut stream = resp.bytes_stream().eventsource();
     let mut full = String::new();
+    let mut shown = String::new();
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => match parse_stream_event(provider, ev.event.as_str(), &ev.data, guard) {
                 StreamAction::Delta(delta) => {
                     guard.mark_ttft();
                     full.push_str(&delta);
+                    let next = text::normalize(target, &full);
+                    let (replace, delta) = text::update(&shown, &next);
+                    if replace {
+                        let _ = app.emit(
+                            "summary:restart",
+                            json!({ "session_id": session_id, "target": target }),
+                        );
+                    }
                     let _ = app.emit(
                         "summary:chunk",
                         SummaryChunk {
@@ -1441,6 +1465,7 @@ async fn consume_summary_stream(
                             text: delta,
                         },
                     );
+                    shown = next;
                 }
                 StreamAction::Stop => break,
                 StreamAction::Error(err) => {
@@ -1453,7 +1478,7 @@ async fn consume_summary_stream(
             }
         }
     }
-    SummaryStreamOutcome::Completed(full)
+    SummaryStreamOutcome::Completed(shown)
 }
 
 /// Stream a structured meeting summary for one session/target. Reads the
