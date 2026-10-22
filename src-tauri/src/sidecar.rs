@@ -1420,7 +1420,7 @@ mod tests {
             }],
         });
         cfg.active_glossary = Some("test".into());
-        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", false), "開花平台的會議");
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", false), "開花平臺的會議");
         assert_eq!(prepare_transcript(&cfg, "开花平台的会议", true), "开发平台的會議");
         for is_final in [false, true] {
             assert_eq!(prepare_transcript(&cfg, "开发平台的会议", is_final), "开发平台的會議");

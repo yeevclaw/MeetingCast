@@ -461,8 +461,11 @@ impl Config {
                 ]
                 .into_iter()
                 .map(|term| (term, e.term.as_str(), true))
-                .chain(e.aliases.iter().map(|a| {
-                    (crate::text::normalize(&self.language.source, a), e.term.as_str(), false)
+                .chain(e.aliases.iter().flat_map(|a| {
+                    // Accept raw aliases as well as normalized transcript
+                    // spellings (e.g. 斗數 may become 鬥數 outside a phrase).
+                    [a.clone(), crate::text::normalize(&self.language.source, a)]
+                        .into_iter().map(|alias| (alias, e.term.as_str(), false))
                 }))
             })
             .filter(|(a, t, _)| !a.is_empty() && !t.is_empty())
@@ -928,6 +931,9 @@ mod tests {
             cfg.apply_glossary_aliases("子位斗數和紫薇斗數"),
             "紫微斗數和紫微斗數"
         );
+        let normalized = cfg.text_normalizer().normalize("zh", "我覺得紫薇斗數很有趣");
+        assert_eq!(normalized, "我覺得紫薇鬥數很有趣");
+        assert_eq!(cfg.apply_glossary_aliases(&normalized), "我覺得紫微斗數很有趣");
     }
 
     #[test]
@@ -968,7 +974,7 @@ mod tests {
         cfg.glossaries[0].entries[0].translations.insert("zh".into(), "开发平台".into());
         assert_eq!(cfg.text_normalizer().normalize("zh", "开发平台的软件"), "开发平台的軟件");
         cfg.language.source = "ja".into();
-        assert_eq!(cfg.text_normalizer().normalize("zh", "开发平台的软件"), "開發平台的軟件");
+        assert_eq!(cfg.text_normalizer().normalize("zh", "开发平台的软件"), "開發平臺的軟件");
     }
 
     #[test]

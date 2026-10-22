@@ -1,8 +1,9 @@
 //! Script normalization at the host boundary, shared by both STT backends
 //! and both translation modes. Dictionaries are embedded; no system OpenCC
-//! install, Python package, network call, or hand-maintained character map.
-//! Shared traditional glyphs and official glossary names retain their spelling.
-use std::collections::HashSet;
+//! install, Python package, or network call. A small explicit list preserves
+//! ambiguous traditional glyphs unless context selects a different conversion.
+//! Official glossary names retain their spelling.
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
@@ -12,21 +13,23 @@ pub(crate) fn normalize(language: &str, text: &str) -> String {
         return text.to_owned();
     }
     static CONVERTER: OnceLock<OpenCC> = OnceLock::new();
-    let converted = CONVERTER
-        .get_or_init(|| OpenCC::from_config(BuiltinConfig::S2tw).expect("embedded s2tw dictionary"))
-        .convert(text);
-    // STCharacters explicitly lists the input among the valid traditional
-    // alternatives for shared glyphs (台, 干, 范, 余, …). Preserve those glyphs
-    // even when a phrase rule would prefer another spelling. Nearby simplified
-    // text is not evidence that a person's surname or a brand should change.
-    static SHARED: OnceLock<HashSet<char>> = OnceLock::new();
-    let shared = SHARED.get_or_init(|| {
-        include_str!("../resources/opencc/STCharacters.txt")
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .filter_map(|line| line.split_once('\t'))
-            .filter(|(key, values)| values.split_whitespace().any(|value| value == *key))
-            .filter_map(|(key, _)| key.chars().next())
+    let converter = CONVERTER
+        .get_or_init(|| OpenCC::from_config(BuiltinConfig::S2tw).expect("embedded s2tw dictionary"));
+    let converted = converter.convert(text);
+    // Only these eight ambiguous glyphs may retain their original spelling
+    // when conversion relies on the single-character default. Do not derive
+    // this list from dictionary alternatives: those include common simplified
+    // glyphs such as 万, 价, 党, 厂, 广, 几, 于, 据 and 确.
+    static DEFAULTS: OnceLock<HashMap<char, char>> = OnceLock::new();
+    let defaults = DEFAULTS.get_or_init(|| {
+        "台干范余准里后面".chars()
+            .filter_map(|original| {
+                let single = converter.convert(&original.to_string());
+                let mut chars = single.chars();
+                let converted = chars.next()?;
+                // Only cache defaults that can be aligned to one input glyph.
+                chars.next().is_none().then_some((original, converted))
+            })
             .collect()
     });
     // s2tw's glyph/phrase dictionaries preserve codepoint count. Fail closed
@@ -34,10 +37,50 @@ pub(crate) fn normalize(language: &str, text: &str) -> String {
     if text.chars().count() != converted.chars().count() {
         return text.to_owned();
     }
-    text.chars()
+    // A phrase can select the SAME result as a single-character default:
+    // 然后 → 然後 and 准备 → 準備. Comparing output glyphs alone cannot
+    // detect these matches. Find phrase spans, including overlaps (在后 and
+    // 后台), so preservation cannot undo part of a contextual conversion.
+    // The converter itself still decides which phrase's output to use.
+    static PHRASES: OnceLock<(HashSet<&str>, usize)> = OnceLock::new();
+    let (phrases, max_bytes) = PHRASES.get_or_init(|| {
+        let phrases: HashSet<_> = include_str!("../resources/opencc/STPhrases.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once('\t').map(|(key, _)| key))
+            .collect();
+        let max_bytes = phrases.iter().map(|key| key.len()).max().unwrap_or(0);
+        (phrases, max_bytes)
+    });
+    let mut phrase_end = 0;
+    let mut spelling_end = 0;
+    text.char_indices()
         .zip(converted.chars())
-        .map(|(original, converted)| {
-            if shared.contains(&original) { original } else { converted }
+        .map(|((index, original), converted)| {
+            let remaining = &text[index..];
+            let matched_bytes = remaining.char_indices().skip(1)
+                .map(|(end, _)| end)
+                .chain(std::iter::once(remaining.len()))
+                .take_while(|end| end <= max_bytes)
+                .filter(|end| phrases.contains(&remaining[..*end]))
+                .last().unwrap_or(0);
+            phrase_end = phrase_end.max(index + matched_bytes);
+            // A phrase fragment such as 在台 must not rewrite an existing
+            // traditional name in 现在台灣. Protect these established valid
+            // spellings; glossary names receive broader exact-match protection.
+            if let Some(spelling) = [
+                "台灣", "台北", "台中", "台積電", "干擾", "范先生",
+                "余老師", "准許", "里長",
+            ].iter().find(|spelling| remaining.starts_with(**spelling)) {
+                spelling_end = index + spelling.len();
+            }
+            if (index >= phrase_end || index < spelling_end)
+                && defaults.get(&original) == Some(&converted)
+            {
+                original
+            } else {
+                converted
+            }
         })
         .collect()
 }
@@ -112,7 +155,7 @@ mod tests {
     fn phrases_disambiguate_without_rewriting_vocabulary() {
         assert_eq!(
             normalize("zh", "皇后在后台整理头发，软件开发。"),
-            "皇后在后台整理頭髮，軟件開發。"
+            "皇后在後臺整理頭髮，軟件開發。"
         );
         let text = "繁體中文 MeetingCast API 123，頭髮與發展。";
         assert_eq!(normalize("zh", text), text);
@@ -122,7 +165,7 @@ mod tests {
     fn valid_traditional_spellings_are_preserved_in_mixed_text() {
         for original in [
             "台灣", "台北", "台中市", "台積電", "干擾", "范先生",
-            "余老師", "准許", "里長", "吃面", "平台",
+            "余老師", "准許", "里長", "面",
         ] {
             assert_eq!(normalize("zh", original), original);
             assert_eq!(
@@ -131,6 +174,53 @@ mod tests {
             );
         }
         assert_eq!(normalize("zh", "现在台灣的软件"), "現在台灣的軟件");
+    }
+
+    #[test]
+    fn isolated_ambiguous_glyphs_use_only_the_explicit_preservation_list() {
+        for original in ["台", "干", "范", "余", "准", "里", "后", "面"] {
+            assert_eq!(normalize("zh", original), original);
+        }
+        assert_eq!(normalize("zh", "万价党厂广几于据确适"), "萬價黨廠廣幾於據確適");
+    }
+
+    #[test]
+    fn common_simplified_phrases_are_fully_converted() {
+        for (input, expected) in [
+            ("然后我们准备一下", "然後我們準備一下"),
+            ("关于这个价格", "關於這個價格"),
+            ("根据范围确定", "根據範圍確定"),
+            ("这里有几个工厂", "這裡有幾個工廠"),
+            ("广告适合一万人", "廣告適合一萬人"),
+            ("共产党", "共產黨"),
+        ] {
+            assert_eq!(normalize("zh", input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn colloquial_context_overrides_ambiguous_glyph_defaults() {
+        for (input, expected) in [
+            ("以后我们在这里开会", "以後我們在這裡開會"),
+            ("请把里面的资料发给我", "請把裡面的資料發給我"),
+            ("这个项目还没准备好", "這個項目還沒準備好"),
+            ("周末一起吃面吧", "週末一起吃麵吧"),
+            ("干扰太多，先把衣服晾干", "干擾太多，先把衣服晾乾"),
+            ("范先生说范围已经确定", "范先生說範圍已經確定"),
+            ("准许里长进来准备会议", "准許里長進來準備會議"),
+            ("台積電在台灣，后台正在更新", "台積電在台灣，後臺正在更新"),
+            ("请打开平台后台", "請打開平臺後臺"),
+            ("回家以后记得给我电话", "回家以後記得給我電話"),
+            ("你先看一下后面的广告", "你先看一下後面的廣告"),
+            ("里面有几个文件，请确认一下", "裡面有幾個文件，請確認一下"),
+            ("今天下午三点见，别忘了带电脑", "今天下午三點見，別忘了帶電腦"),
+            ("我觉得这种方法极好，大家都愿意试试", "我覺得這種方法極好，大家都願意試試"),
+            ("皇后在后台", "皇后在後臺"),
+        ] {
+            let actual = normalize("zh", input);
+            assert_eq!(actual, expected, "input: {input}");
+            assert_eq!(normalize("zh", &actual), actual, "repeat: {input}");
+        }
     }
 
     #[test]
