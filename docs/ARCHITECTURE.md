@@ -241,7 +241,7 @@ graph TB
 
 ### 命名空間
 - Tauri event：`transcript` / `stt:*`（含 `stt:level` = rms 數字、`stt:stage` = `mic_ready` / `stt_connected`、`stt:signal` = `{code, message, device?}`、`stt:interrupted` = 繁中字串）/ `translation:chunk:<lang>` / `translation:replace:<lang>`（`{id, text}`，取代該 id 全文；中文串流字形或正式名稱隨詞組補齊而修正時使用）/ `translation:done:<lang>` / `translation:error:<lang>`（口譯模式，`{id, message}`）/ `translation:skip:<lang>`（口譯模式，`{id}`，太短不翻）/ `session:reset` / `session:closed` / `hotkey:toggle`
-- 中文輸出：Rust 共用轉換邊界處理兩種 STT backend、逐句翻譯、同步口譯、AI 總結與 session 寫入。s2tw 轉字形、不改用語；OpenCC `STCharacters` 中候選包含原字的繁簡共用字保留（如台、干、范、余、准、里），正式術語也保留原字。STT 先轉換，再用同樣轉換過的別名比對並替換成正式名稱，替換結果不再轉換。同步口譯仍剝除模型重複的前綴；中文本次續句可隨上下文修正顯示，送 `translation:replace:zh` 時 payload 是「先前已輸出譯文＋本次完整續句」，並以相同文字累積與存檔。AI 總結修正已顯示前綴時送 `summary:restart`，再送 `summary:chunk` 全文。
+- 中文輸出：Rust 共用轉換邊界處理兩種 STT backend、逐句翻譯、同步口譯、AI 總結與 session 寫入。s2tw 轉字形、不改用語；詞組轉換優先（含重疊詞組），單字僅對「台、干、范、余、准、里、后、面」八字在未命中詞組且結果等同單字預設轉換時保留原字，上下文轉換結果不同時採用 s2tw 結果。明列的合法詞形「台灣、台北、台中、台積電、干擾、范先生、余老師、准許、里長」在結果等同單字預設時仍保留原字，避免詞組片段跨入名稱而改字；術語表正式名稱則由 `Normalizer` 在轉換前以最長完全匹配保護，保留原字形。STT 先轉換，再用同樣轉換過的別名比對並替換成正式名稱，替換結果不再轉換。同步口譯仍剝除模型重複的前綴；中文本次續句可隨上下文修正顯示，送 `translation:replace:zh` 時 payload 是「先前已輸出譯文＋本次完整續句」，並以相同文字累積與存檔。AI 總結修正已顯示前綴時送 `summary:restart`，再送 `summary:chunk` 全文。
 - Sidecar 命令：`start` / `stop` / `shutdown`
 - Sidecar 事件：`ready` / `started` / `transcript` / `stopped` / `error` / `warning`（可帶 `code`）/ `level` / `stage`（`mic_ready` = 收到第一段音訊；`stt_connected` = 雲端首次連上，本機不送）/ `prewarm` / `model_loading` / `model_ready` / `devices`（回 `list_devices`，依請求順序逐一回覆）。注意 `started` 在麥克風真正開啟前就送出，主控台「啟動中」清單以 `stage` 打勾。Rust `start_stt` 在已有一場啟動中或錄音中時回 `already_recording`，不另開 session
 
