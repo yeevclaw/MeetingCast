@@ -810,6 +810,7 @@ async fn consume_translation_stream(
     chunk_event: &str,
     id: &str,
     target: &str,
+    normalizer: &text::Normalizer,
     provider: Provider,
     guard: &mut TraceGuard,
     deadline: tokio::time::Instant,
@@ -849,7 +850,9 @@ async fn consume_translation_stream(
                         full_translation.push_str(&delta);
                         if !is_meta {
                             emitted_any = true;
-                            emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
+                            emit_normalized_translation(
+                                app, id, target, chunk_event, &full_translation, &mut shown, normalizer,
+                            );
                         }
                     } else {
                         buffer.push_str(&delta);
@@ -865,7 +868,9 @@ async fn consume_translation_stream(
                             } else {
                                 full_translation.push_str(&buffer);
                                 emitted_any = true;
-                                emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
+                                emit_normalized_translation(
+                                app, id, target, chunk_event, &full_translation, &mut shown, normalizer,
+                            );
                             }
                         }
                     }
@@ -899,7 +904,9 @@ async fn consume_translation_stream(
             );
         } else {
             full_translation.push_str(&buffer);
-            emit_normalized_translation(app, id, target, chunk_event, &full_translation, &mut shown);
+            emit_normalized_translation(
+                app, id, target, chunk_event, &full_translation, &mut shown, normalizer,
+            );
         }
     }
 
@@ -913,8 +920,9 @@ fn emit_normalized_translation(
     chunk_event: &str,
     raw: &str,
     shown: &mut String,
+    normalizer: &text::Normalizer,
 ) {
-    let next = text::normalize(target, raw);
+    let next = normalizer.normalize(target, raw);
     let (replace, delta) = text::update(shown, &next);
     if !delta.is_empty() || replace {
         let event = if replace {
@@ -1013,7 +1021,7 @@ pub async fn translate(
     text: String,
     target: String,
 ) -> Result<(), String> {
-    let (provider, api_key, model, source_code, glossary_block, glossary_entries, effort) = {
+    let (provider, api_key, model, source_code, glossary_block, glossary_entries, normalizer, effort) = {
         let cfg = config.lock().await;
         // Only feed glossary entries into the observe-only check when the active
         // book applies to the current source language (empty otherwise).
@@ -1034,6 +1042,7 @@ pub async fn translate(
             cfg.language.source.clone(),
             cfg.render_glossary_section(&target),
             glossary_entries,
+            cfg.text_normalizer(),
             reasoning_effort_param(&cfg.api.openai_reasoning_effort),
         )
     };
@@ -1114,7 +1123,7 @@ pub async fn translate(
             }
         };
         match consume_translation_stream(
-            resp, &app, &chunk_event, &id, &target, provider, &mut guard, deadline,
+            resp, &app, &chunk_event, &id, &target, &normalizer, provider, &mut guard, deadline,
         )
         .await
         {
@@ -1148,7 +1157,7 @@ pub async fn translate(
                 // UI already showed with the complete text.
                 match translate_once_nonstreaming(provider, &api_key, &body, &mut guard).await {
                     Ok(text) => {
-                        let text = text::normalize(&target, &text);
+                        let text = normalizer.normalize(&target, &text);
                         let _ = app.emit(
                             &replace_event,
                             ChunkPayload { id: id.clone(), text: text.clone() },
@@ -1437,6 +1446,7 @@ async fn consume_summary_stream(
     app: &AppHandle,
     session_id: &str,
     target: &str,
+    normalizer: &text::Normalizer,
     provider: Provider,
     guard: &mut TraceGuard,
 ) -> SummaryStreamOutcome {
@@ -1449,7 +1459,7 @@ async fn consume_summary_stream(
                 StreamAction::Delta(delta) => {
                     guard.mark_ttft();
                     full.push_str(&delta);
-                    let next = text::normalize(target, &full);
+                    let next = normalizer.normalize(target, &full);
                     let (replace, delta) = text::update(&shown, &next);
                     if replace {
                         let _ = app.emit(
@@ -1512,7 +1522,7 @@ pub async fn generate_summary(
     // nouns the same way the live-translation path does, keeping summary and
     // chunked translation in sync. render_glossary_section itself returns ""
     // when the active book doesn't apply to the current source language.
-    let (glossary_block, source_code) = {
+    let (glossary_block, source_code, normalizer) = {
         let cfg = config.lock().await;
         let source_code = cfg.language.source.clone();
         let block = if !cfg.glossary_applies() || target == source_code {
@@ -1520,7 +1530,7 @@ pub async fn generate_summary(
         } else {
             cfg.render_glossary_section(&target)
         };
-        (block, source_code)
+        (block, source_code, cfg.text_normalizer())
     };
     // Source-language label = registry zh_ui_name (中文 / 英文 / 日文 / 越南文);
     // the config source is registry-valid post-sanitize, "中文" is a defensive
@@ -1619,7 +1629,9 @@ pub async fn generate_summary(
         }
     };
 
-    let full = match consume_summary_stream(resp, &app, &session_id, &target, provider, &mut guard).await {
+    let full = match consume_summary_stream(
+        resp, &app, &session_id, &target, &normalizer, provider, &mut guard,
+    ).await {
         SummaryStreamOutcome::Completed(full) => full,
         SummaryStreamOutcome::Broken(err) => {
             // The stream dropped mid-summary. Tell the UI to clear the partial
@@ -1633,7 +1645,9 @@ pub async fn generate_summary(
             match post_llm_with_retry(&app, provider, &api_key, &body, &mut retry_attempts, None).await {
                 Ok(resp2) => {
                     guard.retries += 1 + retry_attempts;
-                    match consume_summary_stream(resp2, &app, &session_id, &target, provider, &mut guard).await
+                    match consume_summary_stream(
+                        resp2, &app, &session_id, &target, &normalizer, provider, &mut guard,
+                    ).await
                     {
                         SummaryStreamOutcome::Completed(full) => full,
                         SummaryStreamOutcome::Broken(err2) => {

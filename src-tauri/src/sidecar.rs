@@ -20,17 +20,16 @@ use crate::errors;
 use crate::interp;
 use crate::languages;
 use crate::session::{self, SharedRecorder};
-use crate::text;
 use crate::traces;
 use crate::translator::TranslationContext;
 
 fn prepare_transcript(cfg: &Config, text: &str, is_final: bool) -> String {
-    let rewritten = if is_final {
-        cfg.apply_glossary_aliases(text)
+    let normalized = cfg.text_normalizer().normalize(&cfg.language.source, text);
+    if is_final {
+        cfg.apply_glossary_aliases(&normalized)
     } else {
-        text.to_owned()
-    };
-    text::normalize(&cfg.language.source, &rewritten)
+        normalized
+    }
 }
 
 const MAX_RESTART_ATTEMPTS: u32 = 3;
@@ -1409,20 +1408,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_stt_boundary_normalizes_previews_and_finals_after_aliases() {
+    fn shared_stt_boundary_normalizes_before_aliases_and_preserves_official_names() {
         let mut cfg = Config::default();
         cfg.glossaries.push(crate::config::GlossaryBook {
             name: "test".into(),
             source_lang: "zh".into(),
             entries: vec![crate::config::GlossaryEntry {
                 term: "开发平台".into(),
-                aliases: vec!["开花平台".into()],
+                aliases: vec!["開花平台".into()],
                 ..Default::default()
             }],
         });
         cfg.active_glossary = Some("test".into());
-        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", false), "開花平臺的會議");
-        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", true), "開發平臺的會議");
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", false), "開花平台的會議");
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", true), "开发平台的會議");
+        for is_final in [false, true] {
+            assert_eq!(prepare_transcript(&cfg, "开发平台的会议", is_final), "开发平台的會議");
+        }
+        cfg.glossaries[0].entries[0].term = "台積電".into();
+        assert_eq!(prepare_transcript(&cfg, "开花平台的会议", true), "台積電的會議");
         cfg.language.source = "ja".into();
         for is_final in [false, true] {
             assert_eq!(prepare_transcript(&cfg, "日本語の会議", is_final), "日本語の会議");

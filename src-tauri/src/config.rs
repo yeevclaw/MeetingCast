@@ -407,6 +407,18 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Snapshot official source names and Chinese target overrides. Only an
+    /// applicable active book may protect text in this meeting.
+    pub(crate) fn text_normalizer(&self) -> crate::text::Normalizer {
+        if !self.glossary_applies() {
+            return crate::text::Normalizer::default();
+        }
+        crate::text::Normalizer::new(self.active_entries().iter().flat_map(|entry| {
+            std::iter::once(entry.term.clone())
+                .chain(entry.translations.get("zh").cloned())
+        }))
+    }
+
     /// The distinct, non-closed target languages (dedup-preserving order).
     /// Drives how many translation calls / windows are live.
     // Consumed by the multi-target translate orchestration wired in a later
@@ -438,12 +450,24 @@ impl Config {
         if entries.is_empty() {
             return text.to_string();
         }
-        let mut pairs: Vec<(&str, &str)> = entries
+        let mut pairs: Vec<(String, &str, bool)> = entries
             .iter()
-            .flat_map(|e| e.aliases.iter().map(move |a| (a.as_str(), e.term.as_str())))
-            .filter(|(a, t)| !a.is_empty() && !t.is_empty() && a != t)
+            .flat_map(|e| {
+                // Canonical identity matches also prevent an alias for another
+                // entry from rewriting part of an already-correct name.
+                [
+                    e.term.clone(),
+                    crate::text::normalize(&self.language.source, &e.term),
+                ]
+                .into_iter()
+                .map(|term| (term, e.term.as_str(), true))
+                .chain(e.aliases.iter().map(|a| {
+                    (crate::text::normalize(&self.language.source, a), e.term.as_str(), false)
+                }))
+            })
+            .filter(|(a, t, _)| !a.is_empty() && !t.is_empty())
             .collect();
-        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| b.2.cmp(&a.2)));
 
         let mut out = String::with_capacity(text.len());
         let mut i = 0;
@@ -451,9 +475,8 @@ impl Config {
             let rest = &text[i..];
             let matched = pairs
                 .iter()
-                .find(|(alias, _)| rest.starts_with(*alias))
-                .copied();
-            if let Some((alias, canonical)) = matched {
+                .find(|(alias, _, _)| rest.starts_with(alias.as_str()));
+            if let Some((alias, canonical, _)) = matched {
                 out.push_str(canonical);
                 i += alias.len();
             } else {
@@ -923,6 +946,29 @@ mod tests {
             cfg.apply_glossary_aliases("這個AI助理很好用"),
             "這個AI 助理工具很好用"
         );
+    }
+
+    #[test]
+    fn alias_substitution_preserves_canonical_names_and_does_not_cascade() {
+        let cfg = cfg_with_book("x", vec![
+            entry("开发平台", &["開花平台"], "", ""),
+            entry("其他公司", &["开发", "开发平台", "余老師"], "", ""),
+            entry("余老師", &[], "", ""),
+        ]);
+        let normalizer = cfg.text_normalizer();
+        let text = normalizer.normalize("zh", "现在开花平台与开发平台找余老師");
+        assert_eq!(cfg.apply_glossary_aliases(&text), "現在开发平台與开发平台找余老師");
+    }
+
+    #[test]
+    fn normalization_protects_chinese_target_override_only_for_applicable_book() {
+        let mut cfg = cfg_with_book("x", vec![entry("品牌", &[], "", "")]);
+        cfg.language.source = "en".into();
+        cfg.glossaries[0].source_lang = "en".into();
+        cfg.glossaries[0].entries[0].translations.insert("zh".into(), "开发平台".into());
+        assert_eq!(cfg.text_normalizer().normalize("zh", "开发平台的软件"), "开发平台的軟件");
+        cfg.language.source = "ja".into();
+        assert_eq!(cfg.text_normalizer().normalize("zh", "开发平台的软件"), "開發平台的軟件");
     }
 
     #[test]

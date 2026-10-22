@@ -234,16 +234,20 @@ impl SessionRecorder {
     /// Also rewrites meta.json so list_sessions reflects the current count
     /// while a session is still recording (otherwise the history list shows
     /// "0 句" until stop_stt finalizes).
-    pub fn append(&mut self, u: &StoredUtterance) -> Result<(), String> {
+    pub(crate) fn append(
+        &mut self,
+        u: &StoredUtterance,
+        normalizer: &crate::text::Normalizer,
+    ) -> Result<(), String> {
         // Normalize before writing so an old-frontend {zh,en,vi} payload is
         // transparently folded into v2 — disk is v2-only from now on.
         let mut u = u.clone();
         u.normalize();
         // Use the recorder's source language, not a later config selection.
         // This also protects source-only/incomplete rows and older frontends.
-        u.src = crate::text::normalize(&self.language, &u.src);
+        u.src = normalizer.normalize(&self.language, &u.src);
         for (language, text) in &mut u.translations {
-            *text = crate::text::normalize(language, text);
+            *text = normalizer.normalize(language, text);
         }
         let line = serde_json::to_string(&u).map_err(|e| format!("serialize utterance: {e}"))?;
         let mut f = OpenOptions::new()
@@ -409,15 +413,17 @@ pub fn read_transcript(session_id: &str) -> Result<Vec<StoredUtterance>, String>
 #[tauri::command]
 pub async fn session_append_utterance(
     state: tauri::State<'_, SharedRecorder>,
+    config: tauri::State<'_, crate::config::SharedConfig>,
     utterance: StoredUtterance,
 ) -> Result<(), String> {
+    let normalizer = config.lock().await.text_normalizer();
     let mut guard = state.lock().await;
     let Some(rec) = guard.as_mut() else {
         // No active session — silently drop. Happens if the frontend flushes
         // pending utterances after stop_stt has already finalized.
         return Ok(());
     };
-    if let Err(e) = rec.append(&utterance) {
+    if let Err(e) = rec.append(&utterance, &normalizer) {
         errors::record(
             "session_append_failed",
             &e,
@@ -817,12 +823,12 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         let u = parse(r#"{"id":"u1","t_start":0,"t_end":1,"src":"这些新的场景","translations":{},"incomplete":true}"#);
-        rec.append(&u).unwrap();
+        rec.append(&u, &crate::text::Normalizer::default()).unwrap();
         // A Japanese source with a Chinese target must leave Japanese Han
         // characters intact, while normalizing only the Chinese translation.
         rec.language = "ja".into();
         let u = parse(r#"{"id":"u2","t_start":1,"t_end":2,"src":"日本語の会議","translations":{"zh":"开发与头发","ja":"日本語の会議","vi":"Tiếng Việt","km":"ភាសាខ្មែរ"}}"#);
-        rec.append(&u).unwrap();
+        rec.append(&u, &crate::text::Normalizer::default()).unwrap();
         let rows = std::fs::read_to_string(rec.dir.join("transcript.jsonl")).unwrap();
         let rows: Vec<StoredUtterance> = rows.lines().map(parse).collect();
         assert_eq!(rows[0].src, "這些新的場景");
@@ -833,6 +839,21 @@ mod tests {
         assert_eq!(rows[1].translations["ja"], "日本語の会議");
         assert_eq!(rows[1].translations["vi"], "Tiếng Việt");
         assert_eq!(rows[1].translations["km"], "ភាសាខ្មែរ");
+        std::fs::remove_dir_all(rec.dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_glossary_names_remain_exact_after_alias_replacement() {
+        let mut rec = temp_recorder(&format!(
+            "glossary-output-{}", Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let normalizer = crate::text::Normalizer::new(["开发平台".into(), "台積電".into()]);
+        let u = parse(r#"{"id":"u1","t_start":0,"t_end":1,"src":"现在开发平台与台積電开会，干擾很大","translations":{"zh":"开发平台获得准許，范先生见里長"}}"#);
+        rec.append(&u, &normalizer).unwrap();
+        let rows = std::fs::read_to_string(rec.dir.join("transcript.jsonl")).unwrap();
+        let stored = parse(rows.trim());
+        assert_eq!(stored.src, "現在开发平台與台積電開會，干擾很大");
+        assert_eq!(stored.translations["zh"], "开发平台獲得准許，范先生見里長");
         std::fs::remove_dir_all(rec.dir).unwrap();
     }
 
