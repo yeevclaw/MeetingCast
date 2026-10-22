@@ -29,6 +29,7 @@ futures-util = "0.3"
 dotenvy = "0.15"
 toml = "0.8"
 dirs = "5"
+ferrous-opencc = { version = "0.4", default-features = false, features = ["s2t-conversion"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tauri-plugin-global-shortcut = "2"
 

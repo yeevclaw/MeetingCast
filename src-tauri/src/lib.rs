@@ -14,6 +14,7 @@ mod netcheck;
 mod session;
 mod sidecar;
 mod traces;
+mod text;
 mod translator;
 mod verify;
 

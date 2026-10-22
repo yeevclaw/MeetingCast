@@ -10,8 +10,9 @@
 //! * per target language, keeps exactly one LLM call in flight per group and
 //!   asks the model for the *continuation* of what has already been shown,
 //!   so translation starts before the speaker finishes the sentence;
-//! * enforces append-only output — text already emitted to the UI is never
-//!   retracted; a repeated prefix from the model is stripped, never re-shown;
+//! * appends translation content; Chinese script normalization may correct
+//!   this call's visible prefix as word context arrives. A repeated model
+//!   prefix is stripped, never re-shown;
 //! * writes one `transcript.jsonl` row per group when every target is done,
 //!   and feeds the rolling `TranslationContext` the sentence translator uses.
 //!
@@ -36,6 +37,7 @@ use crate::errors;
 use crate::languages;
 use crate::session::{SharedRecorder, StoredUtterance};
 use crate::netcheck;
+use crate::text;
 use crate::translator::{
     self, Provider, StreamAction, TraceGuard, TranslationContext, FIRST_TOKEN_DEADLINE,
     FIRST_TOKEN_TIMEOUT_ERR,
@@ -441,6 +443,7 @@ async fn maybe_finish(app: &AppHandle, group: &SharedGroup) {
     );
 
     {
+        let normalizer = app.state::<SharedConfig>().lock().await.text_normalizer();
         let recorder = app.state::<SharedRecorder>();
         let mut guard = recorder.lock().await;
         if let Some(rec) = guard.as_mut() {
@@ -456,7 +459,7 @@ async fn maybe_finish(app: &AppHandle, group: &SharedGroup) {
                 en: String::new(),
                 vi: String::new(),
             };
-            if let Err(e) = rec.append(&u) {
+            if let Err(e) = rec.append(&u, &normalizer) {
                 errors::record(
                     "session_append_failed",
                     &e,
@@ -630,7 +633,7 @@ fn retryable(error: &str) -> bool {
 /// as they arrive (after the head buffer clears the meta / overlap checks)
 /// and returns the full continuation exactly as shown to the UI.
 async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, CallFailure> {
-    let (provider, api_key, model, source_code, glossary_block, effort) = {
+    let (provider, api_key, model, source_code, glossary_block, normalizer, effort) = {
         let cfg = app.state::<SharedConfig>();
         let cfg = cfg.lock().await;
         let provider = Provider::from_config(&cfg.api.provider);
@@ -644,6 +647,7 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Call
             model,
             cfg.language.source.clone(),
             cfg.render_glossary_section(lang),
+            cfg.text_normalizer(),
             translator::reasoning_effort_param(&cfg.api.openai_reasoning_effort),
         )
     };
@@ -723,6 +727,33 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Call
             StreamAction::Delta(delta) => {
                 guard.mark_ttft();
                 got_first = true;
+                if lang == "zh" {
+                    // Retain raw context across SSE tokens, normalize before
+                    // overlap detection, and correct only this continuation's
+                    // script when a longer phrase changes the conversion.
+                    head.push_str(&delta);
+                    let normalized = normalizer.normalize(lang, &head);
+                    if !decided && head_ready(
+                        &normalized,
+                        &job.emitted,
+                        translator::effective_scan_chars(&head, scan_chars),
+                    ) {
+                        decided = true;
+                        if translator::is_meta_prefix(&head) {
+                            errors::record(
+                                "translation_meta_filtered",
+                                &head.chars().take(80).collect::<String>(),
+                                Some(json!({ "target": lang, "id": job.id, "kind": "interp" })),
+                            );
+                            guard.outcome = "filtered";
+                            return Ok(String::new());
+                        }
+                    }
+                    if decided {
+                        emit_zh_continuation(app, job, &normalized, &mut shown);
+                    }
+                    continue;
+                }
                 if decided {
                     shown.push_str(&delta);
                     let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": delta }));
@@ -766,14 +797,32 @@ async fn call_llm(app: &AppHandle, job: &Job, lang: &str) -> Result<String, Call
             guard.outcome = "filtered";
             return Ok(String::new());
         }
-        let first = first_chunk(&job.emitted, &head, lang);
-        if !first.is_empty() {
-            shown.push_str(&first);
-            let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": first }));
+        if lang == "zh" {
+            emit_zh_continuation(app, job, &normalizer.normalize(lang, &head), &mut shown);
+        } else {
+            let first = first_chunk(&job.emitted, &head, lang);
+            if !first.is_empty() {
+                shown.push_str(&first);
+                let _ = app.emit(&chunk_event, json!({ "id": job.id, "text": first }));
+            }
         }
     }
     guard.outcome = if shown.trim().is_empty() { "empty" } else { "ok" };
     Ok(shown)
+}
+
+fn emit_zh_continuation(app: &AppHandle, job: &Job, normalized: &str, shown: &mut String) {
+    let next = first_chunk(&job.emitted, normalized, "zh");
+    let (replace, delta) = text::update(shown, &next);
+    if replace {
+        let _ = app.emit(
+            "translation:replace:zh",
+            json!({ "id": job.id, "text": format!("{}{}", job.emitted, next) }),
+        );
+    } else if !delta.is_empty() {
+        let _ = app.emit("translation:chunk:zh", json!({ "id": job.id, "text": delta }));
+    }
+    *shown = next;
 }
 
 /// The first visible chunk of a continuation: overlap with `emitted`
@@ -961,16 +1010,30 @@ mod tests {
     }
 
     #[test]
-    fn english_meta_head_on_zh_target_waits_for_latin_threshold() {
-        let zh = translator::meta_scan_chars("zh");
-        let head = "This input appears to be incomplete";
-        // 14 chars of an ASCII head is not decided yet on a zh target…
-        let h14: String = head.chars().take(zh).collect();
-        assert!(!head_ready(&h14, "", translator::effective_scan_chars(&h14, zh)));
-        // …only at 32, where the meta marker is visible.
-        let h32: String = head.chars().take(32).collect();
-        assert!(head_ready(&h32, "", translator::effective_scan_chars(&h32, zh)));
-        assert!(translator::is_meta_prefix(&h32));
+    fn english_meta_head_on_zh_target_waits_and_is_filtered_before_emission() {
+        let scan_chars = translator::meta_scan_chars("zh");
+        let reply = "This input appears to be incomplete. Please provide more context.";
+        let normalizer = text::Normalizer::default();
+        let mut head = String::new();
+        let mut shown = String::new();
+        let mut filtered = false;
+        for ch in reply.chars() {
+            head.push(ch);
+            let normalized = normalizer.normalize("zh", &head);
+            if head_ready(&normalized, "", translator::effective_scan_chars(&head, scan_chars)) {
+                if translator::is_meta_prefix(&head) {
+                    filtered = true;
+                    break;
+                }
+                shown.push_str(&normalized);
+            }
+            if head.chars().count() == scan_chars {
+                assert!(shown.is_empty(), "14 ASCII chars must remain buffered");
+            }
+        }
+        assert_eq!(head.chars().count(), 32);
+        assert!(filtered);
+        assert!(shown.is_empty(), "English meta must never reach the Chinese slot");
     }
 
     #[test]

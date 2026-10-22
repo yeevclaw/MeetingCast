@@ -16,7 +16,7 @@
 | 不等句尾就開口 | 等 VAD 句尾 / 句末標點 | 語意單位（5–15 字）就送翻譯 |
 | 落後恆定 | 文字模式不累積 | 量測 `interp:lag`，給後續 TTS 落後控制用 |
 | 落後時壓縮 | 無 | 預留 `set_interp_mode`，本階段不動作 |
-| 說出去不收回 | 句級整句輸出 | 譯文 **只追加（append-only）**，Rust 強制 |
+| 說出去不收回 | 句級整句輸出 | 以續句追加；中文本次續句可因字形轉換或正式術語補齊而修正顯示 |
 
 ## 設計
 
@@ -45,10 +45,11 @@
 - sidecar.rs 的 stdout reader 把 final 片段直接餵給引擎，不再經前端。
 - 每個目標語言一條**序列化工作隊列**：一次只有一個 API call 在飛；飛行中到達的新片段合併成下一次呼叫（自然限制呼叫頻率）。
 - 每次呼叫送：句群目前為止的源文、已送出的譯文、最近 2 組上下文。模型只輸出**續句**；可回空字串表示「等下一段」。句群關閉時最後一次呼叫要求補完，不准再等。
-- **只追加保證由 Rust 強制**：模型重複已輸出前綴 → 剝掉；前綴不符 → 記 `errors.log`，只取續句部分。
+- **續句與重複前綴由 Rust 處理**：模型重複已輸出前綴 → 剝掉；前綴不符 → 記 `errors.log`，只取續句部分。
   - 主路徑候選：Anthropic assistant prefill（把已輸出譯文放在 assistant 開頭讓模型接著寫，結構上保證不改前文）。需驗證 Haiku 4.5 支援。
   - OpenAI provider 走標籤版（`<emitted>…</emitted>`）。
-- 事件沿用 `translation:chunk:{lang}`（id = 句群 id）；句群關閉時發 `translation:done:{lang}`。Rust 自己寫 session，前端 pending map 移除。
+- 事件沿用 `translation:chunk:{lang}`（id = 句群 id）；句群關閉時發 `translation:done:{lang}`。中文保留本次呼叫原文，隨 SSE 詞組上下文重新轉換；若已顯示前綴改變，送 `translation:replace:zh`，`{id, text}` 的 text 為「先前已輸出譯文＋本次完整續句」，前端取代該 id 全文。累積的 `emitted` 與 session 使用同一份顯示文字。其他語言維持追加。Rust 自己寫 session，前端 pending map 移除。
+- 中文字形轉換保留繁簡共用字與術語表正式名稱；STT 先轉換，再套用同樣轉換過的別名。中文目標遇到英文字母開頭的模型回覆，仍放寬到 32 字再判斷英文前言，避免說明文字漏到投影畫面。
 - 新 prompt 檔 `src-tauri/prompts/interpret_system.txt`；`translate_system.txt` 不動。共用 glossary 注入與 meta 過濾。
 - TraceGuard 新 kind `translate_inc`，欄位同 `translate`。
 
