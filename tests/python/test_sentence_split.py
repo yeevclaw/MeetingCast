@@ -1,10 +1,9 @@
 """Unit tests for punctuation-aware early sentence splitting in the
 OpenAI live Realtime STT backend (prototype/stt/openai_realtime.py).
 
-pytest is not installed in prototype/.venv, so these use stdlib unittest.
-Run (cwd = prototype/):
+Run from the repository root with:
 
-    .venv/bin/python -m unittest discover -s ../tests/python
+    python -m pytest tests/python
 
 Covers:
   * split_complete_sentences — split-at-last-punct, min-length gate,
@@ -16,6 +15,12 @@ Covers:
 import sys
 import unittest
 from pathlib import Path
+
+import pytest
+
+# Check optional native dependencies before importing the STT modules.
+pytest.importorskip("torch")
+pytest.importorskip("silero_vad")
 
 # Mirror python-sidecar/stt_engine.py: put prototype/ on sys.path so the
 # `stt` package imports resolve regardless of cwd.
