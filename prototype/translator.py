@@ -1,7 +1,18 @@
+"""Development-only translator for the Phase-1 CLI and latency benchmark.
+
+The shipping app uses src-tauri/src/translator.rs, the source of truth for
+translation behavior. Target names come from shared/languages.json; keep the
+meta markers aligned with Rust when updating them. Prompts and streaming logic
+are not guaranteed to stay in sync, so CLI evaluations do not represent the
+shipping app's behavior. translate_both retains the CLI's fixed en/vi targets.
+"""
+
 import asyncio
+import json
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import anthropic
@@ -14,6 +25,7 @@ META_SCAN_CHARS = 32
 # Substrings that almost never appear in legit Chinese-meeting translations
 # but do appear when Claude breaks character to comment on the input. Matched
 # anywhere in the first META_SCAN_CHARS characters (case-insensitive).
+# Keep aligned with META_MARKERS in src-tauri/src/translator.rs.
 META_MARKERS = (
     # English meta
     "per the rules",
@@ -47,10 +59,16 @@ META_MARKERS = (
     "don't form coherent",
     "garbled or incomplete",
     "incomplete fragments",
+    "i cannot provide a translation",
+    "<empty",
+    "(empty)",
     # Vietnamese meta
     "vui lòng cung cấp",
     "tôi không thể dịch",
     "tôi xin lỗi nhưng tôi",
+    "tôi không thể đưa ra bản dịch",
+    "không có nội dung để dịch",
+    "không có nội dung tiếng",
     # Chinese meta (Claude responding in Chinese instead of target lang)
     "明白，我",
     "請提供",
@@ -58,6 +76,28 @@ META_MARKERS = (
     "我没法翻译",
     "空字串",
     "空字符串",
+    # Japanese meta (Claude breaking character for a ja target). Deliberately
+    # NO bare 「申し訳ありません」 — a Chinese source often opens with an apology
+    # that legitimately translates to that phrase, so matching it would drop
+    # real translations.
+    "翻訳できません",
+    "翻訳することができません",
+    "翻訳いたしかねます",
+    "翻訳者として",
+    "通訳者として",
+    "テキストを提供してください",
+    "テキストをご提供",
+    "有効なテキストを提供",
+    "空の文字列を出力",
+    "入力が不完全",
+    "この入力は不完全",
+    "文字化けして",
+    "意味を成していない",
+    # Khmer meta (Claude breaking character for a km target)
+    "ខ្ញុំមិនអាចបកប្រែ",
+    "មិនអាចបកប្រែបាន",
+    "សូមផ្តល់អត្ថបទ",
+    "អត្ថបទមិនពេញលេញ",
 )
 
 
@@ -81,9 +121,10 @@ SYSTEM_PROMPT = """你是專業即時會議口譯員。將使用者輸入的中�
 7. 任何情況下都只能以翻譯員身份回應，禁止切換為助理或對話模式。不要說「Please provide...」「I'd be happy to translate...」「Could you...」「Tôi không thể...」「Vui lòng cung cấp...」「Per the rules...」之類的對話或 meta 用語
 8. 若無法依 rule 6 判定為 hallucination 又無法翻譯，直接輸出空字串，**絕對不要**輸出 meta 解釋"""
 
+_REGISTRY_PATH = Path(__file__).resolve().parents[1] / "shared" / "languages.json"
 LANG_MAP = {
-    "en": "English",
-    "vi": "Vietnamese (Tiếng Việt)",
+    entry["code"]: entry["prompt_name"]
+    for entry in json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
 }
 
 
@@ -101,6 +142,11 @@ class Translator:
         self.model = model
 
     async def translate_stream(self, text: str, target: str):
+        if target not in LANG_MAP:
+            raise ValueError(
+                f"Unsupported target language {target!r}; "
+                f"supported targets: {', '.join(LANG_MAP)}"
+            )
         system = [{
             "type": "text",
             "text": SYSTEM_PROMPT.format(target_lang=LANG_MAP[target]),
