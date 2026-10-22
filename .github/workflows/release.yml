@@ -1,0 +1,108 @@
+# Build the macOS (Apple Silicon) .dmg on a GitHub-hosted runner.
+# Mirrors the local packaging SOP in CLAUDE.md:
+#   build-sidecar.sh (PyInstaller) → pnpm tauri build → postbuild-sign.sh
+# Ad-hoc signed (signingIdentity "-"), NOT notarized — same as local builds.
+name: macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+    branches: ["ci/macos-dmg"]
+
+permissions:
+  contents: write # only used to attach the dmg to an existing release on tag push
+
+concurrency:
+  group: macos-dmg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14 # arm64 → MeetingCast_<ver>_aarch64.dmg
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [[ "v$VERSION" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match tauri.conf.json version $VERSION — bump the version first"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: prototype/requirements.txt
+
+      - name: Create prototype/.venv (expected by build-sidecar.sh)
+        run: |
+          python -m venv prototype/.venv
+          prototype/.venv/bin/pip install --upgrade pip
+          prototype/.venv/bin/pip install -r prototype/requirements.txt pyinstaller
+
+      - name: Build Python sidecar (PyInstaller)
+        run: ./scripts/build-sidecar.sh
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Same as `pnpm bundle:mac`, but only the .app bundle: postbuild-sign.sh
+      # discards Tauri's dmg and rebuilds it from the re-signed app anyway, and
+      # skipping Tauri's Finder/AppleScript dmg step avoids flakiness on CI.
+      - name: Build app bundle
+        run: pnpm tauri build --bundles app
+
+      - name: Re-sign and build dmg (postbuild-sign.sh)
+        run: ./scripts/postbuild-sign.sh
+
+      - name: Verify signatures and entitlements (CLAUDE.md step 6)
+        run: |
+          APP=src-tauri/target/release/bundle/macos/MeetingCast.app
+          for BIN in meetingcast stt_engine; do
+            echo "--- $BIN"
+            codesign -dvv "$APP/Contents/MacOS/$BIN" 2>&1 | grep -E "Identifier|flags|Sealed Resources|Signature"
+            KEYS="$(codesign -d --entitlements - "$APP/Contents/MacOS/$BIN" 2>&1 | grep -c '\[Key\]' || true)"
+            echo "entitlement keys: $KEYS"
+            [[ "$KEYS" -ge 5 ]] || { echo "::error::$BIN has $KEYS entitlement keys, expected 5"; exit 1; }
+          done
+          ls -lh src-tauri/target/release/bundle/dmg/*.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeetingCast-macos-aarch64-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach dmg to existing release (tag push only, never publishes)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" src-tauri/target/release/bundle/dmg/*.dmg --clobber
+          else
+            echo "No release named $GITHUB_REF_NAME; dmg is available as a workflow artifact only."
+          fi
