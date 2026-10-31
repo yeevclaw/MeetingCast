@@ -91,7 +91,7 @@ test('checkbox Fields label groups without linking headings to checkboxes', () =
   assert.match(fieldImplementation, /"aria-labelledby": group \?/);
   assert.match(fieldImplementation, /"aria-describedby": hint \?/);
 });
-test('transcript emphasis does not change collapse button inherited weight', () => {
+test('transcript heading emphasis is scoped to its label', () => {
   const header = control.slice(control.lastIndexOf('<div', control.indexOf('即時逐字稿')), control.indexOf('<div ref={historyRef}'));
   assert.match(header, /^<div className="[^"\n]*font-medium/);
   assert.doesNotMatch(header.split('>')[0], /font-semibold/);

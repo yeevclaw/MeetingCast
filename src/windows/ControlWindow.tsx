@@ -1960,12 +1960,13 @@ export default function ControlWindow() {
         </section>
 
         {/* 把手以 grid 的可視高度置中，跨在右欄左緣；不受兩側內容 overflow 裁切。
+            z-[5] 高於逐字稿與側欄一般內容（z-auto），低於 z-10 modal／遮罩及 z-30 精靈。
             WCAG：邊框 paper-600 (#6e6e73) 對白底 5.07:1、paper-50 4.66:1、paper-100 4.27:1；
             圖示／細欄文字 paper-700 (#48484a) 對白底 9.12:1、paper-50 8.38:1、paper-100 7.68:1。
             hover 邊框同為 paper-700。色碼定義統一由 App.css token 提供。 */}
         <button
           type="button"
-          className="absolute top-1/2 z-20 flex h-12 w-6 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full border border-paper-600 bg-white text-paper-700 shadow-sm hover:border-paper-700 hover:bg-paper-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ai-blue"
+          className="absolute top-1/2 z-[5] flex h-12 w-6 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full border border-paper-600 bg-white text-paper-700 shadow-sm hover:border-paper-700 hover:bg-paper-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ai-blue"
           style={{ right: panelCollapsed ? 36 : 320 }}
           aria-expanded={!panelCollapsed}
           aria-controls="session-panel"
@@ -1991,6 +1992,7 @@ export default function ControlWindow() {
         {panelCollapsed && (
           <div
             data-session-rail
+            title="展開本場設定"
             aria-hidden="true"
             onClick={() => setPanelCollapsed(false)}
             className="flex min-h-0 cursor-pointer items-start justify-center border-l border-paper-200 py-5 text-xs font-medium text-paper-700 hover:bg-paper-100"

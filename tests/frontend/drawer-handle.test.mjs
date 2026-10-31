@@ -34,13 +34,28 @@ test("collapsed rail is clickable without a second keyboard or screen reader con
   assert.match(rail, /本場設定/);
   assert.match(rail, /onClick=\{\(\) => setPanelCollapsed\(false\)\}/);
   assert.match(rail, /aria-hidden="true"/);
+  assert.match(rail, /title="展開本場設定"/);
   assert.doesNotMatch(rail, /tabIndex|<button|role="button"/);
   assert.match(rail, /text-xs/);
   assert.match(control, /grid-cols-\[minmax\(0,1fr\)_36px\]/);
 });
 
+test("handle stays below every modal overlay", async () => {
+  const zIndex = (classes) => {
+    const match = classes.match(/(?:^|\s)z-(?:\[(\d+)\]|(\d+))(?=\s|$)/);
+    assert.ok(match, `missing numeric z-index: ${classes}`);
+    return Number(match[1] ?? match[2]);
+  };
+  const handleClasses = handle.match(/className="([^"]+)"/)?.[1] ?? "";
+  for (const name of ["SettingsModal", "HistoryModal", "GlossaryModal"]) {
+    const source = await readFile(new URL(`../../src/components/${name}.tsx`, import.meta.url), "utf8");
+    const overlayClasses = source.match(/<div className="(absolute inset-0 [^"]+)"/)?.[1] ?? "";
+    assert.ok(zIndex(handleClasses) < zIndex(overlayClasses), `handle must stay below ${name}`);
+  }
+});
+
 test("handle geometry, motion preference and persistence remain explicit", () => {
-  assert.match(handle, /absolute.*top-1\/2.*z-20/);
+  assert.match(handle, /absolute.*top-1\/2/);
   assert.match(handle, /h-12 w-6/);
   assert.match(handle, /focus-visible:outline-ai-blue/);
   assert.match(handle, /stroke="currentColor"/);
