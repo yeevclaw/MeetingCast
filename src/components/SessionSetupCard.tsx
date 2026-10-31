@@ -145,10 +145,10 @@ export default function SessionSetupCard({
   if (!local) {
     return (
       <div className="border-b border-paper-200 bg-white px-[18px] py-4">
-        <h3 className="mb-2.5 text-[11px] font-medium uppercase tracking-[0.12em] text-paper-600">
+        <h3 className="mb-2.5 text-[11px] font-semibold text-paper-600">
           本場設定
         </h3>
-        <p className="text-xs text-paper-500">載入中…</p>
+        <p className="text-xs text-paper-600">載入中…</p>
       </div>
     );
   }
@@ -162,14 +162,14 @@ export default function SessionSetupCard({
   return (
     <div className="border-b border-paper-200 bg-white px-[18px] py-4">
       <div className="mb-2.5 flex items-baseline justify-between">
-        <h3 className="text-[11px] font-medium uppercase tracking-[0.12em] text-paper-600">
+        <h3 className="text-[11px] font-semibold text-paper-600">
           本場設定
         </h3>
-        {running && <span className="text-[11px] text-paper-500">錄音中不可變更</span>}
+        {running && <span className="text-[11px] text-paper-600">錄音中不可變更</span>}
       </div>
 
       <dl className="grid grid-cols-[44px_1fr] items-center gap-x-2.5 gap-y-2 text-[13px]">
-        <dt className="text-paper-500">來源</dt>
+        <dt className="text-paper-600">來源</dt>
         <dd>
           <select
             className={SELECT}
@@ -186,7 +186,7 @@ export default function SessionSetupCard({
           </select>
         </dd>
 
-        <dt className="text-paper-500">譯文一</dt>
+        <dt className="text-paper-600">譯文一</dt>
         <dd>
           <select
             className={SELECT}
@@ -199,7 +199,7 @@ export default function SessionSetupCard({
           </select>
         </dd>
 
-        <dt className="text-paper-500">譯文二</dt>
+        <dt className="text-paper-600">譯文二</dt>
         <dd>
           <select
             className={SELECT}
@@ -213,7 +213,7 @@ export default function SessionSetupCard({
           </select>
         </dd>
 
-        <dt className="text-paper-500">辨識</dt>
+        <dt className="text-paper-600">辨識</dt>
         <dd>
           <select
             className={SELECT}
@@ -227,7 +227,7 @@ export default function SessionSetupCard({
           </select>
         </dd>
 
-        <dt className="text-paper-500">麥克風</dt>
+        <dt className="text-paper-600">麥克風</dt>
         <dd>
           {useMic ? (
             <div className="flex gap-1.5">
@@ -257,7 +257,7 @@ export default function SessionSetupCard({
                 aria-label="重新整理裝置清單"
                 title="插拔麥克風後重新整理"
               >
-                {refreshing ? "…" : "↻"}
+                {refreshing ? "…" : "↻︎"}
               </button>
             </div>
           ) : (
@@ -267,7 +267,7 @@ export default function SessionSetupCard({
           )}
         </dd>
 
-        <dt className="text-paper-500">估算</dt>
+        <dt className="text-paper-600">估算</dt>
         <dd
           className="font-mono text-[12px] tabular-nums text-paper-900"
           title="翻譯（＋雲端辨識）費用概估，每小時約 30 分鐘語音"
@@ -277,7 +277,7 @@ export default function SessionSetupCard({
       </dl>
 
       {(note || devicesError || openaiKeyMissing || backend === "openai") && (
-        <div className="mt-2.5 space-y-1 text-[11px] leading-snug">
+        <div className="mt-2.5 space-y-1 text-xs leading-snug">
           {note && <p className="text-paper-700">{note}</p>}
           {devicesError && <p className="break-all text-danger-700">無法列出裝置：{devicesError}</p>}
           {openaiKeyMissing ? (
@@ -288,7 +288,7 @@ export default function SessionSetupCard({
               </button>
             </p>
           ) : backend === "openai" ? (
-            <p className="text-paper-500">音訊會傳送至 OpenAI；術語表會作為辨識提示。</p>
+            <p className="text-paper-600">音訊會傳送至 OpenAI；術語表會作為辨識提示。</p>
           ) : null}
         </div>
       )}
@@ -300,14 +300,14 @@ export default function SessionSetupCard({
         type="button"
         title={anySlotClosed ? "重新開啟被關閉的譯文視窗" : "把譯文視窗帶到最前面"}
       >
-        {anySlotClosed ? "重新開啟譯文視窗 ↗" : "開啟譯文視窗 ↗"}
+        {anySlotClosed ? "重新開啟譯文視窗 ↗︎" : "開啟譯文視窗 ↗︎"}
       </button>
     </div>
   );
 }
 
 const SELECT =
-  "w-full rounded-md border border-paper-300 bg-white px-1.5 py-1 text-[13px] text-paper-900 focus:outline-none focus:ring-2 focus:ring-ai-blue/40 disabled:cursor-not-allowed disabled:bg-paper-50 disabled:text-paper-500";
+  "w-full rounded-md border border-paper-300 bg-white px-1.5 py-1 text-[13px] text-paper-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-paper-700 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:bg-paper-50 disabled:text-paper-500";
 
 // Language <option>s for a translation-slot select. A code is disabled when it
 // equals the source language or is already used by the other slot, so the
