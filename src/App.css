@@ -34,6 +34,11 @@
   --color-ai-pink: #ff375f;
   --color-ai-orange: #ff9f0a;
 
+  /* 按鈕漸層為了白字 4.5:1 使用深色 stop；logo／aura／錄音圓點刻意保留原色。 */
+  --color-ai-blue-deep: #0071e4;
+  --color-ai-violet-deep: #af31ef;
+  --color-ai-pink-deep: #e9002f;
+
   /* Semantic */
   --color-ok-50: #e3f7e8;
   --color-ok-200: #b6e8c4;
@@ -76,11 +81,17 @@
     var(--color-ai-pink) 68%,
     var(--color-ai-orange) 100%
   );
-  --ai-grad-btn: linear-gradient(
+  --ai-grad-bright: linear-gradient(
     135deg,
     var(--color-ai-blue),
     var(--color-ai-violet) 55%,
     var(--color-ai-pink)
+  );
+  --ai-grad-btn: linear-gradient(
+    135deg,
+    var(--color-ai-blue-deep),
+    var(--color-ai-violet-deep) 55%,
+    var(--color-ai-pink-deep)
   );
   --ai-conic: conic-gradient(
     from var(--mc-aura-angle),
@@ -99,7 +110,7 @@
   --color-stage-bg: #ffffff;
   --color-stage-chrome: #f5f5f7;
   --color-stage-fg: #1d1d1f;
-  --color-stage-dim: #8e8e93;
+  --color-stage-dim: #6e6e73;
   --color-stage-rule: #e5e5ea;
 }
 
@@ -120,7 +131,7 @@
 
 /* Recording dot: gradient fill + soft violet pulse ring. */
 .ai-dot {
-  background: var(--ai-grad-btn);
+  background: var(--ai-grad-bright);
   box-shadow: 0 0 0 0 rgba(191, 90, 242, 0.5);
   animation: mc-pulse 1.8s infinite;
 }
@@ -145,7 +156,7 @@
   vertical-align: -0.15em;
   margin-left: 3px;
   border-radius: 2px;
-  background: var(--ai-grad-btn);
+  background: var(--ai-grad-bright);
   animation: mc-blink 1.1s steps(2) infinite;
 }
 @keyframes mc-blink {

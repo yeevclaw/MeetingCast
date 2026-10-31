@@ -19,6 +19,13 @@ MeetingCast includes the following third-party open-source components.
 - 版權：Copyright (c) apoint123 and contributors
 - 授權：Apache License, Version 2.0
 
+## impeccable 4.8.0（開發工具，不隨 App 發佈）
+
+- 用途：專案層的 UI 設計稽核 skill，給 Claude Code（`.claude/skills/impeccable/`）與 Codex（`.agents/skills/impeccable/`）在本 repo 內使用；不打包進 App。說明見 `docs/impeccable.md`。
+- 來源：https://github.com/pbakaus/impeccable （tag `skill-v4.8.0`／`cli-v4.8.0`，commit `414603bf14c7a344edb466bb1f85690c77ce8b7d`）
+- 版權：Copyright (c) Paul Bakaus and contributors
+- 授權：Apache License, Version 2.0（全文與 NOTICE 見 `third_party/impeccable/`）
+
 MeetingCast 未修改上述元件的原始碼或字典內容。
 
 ---

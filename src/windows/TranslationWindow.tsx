@@ -378,7 +378,7 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
   }
 
   const btn = (active: boolean) =>
-    `rounded px-2 py-0.5 transition-colors hover:bg-stage-rule hover:text-stage-fg ${
+    `rounded px-2 py-0.5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stage-fg transition-colors hover:bg-stage-rule hover:text-stage-fg ${
       active ? "bg-stage-rule text-stage-fg" : ""
     }`;
 
@@ -457,7 +457,7 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
             <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
               此視窗未啟用
             </p>
-            <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center opacity-70">
+            <p style={{ fontSize: `max(14px, ${fontSize * 0.35}px)` }} className="text-center">
               可在主控台右欄「本場設定」選擇第二個翻譯語言
             </p>
           </div>
@@ -466,7 +466,7 @@ export default function TranslationWindow({ slotIndex }: { slotIndex: 0 | 1 }) {
             <p style={{ fontSize: `${fontSize * 0.55}px` }} className="text-center">
               {lang ? emptyState(lang).waiting : ""}
             </p>
-            <p style={{ fontSize: `${fontSize * 0.35}px` }} className="text-center opacity-70">
+            <p style={{ fontSize: `max(14px, ${fontSize * 0.35}px)` }} className="text-center">
               {lang ? emptyState(lang).hint : ""}
             </p>
           </div>

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Children, cloneElement, isValidElement, useCallback, useEffect, useId, useRef, useState } from "react";
+import { useFocusTrap } from "@/lib/useFocusTrap";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -168,6 +169,8 @@ export default function ControlWindow() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [needsWelcome, setNeedsWelcome] = useState<Config | null>(null);
   const [confirmRestart, setConfirmRestart] = useState(false);
+  const restartRef = useFocusTrap(confirmRestart);
+  const restartTitleId = useId();
   const [modelLoading, setModelLoading] = useState(false);
   const [sidecarReady, setSidecarReady] = useState<boolean | null>(null);
   const [stepStatus, setStepStatus] = useState<Record<StepId, StepStatus>>({
@@ -1578,7 +1581,7 @@ export default function ControlWindow() {
           lead={<span className={`inline-block h-2 w-2 rounded-full ${running || booting ? "ai-dot" : "bg-paper-400"}`} />}
           value={booting ? "啟動中" : running ? "錄音中" : "閒置"}
           trail={
-            <span className={`font-mono text-[11px] tabular-nums ${running ? "text-paper-700" : "text-paper-500"}`}>
+            <span className={`font-mono text-[11px] tabular-nums ${running ? "text-paper-700" : "text-paper-600"}`}>
               {running ? formatElapsed(elapsed) : "0:00"}
             </span>
           }
@@ -1702,7 +1705,7 @@ export default function ControlWindow() {
               </p>
               {trFriendly.secondary && <p className="mt-0.5 text-danger-700">{trFriendly.secondary}</p>}
               {trFriendly.primary !== trFriendly.raw && (
-                <p className="mt-1 break-all font-mono text-[10px] text-danger-700">{trFriendly.raw}</p>
+                <p className="mt-1 break-all font-mono text-xs text-danger-700">{trFriendly.raw}</p>
               )}
             </div>
           )}
@@ -1803,7 +1806,7 @@ export default function ControlWindow() {
                     onClick={() => setError(null)}
                     aria-label="關閉"
                   >
-                    ✕
+                    ✕︎
                   </button>
                 </div>
                 {(actions.length > 0 || showAccount) && (
@@ -1845,7 +1848,7 @@ export default function ControlWindow() {
                 {f.raw !== f.primary && f.raw !== f.secondary && (
                   <details className="mt-1 text-xs text-danger-700">
                     <summary className="cursor-pointer hover:text-danger-900">技術細節</summary>
-                    <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-danger-100 p-2 font-mono text-[10px]">
+                    <pre className="mt-1 whitespace-pre-wrap break-all rounded bg-danger-100 p-2 font-mono text-xs">
                       {f.raw}
                     </pre>
                   </details>
@@ -1854,10 +1857,10 @@ export default function ControlWindow() {
             );
           })()}
 
-          <div className="flex flex-shrink-0 items-center gap-2 px-6 pb-2 pt-5 text-[11px] font-medium uppercase tracking-[0.12em] text-paper-600">
+          <div className="flex flex-shrink-0 items-center gap-2 px-6 pb-2 pt-5 text-[11px] font-medium text-paper-600">
             <span className={`inline-block h-1.5 w-1.5 rounded-full ${running ? "ai-dot" : "bg-paper-400"}`} />
-            即時逐字稿
-            <span className="rounded-full bg-paper-100 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-paper-700">
+            <span className="font-semibold">即時逐字稿</span>
+            <span className="rounded-full bg-paper-100 px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-paper-700">
               {zhName(sourceLang)}
             </span>
             <button
@@ -1895,12 +1898,12 @@ export default function ControlWindow() {
                         >
                           {retryingPrewarm ? "重新啟動中…" : "重試"}
                         </button>
-                        <p className="text-center text-[11px] text-paper-500">
+                        <p className="text-center text-xs text-paper-600">
                           首次啟動需下載約 1.5 GB；網路不穩可重試
                         </p>
                       </div>
                     ) : (
-                      <p className="mt-4 text-center text-[11px] text-paper-500">
+                      <p className="mt-4 text-center text-xs text-paper-600">
                         首次啟動需下載約 1.5 GB 語音模型，之後直接讀取快取
                       </p>
                     )}
@@ -1923,9 +1926,9 @@ export default function ControlWindow() {
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-2 text-paper-600">
                   <p className="text-base">按「開始」後，你說的話會在這裡逐句出現。</p>
-                  <p className="text-xs text-paper-500">
+                  <p className="text-xs text-paper-600">
                     也可用快捷鍵{" "}
-                    <kbd className="rounded border border-paper-300 bg-paper-100 px-1.5 py-0.5 font-mono text-[10px] text-paper-700">
+                    <kbd className="rounded border border-paper-300 bg-paper-100 px-1.5 py-0.5 font-mono text-[11px] text-paper-700">
                       ⌘ ⇧ M
                     </kbd>{" "}
                     切換
@@ -1983,14 +1986,14 @@ export default function ControlWindow() {
           <div className="flex min-h-0 flex-col gap-3 overflow-hidden px-[18px] py-3.5">
             {targets.map((t) => (
               <div key={t} className="grid grid-cols-[44px_1fr] gap-2 text-[13px] leading-normal text-paper-700">
-                <span className="truncate pt-0.5 text-[11px] text-paper-500" title={t}>
+                <span className="truncate pt-0.5 text-[11px] text-paper-600" title={t}>
                   {zhName(t)}
                 </span>
                 <span className="line-clamp-3">{latestTr[t] || "—"}</span>
               </div>
             ))}
             {targets.length === 0 && (
-              <p className="text-xs text-paper-500">各語言最近一句譯文會顯示在這裡。</p>
+              <p className="text-xs text-paper-600">各語言最近一句譯文會顯示在這裡。</p>
             )}
           </div>
         </aside>
@@ -2030,7 +2033,7 @@ export default function ControlWindow() {
           }}
           disabled={stopping || (booting && !running) || (!booting && !running && startBlock === "preparing")}
           aria-label={
-            stopping ? "正在結束錄音" : booting ? (running ? "取消開始錄音" : "正在開始錄音") : running ? "停止錄音" : "開始錄音"
+            stopping ? "正在結束錄音" : booting ? (running ? "取消開始錄音" : "正在開始錄音") : running ? "停止錄音" : startBlock ? undefined : "開始錄音"
           }
           aria-busy={booting && !running}
           type="button"
@@ -2068,7 +2071,7 @@ export default function ControlWindow() {
           <SettingsIcon />
           設定
         </TextButton>
-        <span className="ml-auto rounded border border-paper-200 px-1.5 py-px font-mono text-[11px] text-paper-500">
+        <span className="ml-auto rounded border border-paper-200 px-1.5 py-px font-mono text-[11px] text-paper-600">
           ⌘ ⇧ M
         </span>
       </div>
@@ -2113,9 +2116,12 @@ export default function ControlWindow() {
                 ? "border-warn-200 bg-warn-50 text-warn-900"
                 : "border-paper-200 bg-white text-paper-700"
           }`}
+          role={toast.kind === "error" ? "alert" : "status"}
+          aria-live={toast.kind === "error" ? "assertive" : "polite"}
           onClick={() => setToast(null)}
         >
           {toast.message}
+          <button type="button" aria-label="關閉" className="ml-2 rounded px-1 focus-visible:outline-2 focus-visible:outline-current" onClick={() => setToast(null)}>✕︎</button>
         </div>
       )}
 
@@ -2163,7 +2169,7 @@ export default function ControlWindow() {
             onClick={() => addToGlossary(transcriptMenu.text)}
           >
             加入術語表
-            <span className="ml-1 text-xs text-paper-500">「{transcriptMenu.text.slice(0, 12)}」</span>
+            <span className="ml-1 text-xs text-paper-600">「{transcriptMenu.text.slice(0, 12)}」</span>
           </button>
         </div>
       )}
@@ -2217,8 +2223,8 @@ export default function ControlWindow() {
 
       {confirmRestart && (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-paper-900/30 p-4">
-          <div className="w-full max-w-sm rounded-2xl border border-paper-200 bg-white p-5 shadow-xl">
-            <h2 className="text-base font-semibold text-paper-900">開始新的錄音？</h2>
+          <div ref={restartRef} role="dialog" aria-modal="true" aria-labelledby={restartTitleId} tabIndex={-1} className="w-full max-w-sm rounded-2xl border border-paper-200 bg-white p-5 shadow-xl">
+            <h2 id={restartTitleId} className="text-base font-semibold text-paper-900">開始新的錄音？</h2>
             <p className="mt-2 text-sm text-paper-600">{restartClearNotice()}</p>
             <footer className="mt-5 flex justify-end gap-2">
               <button
@@ -2233,7 +2239,7 @@ export default function ControlWindow() {
                   setConfirmRestart(false);
                   handleStart();
                 }}
-                autoFocus
+                data-autofocus
               >
                 確定
               </button>
@@ -2287,19 +2293,22 @@ function Chip({
   children: React.ReactNode;
 }) {
   const isOpen = open === id;
+  const popoverId = useId();
+  const titleId = `${popoverId}-title`;
   return (
     <span className="relative inline-flex" onMouseDown={(e) => e.stopPropagation()}>
       <button
         type="button"
-        className={`inline-flex h-[26px] items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 text-xs transition hover:brightness-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-ai-blue/40 ${TONE_CLASS[tone]} ${
+        className={`inline-flex h-[26px] items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 text-xs transition hover:brightness-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-paper-700 focus-visible:ring-offset-1 ${TONE_CLASS[tone]} ${
           isOpen ? "ring-2 ring-paper-300" : ""
         }`}
         onClick={() => setOpen(isOpen ? null : id)}
+        aria-controls={isOpen ? popoverId : undefined}
         aria-expanded={isOpen}
         aria-label={label ? `${label}：${value}` : value}
       >
         {lead}
-        {label && <span className="text-[11px] text-paper-500">{label}</span>}
+        {label && <span className={`text-[11px] ${tone === "warn" || tone === "bad" ? "text-paper-700" : "text-paper-600"}`}>{label}</span>}
         <span className={`font-medium ${mono ? "font-mono tabular-nums" : ""} ${TONE_VALUE_CLASS[tone]}`}>{value}</span>
         {trail}
       </button>
@@ -2308,23 +2317,26 @@ function Chip({
           className={`absolute top-full z-40 mt-1.5 w-72 rounded-xl border border-paper-200 bg-white p-3.5 text-left shadow-xl ${
             alignRight ? "right-0" : "left-0"
           }`}
+          id={popoverId}
+          aria-labelledby={titleId}
           role="dialog"
         >
-          {children}
+          {Children.map(children, (child) => isValidElement(child) && child.type === PopTitle
+            ? cloneElement(child as React.ReactElement<{ id?: string }>, { id: titleId }) : child)}
         </div>
       )}
     </span>
   );
 }
 
-function PopTitle({ children }: { children: React.ReactNode }) {
-  return <p className="text-[13px] font-semibold text-paper-900">{children}</p>;
+function PopTitle({ children, id }: { children: React.ReactNode; id?: string }) {
+  return <p id={id} className="text-[13px] font-semibold text-paper-900">{children}</p>;
 }
 function PopText({ children }: { children: React.ReactNode }) {
   return <p className="mt-1 text-xs leading-relaxed text-paper-600">{children}</p>;
 }
 function PopMeta({ children }: { children: React.ReactNode }) {
-  return <p className="mt-1.5 font-mono text-[10px] text-paper-500">{children}</p>;
+  return <p className="mt-1.5 font-mono text-[11px] text-paper-600">{children}</p>;
 }
 function PopActions({ children }: { children: React.ReactNode }) {
   return <div className="mt-2.5 flex flex-wrap gap-2">{children}</div>;

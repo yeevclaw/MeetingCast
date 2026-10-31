@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useFocusTrap } from "@/lib/useFocusTrap";
 import { invoke } from "@tauri-apps/api/core";
 import PrewarmChecklist, {
   type ModelProgress,
@@ -124,6 +125,8 @@ export default function WelcomeWizard({
   /** Why the test can't start yet (engine/mic), or null when it can. */
   startBlockedReason?: string | null;
 }) {
+  const dialogRef = useFocusTrap();
+  const titleId = useId();
   const [step, setStep] = useState<StepIndex>(0);
   const [provider, setProvider] = useState<"anthropic" | "openai">(
     initialConfig.api.provider === "anthropic" ? "anthropic" : "openai",
@@ -342,7 +345,7 @@ export default function WelcomeWizard({
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-paper-900/50 p-4">
-      <div className="flex w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} className="flex w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         {/* ---- progress rail ---- */}
         <div className="border-b border-paper-200 px-7 pb-4 pt-5">
           <div className="grid grid-cols-7 gap-1.5">
@@ -357,7 +360,7 @@ export default function WelcomeWizard({
                   />
                   <span
                     className={`truncate text-[11px] ${
-                      state === "now" ? "font-medium text-paper-900" : "text-paper-500"
+                      state === "now" ? "font-medium text-paper-900" : "text-paper-600"
                     }`}
                   >
                     {i} {STEP_LABELS[i]}
@@ -369,7 +372,7 @@ export default function WelcomeWizard({
           <p className="mt-2 text-xs text-paper-600">
             已完成 {step} / 6 · 剩約 <span className="tabular-nums">{formatMinutes(remainingMinutes)}</span>
             {step <= 4 && !modelDone && stepStatus.model === "in_progress" && (
-              <span className="text-paper-500">（模型下載在背景進行，不必等它）</span>
+              <span className="text-paper-600">（模型下載在背景進行，不必等它）</span>
             )}
           </p>
         </div>
@@ -377,7 +380,7 @@ export default function WelcomeWizard({
         {/* ---- body (fixed height so steps don't jump) ---- */}
         <div ref={bodyRef} className="h-[min(520px,calc(100vh-230px))] overflow-y-auto px-7 py-6">
           {step === 0 && (
-            <StepShell
+            <StepShell titleId={titleId}
               title={
                 <>
                   <span className="ai-text">MeetingCast</span>
@@ -407,7 +410,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 1 && (
-            <StepShell title="1 · 選擇辨識方式" subtitle="決定聲音在哪裡變成文字。之後可在主控台右欄切換。">
+            <StepShell titleId={titleId} title="1 · 選擇辨識方式" subtitle="決定聲音在哪裡變成文字。之後可在主控台右欄切換。">
               <Block h="在做什麼">
                 <div className="grid grid-cols-2 gap-3">
                   <ChoiceCard
@@ -449,7 +452,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 2 && (
-            <StepShell title="2 · 麥克風授權" subtitle="沒有聲音進來，後面什麼都不會動。">
+            <StepShell titleId={titleId} title="2 · 麥克風授權" subtitle="沒有聲音進來，後面什麼都不會動。">
               <Block h="在做什麼">
                 <div className="flex items-center gap-3 rounded-xl border border-paper-200 bg-paper-50 px-4 py-3">
                   {micState === "checking" && (
@@ -509,7 +512,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 3 && (
-            <StepShell title="3 · API 金鑰" subtitle="翻譯要用大語言模型，金鑰只存在這台電腦的設定檔。">
+            <StepShell titleId={titleId} title="3 · API 金鑰" subtitle="翻譯要用大語言模型，金鑰只存在這台電腦的設定檔。">
               <Block h="在做什麼">
                 <div className="space-y-4">
                   <div>
@@ -538,7 +541,7 @@ export default function WelcomeWizard({
                         </button>
                       ))}
                     </div>
-                    <p className="mt-1 text-xs text-paper-500">
+                    <p className="mt-1 text-xs text-paper-600">
                       {provider === "openai"
                         ? "預設；翻譯、總結與雲端辨識共用同一把 OpenAI key"
                         : "翻譯與總結呼叫 Claude；若選雲端辨識仍需另一把 OpenAI key"}
@@ -597,7 +600,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 4 && (
-            <StepShell title="4 · 語音模型" subtitle="下方步驟自動完成，不必盯著。">
+            <StepShell titleId={titleId} title="4 · 語音模型" subtitle="下方步驟自動完成，不必盯著。">
               {backend === "openai" && (
                 <p className="rounded-lg border border-paper-200 bg-paper-50 px-3 py-2 text-xs text-paper-700">
                   你選了雲端辨識，不需要等模型下載；本機模型仍會在背景準備，以備現場沒網路時切換。
@@ -623,7 +626,7 @@ export default function WelcomeWizard({
                       >
                         重試
                       </button>
-                      <p className="text-[11px] text-paper-500">會從中斷處續傳，不會重頭下載</p>
+                      <p className="text-xs text-paper-600">會從中斷處續傳，不會重頭下載</p>
                     </div>
                   )}
                 </div>
@@ -648,7 +651,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 5 && (
-            <StepShell title="5 · 語言與視窗" subtitle="你講什麼語言，要翻成哪兩種。">
+            <StepShell titleId={titleId} title="5 · 語言與視窗" subtitle="你講什麼語言，要翻成哪兩種。">
               <Block h="在做什麼">
                 <div className="grid grid-cols-3 gap-3">
                   <div>
@@ -702,7 +705,7 @@ export default function WelcomeWizard({
                     onClick={openWindows}
                     disabled={openingWindows}
                   >
-                    {openingWindows ? "開啟中…" : "開啟譯文視窗 ↗"}
+                    {openingWindows ? "開啟中…" : "開啟譯文視窗 ↗︎"}
                   </button>
                 </div>
               </Block>
@@ -720,7 +723,7 @@ export default function WelcomeWizard({
           )}
 
           {step === 6 && (
-            <StepShell title="6 · 試講一句" subtitle="對著麥克風講一句，看三件事都動起來。">
+            <StepShell titleId={titleId} title="6 · 試講一句" subtitle="對著麥克風講一句，看三件事都動起來。">
               {!online && backend === "openai" && (
                 <p className="rounded-lg border border-warn-200 bg-warn-50 px-3 py-2 text-xs text-warn-900">
                   目前偵測不到網路，雲端辨識會失敗。可以先改本機辨識再試，或稍後再試。
@@ -747,7 +750,7 @@ export default function WelcomeWizard({
                         結束試講
                       </button>
                     )}
-                    <p className="text-xs text-paper-500">
+                    <p className="text-xs text-paper-600">
                       {!running && startBlockedReason
                         ? startBlockedReason
                         : "例如：「大家好，今天我們來討論第三季的業績表現。」"}
@@ -769,7 +772,7 @@ export default function WelcomeWizard({
                             onClick={clearStartError}
                             aria-label="關閉"
                           >
-                            ✕
+                            ✕︎
                           </button>
                         )}
                       </div>
@@ -781,7 +784,7 @@ export default function WelcomeWizard({
                     </p>
                   )}
                   <div className="rounded-xl border border-paper-200 bg-paper-50 px-4 py-3">
-                    <p className="text-[11px] uppercase tracking-wider text-paper-500">
+                    <p className="text-xs font-semibold text-paper-600">
                       逐字稿 · {zhName(source)}
                       {lagSec != null && (
                         <span className="ml-2 normal-case tracking-normal tabular-nums">
@@ -796,12 +799,12 @@ export default function WelcomeWizard({
                         </span>
                       )}
                     </p>
-                    {latestSrc && <p className="ai-caret text-sm text-paper-500">{latestSrc}</p>}
+                    {latestSrc && <p className="ai-caret text-sm text-paper-600">{latestSrc}</p>}
                     {targets.length > 0 && (
                       <div className="mt-3 grid gap-2 border-t border-paper-200 pt-3">
                         {targets.map((t) => (
                           <div key={t} className="grid grid-cols-[72px_1fr] gap-2 text-sm">
-                            <span className="text-xs text-paper-500">{nativeName(t)}</span>
+                            <span className="text-xs text-paper-600">{nativeName(t)}</span>
                             <span className="text-paper-800">
                               {latestTranslations[t] || <span className="text-paper-400">…</span>}
                             </span>
@@ -856,7 +859,7 @@ export default function WelcomeWizard({
             {step === 0 ? (
               <button
                 type="button"
-                className="text-xs text-paper-500 hover:text-paper-800 disabled:opacity-50"
+                className="text-xs text-paper-600 hover:text-paper-800 disabled:opacity-50"
                 onClick={skipAll}
                 disabled={saving}
               >
@@ -878,7 +881,7 @@ export default function WelcomeWizard({
               <>
                 <button
                   type="button"
-                  className="text-xs text-paper-500 underline-offset-2 hover:text-paper-700 hover:underline"
+                  className="text-xs text-paper-600 underline-offset-2 hover:text-paper-700 hover:underline"
                   onClick={() => setStep(4)}
                 >
                   略過，稍後在設定填
@@ -895,11 +898,12 @@ export default function WelcomeWizard({
               </>
             )}
             {step === 4 && !modelDone && (
-              <span className="text-xs text-paper-500">下載會繼續，並留在主控台狀態列</span>
+              <span className="text-xs text-paper-600">下載會繼續，並留在主控台狀態列</span>
             )}
 
             {step === 0 && (
               <button
+                data-autofocus
                 type="button"
                 className="ai-fill rounded-xl px-5 py-2 text-sm font-semibold"
                 onClick={() => setStep(1)}
@@ -909,6 +913,7 @@ export default function WelcomeWizard({
             )}
             {(step === 1 || step === 2) && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800"
                 onClick={() => setStep((s) => (s + 1) as StepIndex)}
@@ -918,6 +923,7 @@ export default function WelcomeWizard({
             )}
             {step === 3 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800 disabled:bg-paper-400"
                 onClick={handleKeysNext}
@@ -928,6 +934,7 @@ export default function WelcomeWizard({
             )}
             {step === 4 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800"
                 onClick={() => setStep(5)}
@@ -937,6 +944,7 @@ export default function WelcomeWizard({
             )}
             {step === 5 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800 disabled:bg-paper-400"
                 onClick={goToTest}
@@ -947,6 +955,7 @@ export default function WelcomeWizard({
             )}
             {step === 6 && (
               <button
+                data-autofocus
                 type="button"
                 className="ai-fill rounded-xl px-5 py-2 text-sm font-semibold"
                 onClick={finish}
@@ -964,10 +973,12 @@ export default function WelcomeWizard({
 // ---------- building blocks ----------
 
 function StepShell({
+  titleId,
   title,
   subtitle,
   children,
 }: {
+  titleId: string;
   title: React.ReactNode;
   subtitle: string;
   children: React.ReactNode;
@@ -975,7 +986,7 @@ function StepShell({
   return (
     <div className="flex flex-col gap-5">
       <div>
-        <h2 className="text-2xl font-bold tracking-tight text-paper-900">{title}</h2>
+        <h2 id={titleId} className="text-2xl font-bold tracking-tight text-paper-900">{title}</h2>
         <p className="mt-1 text-sm text-paper-600">{subtitle}</p>
       </div>
       {children}
@@ -986,7 +997,7 @@ function StepShell({
 function Block({ h, children }: { h: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-[84px_1fr] gap-3 text-sm text-paper-800">
-      <span className="pt-0.5 text-[11px] uppercase tracking-widest text-paper-500">{h}</span>
+      <span className="pt-0.5 text-[11px] font-semibold text-paper-600">{h}</span>
       <div>{children}</div>
     </div>
   );
@@ -1018,7 +1029,7 @@ function ChoiceCard({
     >
       <div className="flex items-center justify-between">
         <span className="text-sm font-semibold text-paper-900">{title}</span>
-        <span className="rounded-full bg-paper-100 px-2 py-0.5 text-[10px] text-paper-700">{tag}</span>
+        <span className="rounded-full bg-paper-100 px-2 py-0.5 text-[11px] text-paper-700">{tag}</span>
       </div>
       <ul className="mt-2 space-y-1 text-xs text-paper-700">
         {lines.map((l) => (
@@ -1059,10 +1070,10 @@ function KeyField({
       <label className="mb-1 flex items-center justify-between text-xs font-medium text-paper-700">
         <span>
           {label}
-          {required && <span className="ml-1 rounded-full bg-warn-50 px-1.5 py-0.5 text-[10px] text-warn-900">必要</span>}
+          {required && <span className="ml-1 rounded-full bg-warn-50 px-1.5 py-0.5 text-[11px] text-warn-900">必要</span>}
         </span>
         <a className="text-xs text-ai-blue hover:underline" href={href} target="_blank" rel="noreferrer">
-          取得金鑰 ↗
+          取得金鑰 ↗︎
         </a>
       </label>
       <div className="flex gap-2">
@@ -1082,7 +1093,7 @@ function KeyField({
           {show ? "隱藏" : "顯示"}
         </button>
       </div>
-      <p className="mt-1 text-xs text-paper-500">{hint}</p>
+      <p className="mt-1 text-xs text-paper-600">{hint}</p>
       {children}
     </div>
   );
@@ -1102,14 +1113,14 @@ function CheckRow({
   return (
     <>
       {ok ? (
-        <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-ok-700 text-[10px] text-white">✓</span>
+        <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-ok-700 text-[11px] text-white">✓</span>
       ) : pending ? (
         <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-paper-200 border-t-ai-violet" />
       ) : (
         <span className="inline-block h-4 w-4 rounded-full border-2 border-paper-300" />
       )}
-      <span className={ok ? "text-paper-900" : "text-paper-500"}>{label}</span>
-      <span className="font-mono text-xs tabular-nums text-paper-500">{right ?? ""}</span>
+      <span className={ok ? "text-paper-900" : "text-paper-600"}>{label}</span>
+      <span className="font-mono text-xs tabular-nums text-paper-600">{right ?? ""}</span>
     </>
   );
 }

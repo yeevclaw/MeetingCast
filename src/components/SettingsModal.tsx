@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import type { Config } from "@/lib/types";
 import { LANGS, zhName } from "@/lib/languages";
+import { useFocusTrap } from "@/lib/useFocusTrap";
 import { useEscapeKey } from "@/lib/useEscapeKey";
 import {
   INTERP_CALL_MULTIPLIER,
@@ -54,27 +55,27 @@ type Backend = "local" | "openai";
 type KeyCheck = "valid" | "invalid" | "unknown" | "checking";
 
 function KeyCheckHint({ check }: { check: KeyCheck | null }) {
-  if (check === "checking") return <p className="mt-1 text-xs text-paper-500">驗證中…</p>;
-  if (check === "valid") return <p className="mt-1 text-xs text-ok-700">✓ 有效</p>;
+  if (check === "checking") return <p role="status" className="mt-1 text-xs text-paper-600">驗證中…</p>;
+  if (check === "valid") return <p role="status" className="mt-1 text-xs text-ok-700">✓ 有效</p>;
   if (check === "invalid")
-    return <p className="mt-1 text-xs text-danger-700">無效：請確認是否複製完整</p>;
+    return <p role="status" className="mt-1 text-xs text-danger-700">無效：請確認是否複製完整</p>;
   if (check === "unknown")
-    return <p className="mt-1 text-xs text-warn-700">無法確認（網路問題），仍可儲存</p>;
+    return <p role="status" className="mt-1 text-xs text-warn-700">無法確認（網路問題），仍可儲存</p>;
   return null;
 }
 // Per-meeting settings (languages, STT engine, mic) live on the console's
 // 本場設定 card (SessionSetupCard); this modal only holds what rarely changes.
 export type SettingsTab = "account" | "advanced";
 
-const TABS: Array<{ id: SettingsTab; label: string; freq: string }> = [
-  { id: "account", label: "帳號", freq: "一次" },
-  { id: "advanced", label: "進階", freq: "很少" },
+const TABS: Array<{ id: SettingsTab; label: string }> = [
+  { id: "account", label: "帳號" },
+  { id: "advanced", label: "進階" },
 ];
 
 const DEFAULT_UI: Config["ui"] = { translation_theme: "dark", glow: true };
 
 const INPUT =
-  "rounded-md border border-paper-300 bg-white px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-ai-blue/40 disabled:opacity-50";
+  "rounded-md border border-paper-300 bg-white px-2 py-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-paper-700 focus-visible:ring-offset-1 disabled:opacity-50";
 const SELECT = `w-full ${INPUT}`;
 const CHECKBOX = "h-4 w-4 cursor-pointer accent-ai-violet disabled:opacity-50";
 const BTN_SECONDARY =
@@ -101,6 +102,8 @@ export default function SettingsModal({
   onRerunChecklist?: () => void;
   onRerunOnboarding?: () => void;
 }) {
+  const dialogRef = useFocusTrap();
+  const titleId = useId();
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [cfg, setCfg] = useState<Config | null>(null);
   const [showAnthropic, setShowAnthropic] = useState(false);
@@ -118,6 +121,7 @@ export default function SettingsModal({
   // Snapshot of the config as loaded, for the unsaved-changes check.
   const loadedJson = useRef<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const discardRef = useFocusTrap(confirmDiscard);
   const [openaiCheck, setOpenaiCheck] = useState<KeyCheck | null>(null);
   const [anthropicCheck, setAnthropicCheck] = useState<KeyCheck | null>(null);
   // Last key value each check ran against, so blur without edits doesn't re-bill a probe.
@@ -231,15 +235,15 @@ export default function SettingsModal({
 
   return (
     <div className="absolute inset-0 z-10 flex items-stretch justify-center bg-paper-900/30 p-4">
-      <div className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-paper-200 bg-white shadow-xl">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} className="flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-paper-200 bg-white shadow-xl">
         <header className="flex flex-shrink-0 items-center justify-between border-b border-paper-200 px-5 py-3">
-          <h2 className="text-lg font-semibold text-paper-900">設定</h2>
+          <h2 id={titleId} className="text-lg font-semibold text-paper-900">設定</h2>
           <button
-            className="rounded-md px-2 py-0.5 text-paper-500 hover:bg-paper-100 hover:text-paper-900"
+            className="rounded-md px-2 py-0.5 text-paper-600 hover:bg-paper-100 hover:text-paper-900"
             onClick={requestClose}
             aria-label="關閉"
           >
-            ✕
+            ✕︎
           </button>
         </header>
 
@@ -271,7 +275,6 @@ export default function SettingsModal({
                     />
                   )}
                   <span>{t.label}</span>
-                  <span className="text-[11px] font-normal text-paper-500">{t.freq}</span>
                 </button>
               );
             })}
@@ -288,7 +291,8 @@ export default function SettingsModal({
                     label="翻譯引擎（LLM）"
                     hint="翻譯與總結使用的服務；OpenAI 與雲端辨識共用同一把 key，Anthropic 則需另備 OpenAI key 才能用雲端辨識"
                   >
-                    <select
+                    {(controlProps) => <>
+                    <select {...controlProps}
                       className={SELECT}
                       value={providerIsOpenai ? "openai" : "anthropic"}
                       onChange={(e) => update({ provider: e.target.value })}
@@ -296,6 +300,7 @@ export default function SettingsModal({
                       <option value="openai">OpenAI（GPT，預設）</option>
                       <option value="anthropic">Anthropic（Claude）</option>
                     </select>
+                    </>}
                   </Field>
 
                   <Field
@@ -313,8 +318,9 @@ export default function SettingsModal({
                           : "用途：雲端辨識；只用本機辨識可留空"
                     }
                   >
+                    {(controlProps) => <>
                     <div className="flex gap-2">
-                      <input
+                      <input {...controlProps}
                         type={showOpenai ? "text" : "password"}
                         className={`flex-1 font-mono text-xs ${INPUT}`}
                         value={cfg.api.openai_api_key}
@@ -335,6 +341,7 @@ export default function SettingsModal({
                       </button>
                     </div>
                     <KeyCheckHint check={openaiCheck} />
+                    </>}
                   </Field>
 
                   <Field
@@ -350,8 +357,9 @@ export default function SettingsModal({
                         : "用途：翻譯、總結（目前翻譯引擎為 OpenAI，此把可留空）"
                     }
                   >
+                    {(controlProps) => <>
                     <div className="flex gap-2">
-                      <input
+                      <input {...controlProps}
                         type={showAnthropic ? "text" : "password"}
                         className={`flex-1 font-mono text-xs ${INPUT}`}
                         value={cfg.api.anthropic_api_key}
@@ -372,10 +380,12 @@ export default function SettingsModal({
                       </button>
                     </div>
                     <KeyCheckHint check={anthropicCheck} />
+                    </>}
                   </Field>
 
                   <Field label="翻譯模型" hint="費用為概估：兩個譯文視窗、每小時約 30 分鐘語音">
-                    <select
+                    {(controlProps) => <>
+                    <select {...controlProps}
                       className={SELECT}
                       value={providerIsOpenai ? cfg.api.openai_model : cfg.api.model}
                       onChange={(e) =>
@@ -392,6 +402,7 @@ export default function SettingsModal({
                         </option>
                       ))}
                     </select>
+                    </>}
                   </Field>
 
                   <Field
@@ -402,7 +413,8 @@ export default function SettingsModal({
                         : "會議紀錄的 AI 總結使用；預設 Sonnet 4.6，費用為一小時會議的單次概估"
                     }
                   >
-                    <select
+                    {(controlProps) => <>
+                    <select {...controlProps}
                       className={SELECT}
                       value={providerIsOpenai ? cfg.api.openai_summary_model : cfg.api.summary_model}
                       onChange={(e) =>
@@ -419,6 +431,7 @@ export default function SettingsModal({
                         </option>
                       ))}
                     </select>
+                    </>}
                   </Field>
                 </div>
               )}
@@ -430,8 +443,9 @@ export default function SettingsModal({
                     label="譯文視窗外觀"
                     hint="兩個譯文視窗共用，投影機色偏嚴重或不喜歡動態可關掉光暈"
                   >
+                    {(controlProps) => <>
                     <div className="flex flex-wrap items-center gap-3">
-                      <select
+                      <select {...controlProps}
                         className={INPUT}
                         value={ui.translation_theme === "light" ? "light" : "dark"}
                         onChange={(e) => updateUi({ translation_theme: e.target.value })}
@@ -449,12 +463,14 @@ export default function SettingsModal({
                         顯示 AI 光暈
                       </label>
                     </div>
+                    </>}
                   </Field>
 
-                  <Field
+                  <Field group
                     label="音源"
                     hint={running ? lockedHint : "預設使用麥克風；取消勾選則跑內建 weather demo 音檔（按「儲存」後生效）"}
                   >
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
                       <input
                         type="checkbox"
@@ -465,6 +481,7 @@ export default function SettingsModal({
                       />
                       使用麥克風
                     </label>
+                    </div>}
                   </Field>
 
                   {backend === "openai" && (
@@ -476,7 +493,8 @@ export default function SettingsModal({
                           : "越低字越早上螢幕；越高辨識越準。實測 minimal 比 low 快約 1.4 秒且準確度相當"
                       }
                     >
-                      <select
+                    {(controlProps) => <>
+                      <select {...controlProps}
                         className={SELECT}
                         value={cfg.stt?.openai_delay ?? "minimal"}
                         onChange={(e) => updateStt({ openai_delay: e.target.value })}
@@ -488,10 +506,11 @@ export default function SettingsModal({
                           </option>
                         ))}
                       </select>
+                    </>}
                     </Field>
                   )}
 
-                  <Field
+                  <Field group
                     label="同步口譯模式（實驗）"
                     hint={
                       running
@@ -499,6 +518,7 @@ export default function SettingsModal({
                         : "不等整句說完就開始翻譯，譯文只追加不修改，較接近真人同步口譯；需雲端辨識引擎才有效果"
                     }
                   >
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
                       <input
                         type="checkbox"
@@ -558,13 +578,14 @@ export default function SettingsModal({
                         本機 mlx-whisper 只能在句尾出字，同步口譯模式下行為與一般模式相同；切到雲端辨識引擎才會提前開口
                       </p>
                     )}
+                    </div>}
                   </Field>
 
                   <Field
                     label="閒置自動停止（分鐘）"
                     hint="超過設定分鐘無人說話則自動停止，避免雲端方案空轉計費；0 = 停用"
                   >
-                    <input
+                    {(controlProps) => (<input {...controlProps}
                       type="number"
                       min={0}
                       max={120}
@@ -575,10 +596,11 @@ export default function SettingsModal({
                         const v = parseInt(e.target.value, 10);
                         updateIdleMinutes(Number.isFinite(v) && v >= 0 ? v : 0);
                       }}
-                    />
+                    />)}
                   </Field>
 
-                  <Field label="會後自動總結" hint="錄音結束後自動用 AI 產生總結，完成後於歷史紀錄查看">
+                  <Field group label="會後自動總結" hint="錄音結束後自動用 AI 產生總結，完成後於歷史紀錄查看">
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
                       <input
                         type="checkbox"
@@ -592,10 +614,10 @@ export default function SettingsModal({
                     {cfg.summary.auto_generate && (
                       <div className="mt-3 space-y-3 border-l-2 border-paper-200 pl-3">
                         <div>
-                          <label className="mb-1 block text-xs font-medium text-paper-700">
+                          <label htmlFor={`${controlProps.id}-template`} className="mb-1 block text-xs font-medium text-paper-700">
                             總結模板
                           </label>
-                          <select
+                          <select id={`${controlProps.id}-template`}
                             className={SELECT}
                             value={cfg.summary.auto_template}
                             onChange={(e) => updateSummary({ auto_template: e.target.value })}
@@ -636,16 +658,18 @@ export default function SettingsModal({
                             })}
                           </div>
                         </div>
-                        <p className="text-xs text-paper-500">
+                        <p className="text-xs text-paper-600">
                           每個語言各呼叫一次總結模型 API（與手動產生總結相同）
                         </p>
                       </div>
                     )}
+                    </div>}
                   </Field>
 
                   {(onRerunChecklist || onRerunOnboarding) && (
-                    <Field label="系統狀態" hint="啟動檢查表會重新啟動辨識引擎並逐項驗證；首次設定會重跑 onboarding 流程">
-                      <div className="flex flex-wrap gap-2">
+                    <Field group label="系統狀態" hint="啟動檢查表會重新啟動辨識引擎並逐項驗證；首次設定會重跑 onboarding 流程">
+                    {(controlProps) => <>
+                      <div {...controlProps} role="group" className="flex flex-wrap gap-2">
                         {onRerunChecklist && (
                           <button
                             type="button"
@@ -667,11 +691,13 @@ export default function SettingsModal({
                           </button>
                         )}
                       </div>
+                    </>}
                     </Field>
                   )}
 
-                  <Field label="檔案">
-                    <div className="flex flex-wrap gap-2">
+                  <Field group label="檔案">
+                    {(controlProps) => <>
+                    <div {...controlProps} role="group" className="flex flex-wrap gap-2">
                       <button
                         type="button"
                         className={BTN_SECONDARY}
@@ -691,6 +717,7 @@ export default function SettingsModal({
                         錯誤紀錄
                       </button>
                     </div>
+                    </>}
                   </Field>
                 </div>
               )}
@@ -705,7 +732,7 @@ export default function SettingsModal({
         )}
 
         <footer className="flex flex-shrink-0 items-center justify-between gap-2 border-t border-paper-200 px-5 py-3">
-          <span className="text-[11px] tabular-nums text-paper-500">
+          <span className="text-[11px] tabular-nums text-paper-600">
             {version ? `MeetingCast v${version}` : ""}
           </span>
           <div className="flex gap-2">
@@ -731,6 +758,9 @@ export default function SettingsModal({
       {confirmDiscard && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-paper-900/30 p-4">
           <div
+            ref={discardRef}
+            tabIndex={-1}
+            aria-modal="true"
             role="alertdialog"
             aria-label="放棄未儲存的變更"
             className="w-full max-w-sm rounded-2xl border border-paper-200 bg-white p-5 shadow-xl"
@@ -742,7 +772,7 @@ export default function SettingsModal({
                 type="button"
                 className="rounded-lg px-3 py-1.5 text-sm text-paper-600 hover:bg-paper-100"
                 onClick={() => setConfirmDiscard(false)}
-                autoFocus
+                data-autofocus
               >
                 繼續編輯
               </button>
@@ -767,7 +797,7 @@ export default function SettingsModal({
 function ReqTag({ required }: { required: boolean }) {
   return (
     <span
-      className={`ml-2 rounded-full px-1.5 py-px text-[10px] font-normal ${
+      className={`ml-2 rounded-full px-1.5 py-px text-[11px] font-normal ${
         required
           ? "border border-warn-200 bg-warn-50 text-warn-900"
           : "bg-paper-100 text-paper-700"
@@ -779,19 +809,24 @@ function ReqTag({ required }: { required: boolean }) {
 }
 
 function Field({
+  group = false,
   label,
   hint,
   children,
 }: {
+  group?: boolean;
   label: React.ReactNode;
   hint?: string;
-  children: React.ReactNode;
+  children: (props: { id: string; "aria-describedby"?: string; "aria-labelledby"?: string }) => React.ReactNode;
 }) {
+  const id = useId();
+  const hintId = `${id}-hint`;
   return (
     <div className="py-3.5 first:pt-0 last:pb-0">
-      <label className="mb-1.5 flex items-center text-xs font-medium text-paper-700">{label}</label>
-      {children}
-      {hint && <p className="mt-1 text-xs text-paper-500">{hint}</p>}
+      {group ? <span id={`${id}-label`} className="mb-1.5 flex items-center text-xs font-medium text-paper-700">{label}</span>
+        : <label htmlFor={id} className="mb-1.5 flex items-center text-xs font-medium text-paper-700">{label}</label>}
+      {children({ id, "aria-describedby": hint ? hintId : undefined, "aria-labelledby": group ? `${id}-label` : undefined })}
+      {hint && <p id={hintId} className="mt-1 text-xs text-paper-600">{hint}</p>}
     </div>
   );
 }
