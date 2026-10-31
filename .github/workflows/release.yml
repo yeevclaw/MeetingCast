@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14 # arm64 → MeetingCast_<ver>_aarch64.dmg
+    runs-on: macos-15 # arm64 → MeetingCast_<ver>_aarch64.dmg
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
