@@ -97,3 +97,62 @@ test('transcript emphasis does not change collapse button inherited weight', () 
   assert.doesNotMatch(header.split('>')[0], /font-semibold/);
   assert.match(header, /<span className="font-semibold">即時逐字稿<\/span>/);
 });
+
+const css = read('src/App.css');
+const cssValue = (name) => {
+  const value = css.match(new RegExp(`${name}:\\s*([^;]+);`))?.[1];
+  assert.ok(value, `missing CSS property ${name}`);
+  return value.trim();
+};
+const background = (selector) => {
+  const block = css.slice(css.indexOf(`${selector} {`)).split('}')[0];
+  return block.match(/background:\s*([^;]+);/)[1];
+};
+const resolveColors = (value) => {
+  while (/var\(--[\w-]+\)/.test(value)) {
+    value = value.replace(/var\((--[\w-]+)\)/g, (_, name) => cssValue(name));
+  }
+  return value;
+};
+const rgb = (hex) => hex.slice(1).match(/../g).map((c) => parseInt(c, 16) / 255);
+const whiteContrast = (channels) => {
+  const linear = channels.map((v) => v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+  return 1.05 / (linear.reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i], 0) + 0.05);
+};
+test('actual ai-fill gradient clears white text contrast at stops and sRGB interpolated samples', () => {
+  const gradient = resolveColors(background('.ai-fill'));
+  assert.match(gradient, /^linear-gradient\(/);
+  const stops = [...gradient.matchAll(/#[a-f0-9]{6}/gi)].map(([hex]) => hex);
+  assert.equal(stops.length, 3);
+  for (const hex of stops) assert.ok(whiteContrast(rgb(hex)) >= 4.5, `${hex}: ${whiteContrast(rgb(hex))}`);
+  for (let segment = 0; segment < stops.length - 1; segment++) {
+    const start = rgb(stops[segment]);
+    const end = rgb(stops[segment + 1]);
+    for (let sample = 0; sample <= 100; sample++) {
+      const channels = start.map((v, i) => v + (end[i] - v) * sample / 100);
+      assert.ok(whiteContrast(channels) >= 4.5, `segment ${segment}, sample ${sample}`);
+    }
+  }
+});
+test('brand colors, logo, aura, bar, recording dot and caret keep original gradients', () => {
+  for (const [name, hex] of Object.entries({ blue: '#0a84ff', cyan: '#5ac8fa', violet: '#bf5af2', pink: '#ff375f', orange: '#ff9f0a' })) {
+    assert.equal(cssValue(`--color-ai-${name}`), hex);
+  }
+  const compact = (value) => value.replace(/\s+/g, '');
+  assert.equal(compact(cssValue('--ai-grad')), 'linear-gradient(90deg,var(--color-ai-blue)0%,var(--color-ai-violet)38%,var(--color-ai-pink)68%,var(--color-ai-orange)100%)');
+  assert.equal(compact(cssValue('--ai-conic')), 'conic-gradient(fromvar(--mc-aura-angle),var(--color-ai-blue),var(--color-ai-violet),var(--color-ai-pink),var(--color-ai-orange),var(--color-ai-cyan),var(--color-ai-blue))');
+  for (const selector of ['.ai-text', '.ai-bar']) assert.equal(background(selector), 'var(--ai-grad)');
+  for (const selector of ['.ai-dot', '.ai-caret::after']) {
+    assert.equal(compact(resolveColors(background(selector))), 'linear-gradient(135deg,#0a84ff,#bf5af255%,#ff375f)');
+  }
+});
+test('settings tabs keep names and semantics without frequency annotations', () => {
+  const tabs = settings.slice(settings.indexOf('const TABS:'), settings.indexOf('];', settings.indexOf('const TABS:')));
+  assert.doesNotMatch(tabs, /一次|很少/);
+  assert.doesNotMatch(settings, /\bfreq\b/);
+  assert.match(tabs, /label: "帳號"/);
+  assert.match(tabs, /label: "進階"/);
+  assert.match(settings, /role="tablist"/);
+  assert.match(settings, /role="tab"/);
+  assert.match(settings, /aria-selected=\{selected\}/);
+});

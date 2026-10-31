@@ -67,9 +67,9 @@ function KeyCheckHint({ check }: { check: KeyCheck | null }) {
 // 本場設定 card (SessionSetupCard); this modal only holds what rarely changes.
 export type SettingsTab = "account" | "advanced";
 
-const TABS: Array<{ id: SettingsTab; label: string; freq: string }> = [
-  { id: "account", label: "帳號", freq: "一次" },
-  { id: "advanced", label: "進階", freq: "很少" },
+const TABS: Array<{ id: SettingsTab; label: string }> = [
+  { id: "account", label: "帳號" },
+  { id: "advanced", label: "進階" },
 ];
 
 const DEFAULT_UI: Config["ui"] = { translation_theme: "dark", glow: true };
@@ -275,7 +275,6 @@ export default function SettingsModal({
                     />
                   )}
                   <span>{t.label}</span>
-                  <span className="text-[11px] font-normal text-paper-600">{t.freq}</span>
                 </button>
               );
             })}
