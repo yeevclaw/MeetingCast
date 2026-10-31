@@ -1785,7 +1785,7 @@ export default function ControlWindow() {
       </div>
 
       {/* ---------- Body ---------- */}
-      <div className={`grid min-h-0 ${panelCollapsed ? "grid-cols-1" : "grid-cols-[minmax(0,1fr)_320px]"}`}>
+      <div className={`relative grid min-h-0 ${panelCollapsed ? "grid-cols-[minmax(0,1fr)_36px]" : "grid-cols-[minmax(0,1fr)_320px]"}`}>
         {/* Transcript */}
         <section className={`relative flex min-h-0 min-w-0 flex-col ${panelCollapsed ? "" : "border-r border-paper-200"}`}>
           {error && !isOfflineError(error.raw) && (() => {
@@ -1863,15 +1863,6 @@ export default function ControlWindow() {
             <span className="rounded-full bg-paper-100 px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-paper-700">
               {zhName(sourceLang)}
             </span>
-            <button
-              type="button"
-              className="ml-auto rounded-md border border-paper-300 bg-white px-2 py-1 text-xs normal-case tracking-normal text-paper-700 hover:bg-paper-100 focus-visible:outline-2 focus-visible:outline-ai-blue"
-              aria-expanded={!panelCollapsed}
-              aria-controls="session-panel"
-              onClick={() => setPanelCollapsed((collapsed) => !collapsed)}
-            >
-              {panelCollapsed ? "← 展開本場設定" : "收合本場設定 →"}
-            </button>
           </div>
 
           <div ref={historyRef} onScroll={onTranscriptScroll} className="flex-1 overflow-y-auto px-6 pb-6">
@@ -1967,6 +1958,52 @@ export default function ControlWindow() {
             </button>
           )}
         </section>
+
+        {/* 把手以 grid 的可視高度置中，跨在右欄左緣；不受兩側內容 overflow 裁切。
+            z-[5] 高於逐字稿與側欄一般內容（z-auto），低於 z-10 modal／遮罩及 z-30 精靈。
+            WCAG：邊框 paper-600 (#6e6e73) 對白底 5.07:1、paper-50 4.66:1、paper-100 4.27:1；
+            圖示／細欄文字 paper-700 (#48484a) 對白底 9.12:1、paper-50 8.38:1、paper-100 7.68:1。
+            hover 邊框同為 paper-700。色碼定義統一由 App.css token 提供。 */}
+        <button
+          type="button"
+          className="absolute top-1/2 z-[5] flex h-12 w-6 -translate-y-1/2 translate-x-1/2 items-center justify-center rounded-full border border-paper-600 bg-white text-paper-700 shadow-sm hover:border-paper-700 hover:bg-paper-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ai-blue"
+          style={{ right: panelCollapsed ? 36 : 320 }}
+          aria-expanded={!panelCollapsed}
+          aria-controls="session-panel"
+          aria-label={panelCollapsed ? "展開本場設定" : "收合本場設定"}
+          title={panelCollapsed ? "展開本場設定" : "收合本場設定"}
+          onClick={() => setPanelCollapsed((collapsed) => !collapsed)}
+        >
+          <svg
+            aria-hidden="true"
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={`motion-safe:transition-transform motion-safe:duration-150 ${panelCollapsed ? "rotate-180" : ""}`}
+          >
+            <path d="m6 4 4 4-4 4" />
+          </svg>
+        </button>
+        {panelCollapsed && (
+          <div
+            data-session-rail
+            title="展開本場設定"
+            aria-hidden="true"
+            onClick={() => setPanelCollapsed(false)}
+            className="flex min-h-0 cursor-pointer items-start justify-center border-l border-paper-200 py-5 text-xs font-medium text-paper-700 hover:bg-paper-100"
+          >
+            <span className="flex flex-col items-center">
+              {"本場設定".split("").map((ch) => (
+                <span key={ch} className="block leading-[1.25]">{ch}</span>
+              ))}
+            </span>
+          </div>
+        )}
 
         {/* Side column */}
         <aside id="session-panel" hidden={panelCollapsed} className={panelCollapsed ? "hidden" : "grid min-h-0 grid-rows-[auto_1fr]"}>
