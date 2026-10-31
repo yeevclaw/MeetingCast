@@ -1857,9 +1857,9 @@ export default function ControlWindow() {
             );
           })()}
 
-          <div className="flex flex-shrink-0 items-center gap-2 px-6 pb-2 pt-5 text-[11px] font-semibold text-paper-600">
+          <div className="flex flex-shrink-0 items-center gap-2 px-6 pb-2 pt-5 text-[11px] font-medium text-paper-600">
             <span className={`inline-block h-1.5 w-1.5 rounded-full ${running ? "ai-dot" : "bg-paper-400"}`} />
-            即時逐字稿
+            <span className="font-semibold">即時逐字稿</span>
             <span className="rounded-full bg-paper-100 px-1.5 py-0.5 text-[11px] font-medium normal-case tracking-normal text-paper-700">
               {zhName(sourceLang)}
             </span>

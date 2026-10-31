@@ -7,10 +7,15 @@ const candidates = 'button, input, select, textarea, a[href], [tabindex]';
 /** Protect modal keyboard focus without taking over Escape or close handling. */
 export function useFocusTrap(active = true) {
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
     const root = ref.current;
     if (!active || !root) return;
-    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // StrictMode replays setup after focus has already moved into the dialog.
+    if (document.activeElement instanceof HTMLElement && !root.contains(document.activeElement)) {
+      triggerRef.current = document.activeElement;
+    }
+    const trigger = triggerRef.current;
     const available = () => Array.from(root.querySelectorAll<HTMLElement>(candidates))
       .filter((el) => el.tabIndex >= 0 && !el.matches(':disabled') && !el.closest('[inert]') && el.getClientRects().length > 0);
     const focusFirst = () => (root.querySelector<HTMLElement>('[data-autofocus]') ?? available()[0] ?? root).focus();
@@ -59,6 +64,7 @@ export function useFocusTrap(active = true) {
       // Wait for nested dialogs to clean up and React to remove their DOM.
       queueMicrotask(() => {
         const top = traps[traps.length - 1];
+        if (traps.includes(root)) return;
         if (trigger?.isConnected && !trigger.closest('[inert]') && (!top || top.contains(trigger))) trigger.focus();
       });
     };

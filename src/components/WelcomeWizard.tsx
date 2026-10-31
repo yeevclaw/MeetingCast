@@ -903,6 +903,7 @@ export default function WelcomeWizard({
 
             {step === 0 && (
               <button
+                data-autofocus
                 type="button"
                 className="ai-fill rounded-xl px-5 py-2 text-sm font-semibold"
                 onClick={() => setStep(1)}
@@ -912,6 +913,7 @@ export default function WelcomeWizard({
             )}
             {(step === 1 || step === 2) && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800"
                 onClick={() => setStep((s) => (s + 1) as StepIndex)}
@@ -921,6 +923,7 @@ export default function WelcomeWizard({
             )}
             {step === 3 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800 disabled:bg-paper-400"
                 onClick={handleKeysNext}
@@ -931,6 +934,7 @@ export default function WelcomeWizard({
             )}
             {step === 4 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800"
                 onClick={() => setStep(5)}
@@ -940,6 +944,7 @@ export default function WelcomeWizard({
             )}
             {step === 5 && (
               <button
+                data-autofocus
                 type="button"
                 className="rounded-xl bg-paper-900 px-5 py-2 text-sm font-medium text-white hover:bg-paper-800 disabled:bg-paper-400"
                 onClick={goToTest}
@@ -950,6 +955,7 @@ export default function WelcomeWizard({
             )}
             {step === 6 && (
               <button
+                data-autofocus
                 type="button"
                 className="ai-fill rounded-xl px-5 py-2 text-sm font-semibold"
                 onClick={finish}

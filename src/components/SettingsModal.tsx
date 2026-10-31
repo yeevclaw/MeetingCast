@@ -467,13 +467,13 @@ export default function SettingsModal({
                     </>}
                   </Field>
 
-                  <Field
+                  <Field group
                     label="音源"
                     hint={running ? lockedHint : "預設使用麥克風；取消勾選則跑內建 weather demo 音檔（按「儲存」後生效）"}
                   >
-                    {(controlProps) => <>
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
-                      <input {...controlProps}
+                      <input
                         type="checkbox"
                         className={CHECKBOX}
                         checked={micDraft}
@@ -482,7 +482,7 @@ export default function SettingsModal({
                       />
                       使用麥克風
                     </label>
-                    </>}
+                    </div>}
                   </Field>
 
                   {backend === "openai" && (
@@ -511,7 +511,7 @@ export default function SettingsModal({
                     </Field>
                   )}
 
-                  <Field
+                  <Field group
                     label="同步口譯模式（實驗）"
                     hint={
                       running
@@ -519,9 +519,9 @@ export default function SettingsModal({
                         : "不等整句說完就開始翻譯，譯文只追加不修改，較接近真人同步口譯；需雲端辨識引擎才有效果"
                     }
                   >
-                    {(controlProps) => <>
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
-                      <input {...controlProps}
+                      <input
                         type="checkbox"
                         className={CHECKBOX}
                         checked={interpOn}
@@ -579,7 +579,7 @@ export default function SettingsModal({
                         本機 mlx-whisper 只能在句尾出字，同步口譯模式下行為與一般模式相同；切到雲端辨識引擎才會提前開口
                       </p>
                     )}
-                    </>}
+                    </div>}
                   </Field>
 
                   <Field
@@ -600,10 +600,10 @@ export default function SettingsModal({
                     />)}
                   </Field>
 
-                  <Field label="會後自動總結" hint="錄音結束後自動用 AI 產生總結，完成後於歷史紀錄查看">
-                    {(controlProps) => <>
+                  <Field group label="會後自動總結" hint="錄音結束後自動用 AI 產生總結，完成後於歷史紀錄查看">
+                    {(controlProps) => <div role="group" {...controlProps}>
                     <label className="flex cursor-pointer items-center gap-2 text-sm text-paper-700">
-                      <input {...controlProps}
+                      <input
                         type="checkbox"
                         className={CHECKBOX}
                         checked={cfg.summary.auto_generate}
@@ -664,7 +664,7 @@ export default function SettingsModal({
                         </p>
                       </div>
                     )}
-                    </>}
+                    </div>}
                   </Field>
 
                   {(onRerunChecklist || onRerunOnboarding) && (

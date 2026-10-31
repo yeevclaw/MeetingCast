@@ -71,3 +71,29 @@ test('opaque focus color clears 3:1 on every affected control surface', () => {
     assert.ok((luminance(color(surface)) + 0.05) / (foreground + 0.05) >= 3, surface);
   }
 });
+
+test('wizard forward buttons explicitly receive initial focus', () => {
+  const footer = wizard.slice(wizard.indexOf('{/* ---- footer ---- */}'));
+  const primary = [...footer.matchAll(/<button\b[^>]*className="(?:ai-fill|rounded-xl bg-paper-900)[^>]*>/g)];
+  assert.equal(primary.length, 6);
+  for (const [button] of primary) assert.match(button, /data-autofocus/);
+});
+test('checkbox Fields label groups without linking headings to checkboxes', () => {
+  for (const label of ['音源', '同步口譯模式（實驗）', '會後自動總結']) {
+    const field = [...settings.matchAll(/<Field\b[\s\S]*?<\/Field>/g)].find(([source]) => source.includes(`label="${label}"`))?.[0];
+    assert.ok(field, label);
+    assert.match(field, /<Field\s+group\b/);
+    assert.match(field, /<div[^>]*role="group"[^>]*\{\.\.\.controlProps\}/);
+    assert.doesNotMatch(field, /<input\s+\{\.\.\.controlProps\}/);
+  }
+  const fieldImplementation = settings.slice(settings.indexOf('function Field('));
+  assert.match(fieldImplementation, /group \? <span id=/);
+  assert.match(fieldImplementation, /"aria-labelledby": group \?/);
+  assert.match(fieldImplementation, /"aria-describedby": hint \?/);
+});
+test('transcript emphasis does not change collapse button inherited weight', () => {
+  const header = control.slice(control.lastIndexOf('<div', control.indexOf('即時逐字稿')), control.indexOf('<div ref={historyRef}'));
+  assert.match(header, /^<div className="[^"\n]*font-medium/);
+  assert.doesNotMatch(header.split('>')[0], /font-semibold/);
+  assert.match(header, /<span className="font-semibold">即時逐字稿<\/span>/);
+});
