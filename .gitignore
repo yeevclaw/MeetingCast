@@ -13,8 +13,9 @@ venv/
 .env.local
 .dev-config.toml
 
-# Claude Code local settings & agent state
-.claude/
+# Claude Code local settings & agent state（只追蹤 vendored 的專案層 skill，settings／hooks 一律不進版控）
+.claude/*
+!.claude/skills/
 
 # macOS
 .DS_Store
@@ -58,3 +59,8 @@ target/
 
 # stream_bench.py reference-timing cache
 prototype/.bench_cache/
+
+# impeccable：引擎 binary 與執行期狀態不進版控（見 docs/impeccable.md）
+.claude/skills/impeccable/scripts/bin/
+.agents/skills/impeccable/scripts/bin/
+.impeccable/
