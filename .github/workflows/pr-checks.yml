@@ -1,0 +1,73 @@
+# review-checks：攔下 PR 描述缺段落、授權聲明遺漏、誤追蹤設定與失效文件路徑。
+# tests：讓既有版本一致性、前端與 Python 回歸測試確實在每次 PR 執行。
+# rust-tests：準備 Linux sidecar 佔位檔，執行台灣繁體字形等 Rust 回歸測試。
+name: PR checks
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  review-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/review-checks/tracked-files.mjs
+      - run: node scripts/review-checks/feature-map.mjs
+      - name: 檢查新增依賴聲明
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: node scripts/review-checks/third-party-notices.mjs --base "origin/$BASE_REF"
+      - name: 檢查 PR 描述
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/review-checks/pr-body.mjs
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: node --test tests/frontend/*.test.mjs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements-test.txt
+      - run: python -m pytest tests/python -q
+  rust-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安裝 Tauri 2 Linux 依賴
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev pkg-config build-essential
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: 建立測試用 sidecar 佔位檔
+        run: |
+          mkdir -p src-tauri/binaries
+          touch src-tauri/binaries/stt_engine-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/stt_engine-x86_64-unknown-linux-gnu
+      - run: cargo test --locked
+        working-directory: src-tauri
