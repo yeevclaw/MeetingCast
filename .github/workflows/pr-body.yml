@@ -1,0 +1,27 @@
+name: PR body
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  contents: read
+concurrency:
+  group: pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/pull_request_template.md
+            scripts/review-checks/pr-body.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 檢查 PR 描述
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/review-checks/pr-body.mjs
