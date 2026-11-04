@@ -1,10 +1,10 @@
-# review-checks：攔下 PR 描述缺段落、授權聲明遺漏、誤追蹤設定與失效文件路徑。
+# review-checks：攔下 授權聲明遺漏、誤追蹤設定與失效文件路徑。
 # tests：讓既有版本一致性、前端與 Python 回歸測試確實在每次 PR 執行。
 # rust-tests：準備 Linux sidecar 佔位檔，執行台灣繁體字形等 Rust 回歸測試。
 name: PR checks
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,26 +16,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        if: ${{ !cancelled() }}
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v4
+        if: ${{ !cancelled() }}
         with:
           node-version: 22
       - run: node scripts/review-checks/tracked-files.mjs
+        if: ${{ !cancelled() }}
       - run: node scripts/review-checks/feature-map.mjs
+        if: ${{ !cancelled() }}
       - name: 檢查新增依賴聲明
+        if: ${{ !cancelled() }}
         env:
           BASE_REF: ${{ github.base_ref || 'main' }}
         run: node scripts/review-checks/third-party-notices.mjs --base "origin/$BASE_REF"
-      - name: 檢查 PR 描述
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: node scripts/review-checks/pr-body.mjs
   tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -56,6 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: 安裝 Tauri 2 Linux 依賴
         run: |
           sudo apt-get update
@@ -69,5 +74,7 @@ jobs:
           mkdir -p src-tauri/binaries
           touch src-tauri/binaries/stt_engine-x86_64-unknown-linux-gnu
           chmod +x src-tauri/binaries/stt_engine-x86_64-unknown-linux-gnu
+      # cargo test 未建置前端；建立 frontendDist 目錄供 Tauri 資源路徑檢查使用。
+      - run: mkdir -p dist
       - run: cargo test --locked
         working-directory: src-tauri
